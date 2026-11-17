@@ -1,0 +1,1 @@
+import {defineConfig} from 'vite';export default defineConfig({server:{host:'0.0.0.0',strictPort:true,allowedHosts:true,watch:{usePolling:true,interval:250},hmr:{protocol:process.env.BEOWNIR_CLIENT_PROTOCOL||'ws',clientPort:Number(process.env.BEOWNIR_CLIENT_PORT||4175)}},preview:{allowedHosts:true}});

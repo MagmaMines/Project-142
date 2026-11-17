@@ -1,0 +1,17 @@
+{
+  "name": "vite-browser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "start": "vite preview --host 0.0.0.0 --port 4173"
+  },
+  "dependencies": {
+    "vite": "7.3.7"
+  },
+  "overrides": {
+    "esbuild": "npm:esbuild-wasm@0.27.3",
+    "rollup": "npm:@rollup/wasm-node@4.65.0"
+  }
+}

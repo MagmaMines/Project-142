@@ -1,0 +1,388 @@
+{
+  "generatedAt": "2026-11-14T05:45:59.416Z",
+  "node": "v22.23.4",
+  "runtime": "v20.11.0-beownir",
+  "results": [
+    {
+      "name": "express",
+      "passed": true,
+      "detail": "express 5.3.0 served 200 /hello?name=beownir",
+      "packages": 68,
+      "versions": [
+        "express@5.3.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1296
+    },
+    {
+      "name": "koa",
+      "passed": true,
+      "detail": "koa 3.3.0 served 200 /koa",
+      "packages": 30,
+      "versions": [
+        "koa@3.3.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 491
+    },
+    {
+      "name": "fastify",
+      "passed": true,
+      "detail": "fastify 5.12.8 served 200 true",
+      "packages": 47,
+      "versions": [
+        "fastify@5.12.8"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1385
+    },
+    {
+      "name": "hono",
+      "passed": true,
+      "detail": "hono 4.13.18 answered 200 /hello",
+      "packages": 1,
+      "versions": [
+        "hono@4.13.18"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 257
+    },
+    {
+      "name": "react",
+      "passed": true,
+      "detail": "react 19.3.1 rendered <main><h1>beownir</h1></main>",
+      "packages": 3,
+      "versions": [
+        "react-dom@19.3.1",
+        "react@19.3.1"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 364
+    },
+    {
+      "name": "vue",
+      "passed": true,
+      "detail": "vue 3.5.45 rendered <p>beownir</p>",
+      "packages": 23,
+      "versions": [
+        "@vue/server-renderer@3.5.45",
+        "vue@3.5.45"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1449
+    },
+    {
+      "name": "preact",
+      "passed": true,
+      "detail": "preact 11.2.0 rendered <section>beownir</section>",
+      "packages": 2,
+      "versions": [
+        "preact-render-to-string@6.8.3",
+        "preact@11.2.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 260
+    },
+    {
+      "name": "svelte",
+      "passed": true,
+      "detail": "svelte 5.57.3 compiled 311 bytes",
+      "note": "ESM-only compiler reached through the \"svelte/compiler\" subpath export",
+      "packages": 19,
+      "versions": [
+        "svelte@5.57.3"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 948
+    },
+    {
+      "name": "vite",
+      "passed": true,
+      "detail": "vite 6.4.6 loaded 36 exports",
+      "note": "Node API loads through the CJS shim + dynamic import; a dev server still needs rollup/esbuild as WASM",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1057
+    },
+    {
+      "name": "hapi",
+      "passed": true,
+      "detail": "hapi 21.4.13 served 200 {\"ok\":true}",
+      "packages": 30,
+      "versions": [
+        "@hapi/hapi@21.4.13"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1686
+    },
+    {
+      "name": "zod",
+      "passed": true,
+      "detail": "zod 4.6.7 parsed {\"name\":\"beownir\",\"port\":4000}",
+      "packages": 1,
+      "versions": [
+        "zod@4.6.7"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 737
+    },
+    {
+      "name": "graphql",
+      "passed": true,
+      "detail": "graphql 17.1.0 executed {beownir}",
+      "packages": 1,
+      "versions": [
+        "graphql@17.1.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 755
+    },
+    {
+      "name": "socket.io",
+      "passed": true,
+      "detail": "socket.io 4.8.4 handshake sid=yes status=200",
+      "packages": 21,
+      "versions": [
+        "socket.io@4.8.4"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 797
+    },
+    {
+      "name": "typescript",
+      "passed": true,
+      "detail": "typescript 5.9.3 compiled \"const greet = (name) => \\\"hi \\\" + name;\"",
+      "note": "typescript 7 is the native compiler and only exports its version; ^5 is the JS API",
+      "packages": 1,
+      "versions": [
+        "typescript@5.9.3"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1627
+    },
+    {
+      "name": "babel",
+      "passed": true,
+      "detail": "babel 8.1.2 transformed JSX",
+      "packages": 47,
+      "versions": [
+        "@babel/preset-react@8.0.1",
+        "@babel/core@8.1.2"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1691
+    },
+    {
+      "name": "postcss",
+      "passed": true,
+      "detail": "postcss 8.5.33 produced \".a { color: blue }\"",
+      "packages": 4,
+      "versions": [
+        "postcss@8.5.33"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 95
+    },
+    {
+      "name": "sass",
+      "passed": true,
+      "detail": "sass 1.108.2 compiled \".a {\\n  color: red;\\n}\"",
+      "packages": 11,
+      "versions": [
+        "sass@1.108.2"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1360
+    },
+    {
+      "name": "yargs",
+      "passed": true,
+      "detail": "yargs 18.2.0 parsed port=3000 name=beownir",
+      "packages": 12,
+      "versions": [
+        "yargs@18.2.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 454
+    },
+    {
+      "name": "chalk",
+      "passed": true,
+      "detail": "chalk 6.0.1 styled \"beownir\" at level 0",
+      "note": "chalk resolves \"#ansi-styles\" through its package.json \"imports\" map",
+      "packages": 1,
+      "versions": [
+        "chalk@6.0.1"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 279
+    },
+    {
+      "name": "dotenv",
+      "passed": true,
+      "detail": "dotenv 18.0.10 loaded {\"GREETING\":\"hello\",\"PORT\":\"8080\"}",
+      "packages": 1,
+      "versions": [
+        "dotenv@18.0.10"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 43
+    },
+    {
+      "name": "esbuild",
+      "passed": true,
+      "detail": "esbuild 0.25.12 transformed -> const n = 1;",
+      "note": "require(\"esbuild\") is served by the embedded esbuild WASM build through the shim; the native package binary is never loaded",
+      "packages": 1,
+      "versions": [
+        "esbuild@0.28.2"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 686
+    },
+    {
+      "name": "vite-dev-transform",
+      "passed": true,
+      "detail": "vite 6.4.6 transformed main.ts, imports rewritten to /lib.ts",
+      "note": "Vite 6 dev server: createServer and transformRequest run TypeScript through the WASM esbuild and the WASM Rollup",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 2255
+    },
+    {
+      "name": "vite-hmr-invalidation",
+      "passed": true,
+      "detail": "vite-hmr re-transformed main.js after an edit: export const version = 1; -> export const version = 2;",
+      "note": "HMR core: a file edit is seen by the watcher, the module graph invalidates, and the next transform returns the new code. The WebSocket transport is not part of this row",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1342
+    },
+    {
+      "name": "tailwind-4",
+      "passed": true,
+      "detail": "tailwind 4.3.5 compiled 4882 bytes with flex, bg-red-500, p-4, text-center",
+      "note": "Tailwind v4 through its real PostCSS plugin. The native @tailwindcss/oxide scanner and lightningcss are served by JavaScript compat shims; output is correct but not minified",
+      "packages": 28,
+      "versions": [
+        "postcss@8.5.33",
+        "@tailwindcss/postcss@4.3.5",
+        "tailwindcss@4.3.5"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1625
+    },
+    {
+      "name": "mocha",
+      "passed": true,
+      "detail": "mocha 12.0.3 passes=2 fails=1 failures=1",
+      "note": "Test runner: a real spec file is written into the virtual project, loaded through the runtime, and run with pass/fail events",
+      "packages": 25,
+      "versions": [
+        "mocha@12.0.3"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1137
+    },
+    {
+      "name": "stylelint",
+      "passed": true,
+      "detail": "stylelint 18.0.0 warnings=1",
+      "note": "Stylelint probes the cache with statSync({ throwIfNoEntry: false }) and must not throw on a cold run",
+      "packages": 30,
+      "versions": [
+        "stylelint@18.0.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1194
+    },
+    {
+      "name": "chokidar",
+      "passed": true,
+      "detail": "chokidar 6.0.0 events=ready change:/project/smoke/watch/a.txt",
+      "note": "Live watcher: the initial scan emits ready, and an edit to a watched file emits change through readdirp",
+      "packages": 2,
+      "versions": [
+        "chokidar@6.0.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 2041
+    },
+    {
+      "name": "prettier",
+      "passed": true,
+      "detail": "prettier 3.10.1 formatted -> const a = { b: 1 };",
+      "note": "ESM-only formatter reached through require() of a module without top-level await",
+      "packages": 1,
+      "versions": [
+        "prettier@3.10.1"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 401
+    },
+    {
+      "name": "eslint",
+      "passed": true,
+      "detail": "eslint 10.15.0 messages=1",
+      "note": "Flat-config linter run through its Node API with an inline rule",
+      "packages": 76,
+      "versions": [
+        "eslint@10.15.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1978
+    },
+    {
+      "name": "tailwind-3",
+      "passed": true,
+      "detail": "tailwind 4.3.5 compiled css=10209 bytes",
+      "note": "Tailwind v3 is pure JavaScript. Tailwind v4 needs the native lightningcss binary and is not supported here",
+      "packages": 68,
+      "versions": [
+        "tailwindcss@3.4.19",
+        "postcss@8.5.33"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 1848
+    }
+  ]
+}

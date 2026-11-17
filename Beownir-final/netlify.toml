@@ -1,0 +1,48 @@
+# Deploying this repository to Netlify: no build step, no dashboard settings.
+#
+# The whole product is `o/site/index.html` (plus the service worker that turns
+# on cross-origin isolation on hosts that cannot send headers themselves).
+# Netlify only reads `netlify.toml` from the repository root, which is why this
+# file exists next to `o/netlify.toml` — that one is used by `o/deploy/*` when a
+# deployment is configured with `base = "o"` instead. Keep the two in sync;
+# `test/deployment.test.mjs` fails if their isolation headers drift apart.
+[build]
+  publish = "o/site"
+  # Verification only: it never rewrites the site. A stale artifact, a source
+  # that no longer matches its embedded copy, or a _headers file that disagrees
+  # with this TOML fails the deploy instead of shipping something unreviewed.
+  command = "node tools/deploy-files.mjs && node tools/build-standalone.mjs --check"
+  [build.environment]
+    NODE_VERSION = "22"
+
+# Cross-origin isolation is what gives the runtime SharedArrayBuffer, JSPI and
+# the WASIX profile. Without these two headers the IDE still boots, but in the
+# limited single-threaded profile.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"
+    Cross-Origin-Resource-Policy = "same-origin"
+    Origin-Agent-Cluster = "?1"
+    Permissions-Policy = 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), cross-origin-isolated=*'
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+
+# The shell must be revalidated on every visit, or a deploy can sit behind a
+# stale CDN copy and the service worker keeps serving the previous build.
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/coi-sw.js"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+    Service-Worker-Allowed = "/"

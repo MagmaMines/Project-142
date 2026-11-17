@@ -1,0 +1,18 @@
+# Used when the Netlify site sets `base = "o"`.
+# For the default setup (base = repository root) Netlify reads ../netlify.toml,
+# which publishes o/site. Keep the isolation headers in both files identical;
+# test/deployment.test.mjs fails if they drift.
+
+# The whole IDE is one file; Netlify serves site/index.html for / and its assets are inline.
+[build]
+  publish = "site"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"
+    Origin-Agent-Cluster = "?1"
+    Permissions-Policy = 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), cross-origin-isolated=*'
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"

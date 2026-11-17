@@ -1,0 +1,14 @@
+node_modules/
+.DS_Store
+*.log
+.env
+.env.*
+coverage/
+dist/
+out/
+.beownir/
+
+# The embedded runtime keeps its vendored SDK sources in the repository: they are
+# the editable copy of the blobs inside o/site/index.html (tools/native-assets.mjs).
+!o/native/node_modules/
+!o/native/node_modules/**

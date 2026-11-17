@@ -1,0 +1,303 @@
+{
+  "generatedAt": "2026-11-06T07:54:04.781Z",
+  "node": "22.22.3",
+  "runtime": "v20.11.0-beownir",
+  "modules": 55,
+  "implementedModules": 55,
+  "unimplementedModules": [],
+  "skippedRuntimeModules": [
+    "crypto/webcrypto"
+  ],
+  "nodeExports": 1336,
+  "covered": 1333,
+  "overall": 0.9978,
+  "internals": {
+    "modules": 11,
+    "implementedModules": 0,
+    "nodeExports": 53,
+    "covered": 0,
+    "overall": 0
+  },
+  "baseline": 0.9978,
+  "perModule": {
+    "assert": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "assert/strict": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "async_hooks": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "buffer": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "child_process": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "cluster": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "console": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "constants": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "crypto": {
+      "coverage": 0.9552,
+      "missingCount": 3,
+      "missing": [
+        "Certificate",
+        "ECDH",
+        "X509Certificate"
+      ]
+    },
+    "dgram": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "diagnostics_channel": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "dns": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "dns/promises": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "domain": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "events": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "fs": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "fs/promises": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "http": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "http2": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "https": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "inspector": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "inspector/promises": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "module": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "net": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "os": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "path": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "path/posix": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "path/win32": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "perf_hooks": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "process": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "punycode": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "querystring": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "readline": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "readline/promises": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "repl": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "stream": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "stream/consumers": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "stream/promises": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "stream/web": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "string_decoder": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "sys": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "test": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "timers": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "timers/promises": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "tls": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "trace_events": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "tty": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "url": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "util": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "util/types": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "v8": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "vm": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "wasi": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "worker_threads": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    },
+    "zlib": {
+      "coverage": 1,
+      "missingCount": 0,
+      "missing": []
+    }
+  }
+}

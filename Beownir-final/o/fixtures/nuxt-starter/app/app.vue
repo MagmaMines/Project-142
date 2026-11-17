@@ -1,0 +1,1 @@
+<script setup>const n=ref(0);onMounted(()=>{document.documentElement.dataset.hydrated='true'})</script><template><main><small>NUXT · EXPERIMENTAL BROWSER SSR</small><h1 id="app">NUXT_INITIAL</h1><p>Edit this component to exercise the real Vue HMR connection. Build with the Nitro node-server target.</p><button id="counter" @click="n++">Count {{n}}</button></main></template>

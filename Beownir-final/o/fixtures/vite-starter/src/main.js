@@ -1,0 +1,1 @@
+import { message } from './message.js';import './style.css';const heading=document.querySelector('#app');heading.textContent=message;let n=0;const button=document.querySelector('#counter');button.onclick=()=>button.textContent='Count '+(++n);if(import.meta.hot)import.meta.hot.accept('./message.js',next=>{if(next)heading.textContent=next.message});
