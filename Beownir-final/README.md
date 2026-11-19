@@ -339,7 +339,7 @@ from registry.npmjs.org, and each row runs the framework's own API.
 | vue | 3.5.44 | `createSSRApp()` + `@vue/server-renderer` |
 | preact | 11.1.0 | `preact-render-to-string` — preact 11 is **ESM only** |
 | svelte | 5.57.3 | `svelte/compiler` compiles a component — ESM only, reached through a subpath export |
-| vite | 6.4.5 | the Node API loads through vite's CJS shim + dynamic `import()` (36 exports, `createServer` present) |
+| vite | 6.4.6 | bounded Vite 6 Node API coverage: TypeScript transform, virtual HTTP dev serving, production build, React integration and HMR transport in the framework matrix; not full CLI/plugin/browser conformance |
 | hapi | 21.4.12 | `Hapi.server()` + `server.start()` answering a real request through the virtual HTTP client |
 | socket.io | 4.8.4 | Engine.IO polling handshake (`/socket.io/?EIO=4&transport=polling`) returns a session id |
 | graphql | 17.0.2 | `buildSchema()` + `graphql()` executes `{ hello }` |
@@ -364,11 +364,13 @@ before injecting a request.
 
 Known limits, measured rather than hidden:
 
-- **Vite's dev server still needs native binaries.** The API loads, but
-  `createServer()` reaches for Rollup's platform build and vite's own esbuild
-  binary. Running them needs the WASM pair (`@rollup/wasm-node` plus the
-  esbuild WASM the preview bundler already embeds); until that substitution
-  exists, Vite's `createServer` is out of reach even though its modules load.
+- **Vite support is real but bounded.** The framework matrix runs Vite 6's
+  Node API with embedded WASM Rollup/esbuild providers: dev HTTP, TypeScript
+  transforms, a production fixture build, React integration, and virtual HMR
+  transport/invalidation pass. This does not establish arbitrary plugins,
+  optimizeDeps, browser DOM updates, or the full upstream Vite CLI. In
+  particular, `vite build` from the limited compatibility terminal is not
+  certified; do not confuse the terminal preview adapter with Vite itself.
 - **`http` upgrade / WebSocket handshakes are not carried over the virtual
   loopback.** An HTTP server answers ordinary requests, but `'upgrade'` has no
   duplex socket to hand out, so a `ws` client receives `426 Upgrade Required`
