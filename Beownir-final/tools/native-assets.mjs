@@ -21,6 +21,22 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const appPath = path.join(root, 'o', 'site', 'index.html');
 const sourceDir = path.join(root, 'o', 'native');
+// Keep SDK source files out of a directory literally named node_modules:
+// repository snapshot systems and package tooling commonly exclude those
+// directories. The browser asset URL remains the upstream /node_modules path.
+const VENDORED_SDK_SOURCE = '/vendor/wasmer-sdk/';
+const VENDORED_SDK_URL = '/node_modules/@wasmer/sdk/';
+
+function sourceNameForAsset(urlName) {
+  return urlName.startsWith(VENDORED_SDK_URL)
+    ? VENDORED_SDK_SOURCE + urlName.slice(VENDORED_SDK_URL.length)
+    : urlName;
+}
+function assetNameForSource(sourceName) {
+  return sourceName.startsWith(VENDORED_SDK_SOURCE)
+    ? VENDORED_SDK_URL + sourceName.slice(VENDORED_SDK_SOURCE.length)
+    : sourceName;
+}
 
 const PACK_OPEN = '<script id="beownir-native-assets" type="application/json">';
 const PACK_CLOSE = '</script>';
@@ -86,7 +102,7 @@ function extractAssets(html) {
   for (const [name, entry] of Object.entries(pack)) {
     const bytes = zlib.gunzipSync(Buffer.from(entry.base64, 'base64'), { maxOutputLength: 64 * 1024 * 1024 });
     if (sha256(bytes) !== entry.sha256) throw new Error('embedded hash mismatch for ' + name);
-    const target = path.join(sourceDir, name.replace(/^\//, ''));
+    const target = path.join(sourceDir, sourceNameForAsset(name).replace(/^\//, ''));
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, bytes);
     count++;
@@ -96,7 +112,10 @@ function extractAssets(html) {
 
 function loadSources() {
   const files = new Map();
-  for (const name of walk(sourceDir)) files.set(name, fs.readFileSync(path.join(sourceDir, name.replace(/^\//, ''))));
+  for (const sourceName of walk(sourceDir)) {
+    const assetName = assetNameForSource(sourceName);
+    files.set(assetName, fs.readFileSync(path.join(sourceDir, sourceName.replace(/^\//, ''))));
+  }
   return files;
 }
 

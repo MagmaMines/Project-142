@@ -24,6 +24,7 @@
     "build:standalone": "node tools/build-standalone.mjs",
     "standalone:check": "node tools/build-standalone.mjs --check",
     "standalone:smoke": "node tools/standalone-smoke.mjs beownir-standalone.html",
+    "release:candidate": "node tools/package-release.mjs",
     "reports": "node tools/reports.mjs",
     "reports:fast": "node tools/reports.mjs --fast",
     "deploy:headers": "node tools/deploy-files.mjs",

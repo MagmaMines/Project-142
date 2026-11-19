@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-11-14T05:45:59.416Z",
-  "node": "v22.23.4",
+  "generatedAt": "2026-11-18T14:06:21.947Z",
+  "node": "v22.22.3",
   "runtime": "v20.11.0-beownir",
   "results": [
     {
@@ -13,7 +13,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1296
+      "ms": 847
     },
     {
       "name": "koa",
@@ -25,7 +25,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 491
+      "ms": 269
     },
     {
       "name": "fastify",
@@ -37,19 +37,19 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1385
+      "ms": 837
     },
     {
       "name": "hono",
       "passed": true,
-      "detail": "hono 4.13.18 answered 200 /hello",
+      "detail": "hono 4.13.19 answered 200 /hello",
       "packages": 1,
       "versions": [
-        "hono@4.13.18"
+        "hono@4.13.19"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 257
+      "ms": 99
     },
     {
       "name": "react",
@@ -62,7 +62,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 364
+      "ms": 1408
     },
     {
       "name": "vue",
@@ -70,12 +70,12 @@
       "detail": "vue 3.5.45 rendered <p>beownir</p>",
       "packages": 23,
       "versions": [
-        "@vue/server-renderer@3.5.45",
-        "vue@3.5.45"
+        "vue@3.5.45",
+        "@vue/server-renderer@3.5.45"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1449
+      "ms": 1080
     },
     {
       "name": "preact",
@@ -88,20 +88,20 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 260
+      "ms": 245
     },
     {
       "name": "svelte",
       "passed": true,
-      "detail": "svelte 5.57.3 compiled 311 bytes",
+      "detail": "svelte 5.58.0 compiled 311 bytes",
       "note": "ESM-only compiler reached through the \"svelte/compiler\" subpath export",
       "packages": 19,
       "versions": [
-        "svelte@5.57.3"
+        "svelte@5.58.0"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 948
+      "ms": 789
     },
     {
       "name": "vite",
@@ -114,7 +114,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1057
+      "ms": 1620
     },
     {
       "name": "hapi",
@@ -126,7 +126,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1686
+      "ms": 597
     },
     {
       "name": "zod",
@@ -138,7 +138,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 737
+      "ms": 212
     },
     {
       "name": "graphql",
@@ -150,7 +150,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 755
+      "ms": 270
     },
     {
       "name": "socket.io",
@@ -162,7 +162,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 797
+      "ms": 1347
     },
     {
       "name": "typescript",
@@ -175,7 +175,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1627
+      "ms": 2297
     },
     {
       "name": "babel",
@@ -183,12 +183,12 @@
       "detail": "babel 8.1.2 transformed JSX",
       "packages": 47,
       "versions": [
-        "@babel/preset-react@8.0.1",
-        "@babel/core@8.1.2"
+        "@babel/core@8.1.2",
+        "@babel/preset-react@8.0.1"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1691
+      "ms": 1142
     },
     {
       "name": "postcss",
@@ -200,7 +200,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 95
+      "ms": 72
     },
     {
       "name": "sass",
@@ -212,7 +212,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1360
+      "ms": 1016
     },
     {
       "name": "yargs",
@@ -224,7 +224,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 454
+      "ms": 280
     },
     {
       "name": "chalk",
@@ -237,7 +237,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 279
+      "ms": 34
     },
     {
       "name": "dotenv",
@@ -249,7 +249,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 43
+      "ms": 31
     },
     {
       "name": "esbuild",
@@ -262,7 +262,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 686
+      "ms": 454
     },
     {
       "name": "vite-dev-transform",
@@ -275,7 +275,76 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 2255
+      "ms": 977
+    },
+    {
+      "name": "vite-http-dev-server",
+      "passed": true,
+      "detail": "vite HTTP 200 index, 200 transformed module on virtual port 5173",
+      "note": "Vite dev server binds to the project virtual loopback; an HTTP client fetches the served HTML and transformed module over the runtime kernel",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 447
+    },
+    {
+      "name": "vite-production-build",
+      "passed": true,
+      "detail": "vite 6.4.6 production build emitted index.html, index-816tlDbo.js and index-B9-KD18r.css",
+      "note": "Vite 6 production build with the WASM Rollup/esbuild providers; verifies emitted HTML, JS bundle and CSS asset from a real virtual project",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 582
+    },
+    {
+      "name": "vite-react-production-build",
+      "passed": true,
+      "detail": "vite 6.4.6 + React 19.3.1 production bundle emitted index-BqpCRNZS.js with JSX and createRoot",
+      "note": "Integrated Vite 6 + React 19 production build from a virtual project; validates JSX transform, package resolution, Rollup output and emitted entry bundle (not browser hydration or arbitrary plugins)",
+      "packages": 14,
+      "versions": [
+        "vite@6.4.6",
+        "react@19.3.1",
+        "react-dom@19.3.1"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 3697
+    },
+    {
+      "name": "vite-react-dev-server",
+      "passed": true,
+      "detail": "vite 6.4.6 + React 19.3.1 dev HTTP 200 HTML, 200 JSX module with React imports",
+      "note": "Integrated Vite 6 + React 19 dev server: serves project HTML and transforms JSX with package imports through the virtual HTTP loopback (not browser hydration or HMR WebSocket)",
+      "packages": 14,
+      "versions": [
+        "vite@6.4.6",
+        "react@19.3.1",
+        "react-dom@19.3.1"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 428
+    },
+    {
+      "name": "vite-hmr-websocket",
+      "passed": true,
+      "detail": "vite 6.4.6 HMR WebSocket sent connected then update after src.js edit",
+      "note": "End-to-end Vite HMR over the runtime virtual WebSocket: handshake, connected frame, file edit and update frame. Does not assert browser DOM rendering.",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 278
     },
     {
       "name": "vite-hmr-invalidation",
@@ -288,7 +357,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1342
+      "ms": 635
     },
     {
       "name": "tailwind-4",
@@ -303,7 +372,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1625
+      "ms": 2743
     },
     {
       "name": "mocha",
@@ -316,7 +385,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1137
+      "ms": 796
     },
     {
       "name": "stylelint",
@@ -329,7 +398,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1194
+      "ms": 806
     },
     {
       "name": "chokidar",
@@ -342,7 +411,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 2041
+      "ms": 1670
     },
     {
       "name": "prettier",
@@ -355,7 +424,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 401
+      "ms": 346
     },
     {
       "name": "eslint",
@@ -368,7 +437,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1978
+      "ms": 1403
     },
     {
       "name": "tailwind-3",
@@ -382,7 +451,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1848
+      "ms": 1408
     }
   ]
 }

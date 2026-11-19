@@ -12,6 +12,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const rt = await initToolchain(loadRuntime());
 rt.sandbox.__check = fs.readFileSync(path.join(here, 'fixtures-wasi', 'wasi-check.js'), 'utf8');
 rt.sandbox.__quickjs = fs.readFileSync(path.join(here, 'fixtures-wasi', 'quickjs.wasm'));
+// Minimal WASI module whose _start calls proc_exit(7).
+rt.sandbox.__childExitWasm = Uint8Array.from(Buffer.from('0061736d0100000001080260017f0060000002240116776173695f736e617073686f745f70726576696577310970726f635f657869740000030201010503010001071302066d656d6f72790200065f737461727400010a08010600410710000b', 'hex'));
 rt.evaluate(`(() => {
   const F = __internal.getFS();
   const at = Date.now();
@@ -77,6 +79,14 @@ test('proc_exit ends the program and start() returns its exit code', () => {
   const r = check('environment');
   assert.equal(r.exit, undefined);
   assert.equal(r.startReturned, 7);
+});
+
+test('a parent runs a WASI command module and receives proc_exit status', async () => {
+  const result = await rt.evaluate(`CORE.module.createRequire('/project/index.js')('wasi').WASI.runChild(__childExitWasm, {version:'preview1'})`);
+  assert.equal(result.status, 7);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
+  assert.equal(result.outputLimitExceeded, false);
 });
 
 test('QuickJS-NG, a real WebAssembly engine, runs on this WASI host inside the runtime', () => {

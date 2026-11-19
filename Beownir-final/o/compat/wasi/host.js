@@ -53,6 +53,8 @@ class WASI {
     this._moduleName = options.version === 'unstable' ? 'wasi_unstable' : 'wasi_snapshot_preview1';
     this._args = (options.args || []).map(String);
     this._env = Object.entries(options.env || {}).map(([key, value]) => key + '=' + value);
+    this._stdout = typeof options.stdout === 'function' ? options.stdout : null;
+    this._stderr = typeof options.stderr === 'function' ? options.stderr : null;
     this._memory = null;
     this._fds = new Map([
       [0, { kind: 'stdin' }],
@@ -89,6 +91,34 @@ class WASI {
     this._memory = this._checkInstance(instance);
     if (instance.exports._start !== undefined) throw invalidType('instance.exports._start', 'undefined', instance.exports._start);
     if (typeof instance.exports._initialize === 'function') instance.exports._initialize();
+  }
+
+  // Execute one WASI command module as a child of the current runtime. This is
+  // an in-runtime WebAssembly task, not an operating-system process. The new
+  // WASI instance has independent descriptors and returns proc_exit to parent.
+  static async runChild(source, options = {}) {
+    if (!(source instanceof WebAssembly.Module) && !(source instanceof ArrayBuffer) && !ArrayBuffer.isView(source)) {
+      throw invalidType('source', 'WebAssembly.Module, ArrayBuffer, or typed array', source);
+    }
+    const maxOutputBytes = options.maxOutputBytes === undefined ? 1024 * 1024 : Number(options.maxOutputBytes);
+    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0 || maxOutputBytes > 32 * 1024 * 1024) {
+      throw nodeError('ERR_OUT_OF_RANGE', 'maxOutputBytes must be between 0 and 33554432');
+    }
+    const output = { stdout: [], stderr: [], bytes: 0, truncated: false };
+    const capture = stream => text => {
+      const value = String(text);
+      const bytes = Buffer.from(value);
+      const room = Math.max(0, maxOutputBytes - output.bytes);
+      const kept = bytes.subarray(0, room);
+      if (kept.length) output[stream].push(kept.toString('utf8'));
+      output.bytes += kept.length;
+      if (kept.length < bytes.length) output.truncated = true;
+    };
+    const wasi = new WASI({...options, stdout:capture('stdout'), stderr:capture('stderr')});
+    const module = source instanceof WebAssembly.Module ? source : await WebAssembly.compile(source);
+    const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
+    const status = wasi.start(instance);
+    return {status, stdout:output.stdout.join(''), stderr:output.stderr.join(''), outputLimitExceeded:output.truncated};
   }
 
   _checkInstance(instance) {
@@ -229,8 +259,8 @@ class WASI {
       fd_write(fd, iovs, iovsLen, writtenPtr) {
         const entry = this._entry(fd);
         const data = this._gather(iovs, iovsLen);
-        if (entry.kind === 'stdout') process.stdout.write(data.toString('utf8'));
-        else if (entry.kind === 'stderr') process.stderr.write(data.toString('utf8'));
+        if (entry.kind === 'stdout') (this._stdout || (text => process.stdout.write(text)))(data.toString('utf8'));
+        else if (entry.kind === 'stderr') (this._stderr || (text => process.stderr.write(text)))(data.toString('utf8'));
         else if (entry.kind === 'file') {
           this._writeAt(entry, data, entry.pos);
           entry.pos += data.length;

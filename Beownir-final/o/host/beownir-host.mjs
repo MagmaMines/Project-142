@@ -4277,6 +4277,8 @@ try {
 var artifactHash = crypto2.createHash("sha256").update(html).digest("hex");
 var base = Number(process.env.PORT || 4173);
 if (!Number.isInteger(base) || base < 1024 || base > 65533) throw Error("PORT must be 1024\u201365533");
+var bindAddress = process.env.BEOWNIR_BIND || "127.0.0.1";
+if (!["127.0.0.1", "0.0.0.0", "::1", "::"].includes(bindAddress)) throw Error("BEOWNIR_BIND must be one of 127.0.0.1, 0.0.0.0, ::1, or ::");
 var broker = createPreviewBroker();
 var servers = [];
 var closing = false;
@@ -4460,7 +4462,7 @@ for (const [server, port, name] of [[ide, base, "IDE"], [runtime, base + 1, "Iso
     else console.error(name + ": " + (error && error.message || error));
     shutdown("error", 1);
   });
-  server.listen(port, "0.0.0.0", () => console.log(name + " on 0.0.0.0:" + port));
+  server.listen(port, bindAddress, () => console.log(name + " on " + bindAddress + ":" + port));
   servers.push(server);
 }
 console.log("Beownir host " + version + " on Node " + process.versions.node + " · artifact " + artifactHash.slice(0, 16) + " · " + assets.size + " embedded assets");

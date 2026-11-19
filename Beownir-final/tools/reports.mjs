@@ -168,10 +168,10 @@ tree, and then runs the framework's own API inside the worker runtime.
 
 ${table(['framework', 'versions', 'what ran', 'result'], rows.map(row => [row.name, (row.versions || []).join(', '), row.detail + (row.note ? ' — ' + row.note : ''), row.passed ? 'pass' : 'FAIL: ' + (row.error || 'unknown')]))}
 
-A passing row means: the tarballs were fetched and extracted, the dependency
-tree resolved, the module loaded through the real resolver (CJS or ESM), and the
-framework executed the code shown. It does **not** mean a full application was
-built and served.
+A passing row means the exact code shown in that row ran after its packages were
+resolved and installed in the worker runtime. Some rows load an API; the Vite
+build/dev rows exercise bounded virtual projects. Neither row type proves
+arbitrary applications, browser rendering, or complete framework conformance.
 
 ## End-to-end development servers: what is and is not verified
 
@@ -181,33 +181,35 @@ built and served.
 | Koa, Fastify, hapi, Hono | Tested and passed | Each answers a real request through the virtual HTTP client |
 | React / Vue / Preact / Svelte SSR | Tested and passed | \`renderToString\`, \`createSSRApp\`, \`svelte/compiler\` |
 | Sass, PostCSS, Babel, TypeScript, GraphQL, zod, yargs, chalk, dotenv | Tested and passed | Real compilers/CLIs run inside the runtime |
-| Vite Node API (\`createServer\`) | **Not verified** | Vite loads (36 exports) but \`createServer()\` reaches Rollup's native binary and esbuild's native executable. The WASM pair is not wired into Vite's dependency graph, so a Vite dev server is documented as unsupported rather than claimed |
-| Vite production build | **Not verified** | Same native Rollup/esbuild requirement. The embedded esbuild-WASM bundler serves the *preview* pipeline, not Vite's build |
+| Vite Node API (\`createServer\`) | Tested and passed (bounded smoke) | Vite 6 runs with the embedded Rollup/esbuild WASM substitutions. Middleware transforms, virtual-loopback HTTP serving of HTML and transformed JS, and watcher invalidation pass. This is not full Vite conformance |
+| Vite production build | Tested and passed (bounded fixture) | Vite emits HTML, JS and CSS from a virtual project using the WASM Rollup/esbuild providers. Arbitrary plugins, workers, optimizeDeps and large applications remain unverified |
 | Next.js (dev or build) | **Fundamentally blocked in this runtime profile** | \`next\` needs SWC (\`@next/swc-*\` native addon) or the WASM fallback plus a real TCP listener. Neither is available to the limited engine; the native browser-WASM profile can host the server but next's dev server also needs a writable OS-like \`/tmp\`, file watching and worker threads |
 | Nuxt | **Not verified** | Installs and resolves; Nitro's server bundle needs the same native compiler path as Vite |
 | Astro, SvelteKit, Remix, Angular, NestJS | **Not tested** | Not part of the committed matrix. Where they depend on Vite/SWC they inherit the Vite limitation |
-| HMR | **Not from the runtime** | The runtime has no file-watcher substrate for framework HMR. The IDE's live preview reloads the page after a settled write (scroll/form/focus preserved); that is documented as live reload, not HMR |
+| HMR | **Partial; virtual transport verified, browser DOM not verified** | The framework matrix exercises Vite's HMR WebSocket handshake, connected frame, source edit and update frame, plus watcher/module invalidation. This does not verify a real browser client's DOM update, plugin ecosystem or full application HMR; IDE live reload is a separate feature |
 | Production preview | Supported | \`beownir build\` output can be previewed by the static server in the runtime; the native profile exports \`dist\`/\`.next\`/\`.output\` as a ZIP |
 
-## Why the server-side gap exists
+## Vite and TypeScript scope
 
-Vite, Next and Nuxt all assume they own an operating-system process: they spawn
-\`esbuild\`, load \`rollup\`'s native addon, and bind a TCP port. A page can bind
-no arbitrary port and cannot load a native addon. Two honest paths exist and
-neither is complete in this build:
+The passing Vite rows run Vite 6's Node API inside the browser worker runtime
+with the repository's WASM Rollup/esbuild providers. They cover TypeScript
+module transforms, a virtual-loopback dev-server HTTP request, a bounded
+production build, React integration, and virtual HMR transport/invalidation.
+They do not prove arbitrary plugins, optimizeDeps, browser DOM updates, the
+upstream Vite CLI in every terminal profile, or arbitrary projects. In
+particular, the limited compatibility shell's \`vite\` command may route to its
+preview adapter; do not equate that adapter with the Vite CLI.
 
-1. **WASM substitution** — run Rollup's WASM build and esbuild's WASM build
-   inside the runtime, patch Vite's dependency graph to prefer them. The
-   esbuild WASM binary is already embedded (it powers the preview bundler); the
-   Rollup pieces are not.
-2. **Native browser-WASM profile** — the Wasmer/WASIX execution groups in
-   \`o/native/\` boot a real Node distribution with its own filesystem, process
-   model and port ownership. This is where a genuine Vite/Next dev server is
-   reachable, and the host relay exposes its ports to the preview origin. It
-   requires COOP/COEP (cross-origin isolation) and the host.
+The TypeScript row uses TypeScript 5's \`transpileModule\`; the Vite fixture also
+transforms a \`.ts\` module. This is transpilation evidence, not \`tsc\` semantic
+type-checking or support for every \`tsconfig\` option. Native compiler binaries
+and arbitrary editor language-service behavior are not established by these
+rows.
 
-The matrix therefore certifies framework *APIs* and server frameworks, not
-framework *dev servers*, and this report does not score the latter as passing.
+The native browser-WASM profile is a separate execution path intended to host
+a real Node environment, but its runtime package acquisition is still blocked
+in the audited browser environment. Do not use that intended path as evidence
+that native Node/Vite works until an actual guest acceptance run passes.
 `;
 }
 
@@ -270,13 +272,17 @@ exist in the code, not a third-party penetration test.
    needs the host; \`file://\` cannot be cross-origin isolated at all, which is
    why SharedArrayBuffer/JSPI profiles report "unavailable" rather than silently
    degrading.
-4. **The host binds loopback by default.** Exposing it publicly is a deliberate
-   act (\`--host 0.0.0.0\`), and the audit does not claim the relay is safe as a
-   public reverse proxy.
-5. **WebAssembly is not a security boundary by itself.** The native profile runs
-   a real Node build with WASI syscalls; the sandbox is the WASM runtime's
-   capability set (filesystem mounts, port allow-list), not the fact that it is
-   compiled to wasm.
+4. **The host binds to loopback by default (\`127.0.0.1\`).** Network exposure
+   requires the explicit \`BEOWNIR_BIND=0.0.0.0\` opt-in. That does not make the
+   relay safe as a public reverse proxy; use a separately secured deployment
+   boundary and do not expose the development host to untrusted clients.
+5. **WebAssembly is not a security boundary by itself.** The native profile is
+   designed to acquire an Edge.js/WASIX Node runtime and constrain it with the
+   WASM runtime's filesystem mounts and port policy. In the isolated Chromium
+   acceptance attempt, registry acquisition failed before the guest started;
+   native guest isolation and capability behavior therefore remain unverified.
+   A successful WASM instantiation would still not by itself establish a secure
+   sandbox.
 
 ## What was not tested
 

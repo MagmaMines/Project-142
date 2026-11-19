@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,7 +39,7 @@ function startHost(args, env) {
   const ready = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('host did not start in 30s\n' + stdout + '\n' + stderr)), 30000);
     const poll = setInterval(() => {
-      if ((stdout.match(/ on 0\.0\.0\.0:\d+/g) || []).length >= 3) {
+      if ((stdout.match(/ on (?:127\.0\.0\.1|0\.0\.0\.0|::1|::):\d+/g) || []).length >= 3) {
         clearInterval(poll);
         clearTimeout(timer);
         resolve();
@@ -62,6 +63,7 @@ test('the host serves the IDE, runtime assets and preview from three isolated or
   const host = startHost([appFile], { PORT: String(base) });
   try {
     await host.ready;
+    assert.match(host.output(), /IDE on 127\.0\.0\.1:/, 'the host defaults to loopback and is not LAN-exposed');
     const ide = 'http://127.0.0.1:' + base;
     const runtime = 'http://127.0.0.1:' + (base + 1);
     const preview = 'http://127.0.0.1:' + (base + 2);
@@ -134,6 +136,11 @@ test('the host serves the IDE, runtime assets and preview from three isolated or
     /* --- preview origin --- */
     const previewHealth = await (await get(preview + '/healthz')).json();
     assert.equal(previewHealth.role, 'preview');
+    const deployedCheck = await promisify(execFile)(process.execPath, [
+      path.join(root, 'o', 'deploy', 'check.mjs'), '--ide', ide, '--runtime', runtime, '--preview', preview
+    ], { timeout: 60000 });
+    assert.match(deployedCheck.stdout, /Runtime and preview origins match the deployment.*host-injected origin config/);
+    assert.match(deployedCheck.stdout, /All server-side checks passed/);
     const offline = await get(preview + '/');
     assert.equal(offline.status, 503);
     assert.match(await offline.text(), /not connected/);
@@ -160,6 +167,11 @@ test('the host fails fast with a clear message for a bad PORT or a missing HTML 
   const second = await missing.exited;
   assert.equal(second.code, 2);
   assert.match(missing.output(), /cannot find the single-file app/i);
+
+  const badBind = startHost([appFile], { PORT: String(await findBase()), BEOWNIR_BIND: '192.0.2.1' });
+  const third = await badBind.exited;
+  assert.notEqual(third.code, 0);
+  assert.match(badBind.output(), /BEOWNIR_BIND must be one of/);
 });
 
 test('websocket upgrades without a trusted origin are rejected', { timeout: 60000 }, async () => {

@@ -18,7 +18,7 @@ will allow, not in what the IDE is.
 - **Node.js**: 22 LTS for the tooling, tests and host (`engines: >=18.17`,
   but the test suite and the hashes in the reports were produced on 22.22.3).
   Nothing in the browser needs Node.
-- **Disk**: the artifact is about 8.6 MiB.
+- **Disk**: the artifact is about 9.04 MiB.
 
 ## A. Open the single file
 
@@ -117,8 +117,10 @@ Open `http://localhost:4173`. The host provides what a page cannot:
   profile possible (the Node distribution in `o/native/` runs there);
 - **COOP/COEP on every response**, so SharedArrayBuffer stays available.
 
-`npm run host -- --host 0.0.0.0 --port 8080` exposes it on a LAN; the audit
-notes the caveats of doing that behind no reverse proxy.
+The host binds to `127.0.0.1` by default. For a trusted LAN/reverse-proxy
+setup, explicitly opt in with `BEOWNIR_BIND=0.0.0.0 PORT=8080 npm run host`.
+This exposes all three ports to the network; do not use it on an untrusted
+network or public interface without a separately secured reverse proxy.
 
 ## First project
 

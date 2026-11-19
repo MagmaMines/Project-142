@@ -44,7 +44,7 @@ test('the committed matrix is real evidence, not a placeholder', () => {
     assert.ok(result.name, 'every row is named');
     assert.ok(result.packages > 0, result.name + ' installed packages');
     assert.ok(result.versions.length > 0, result.name + ' records the installed version');
-    assert.match(result.detail, /served|rendered|answered|compiled|loaded|parsed|executed|handshake|transformed|produced|styled|passes=|warnings=|events=|messages=|formatted|Cannot|Error/, result.name + ' records what happened');
+    assert.match(result.detail, /served|rendered|answered|compiled|loaded|parsed|executed|handshake|upgraded|update after|transformed|produced|emitted|styled|dev HTTP|passes=|warnings=|events=|messages=|formatted|Cannot|Error/, result.name + ' records what happened');
   }
   const passing = document.results.filter(result => result.passed);
   assert.equal(passing.length, document.results.length, 'every committed row passes; --write refreshes the evidence');

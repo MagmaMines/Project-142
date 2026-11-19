@@ -74,6 +74,15 @@ function load({ isolated = true, sab = true, jspi = true, opfs = true, shell = '
 
 const byName = rows => Object.fromEntries(rows.map(row => [row.name, row]));
 
+test('static-host Install and Build actions use the limited browser runtime', () => {
+  const setup = page.slice(page.indexOf('  function npmDialog(){'), page.indexOf('  // Explicit built-in-template lifecycle.'));
+  assert.match(setup, /nativeMode\(\)\s*\?\s*'pnpm install --ignore-scripts'\s*:\s*'npm install'/);
+  assert.match(setup, /nativeMode\(\)\s*\?\s*'pnpm build'\s*:\s*'npm run build'/);
+  assert.match(setup, /\[\['Install declared dependencies','npm install'\],\['Build project script','npm run build'\]\]/);
+  assert.match(setup, /limited browser runtime includes an npm-compatible registry installer/);
+  assert.match(setup, /This static-host profile does not compile native C\/C\+\+ addons/);
+});
+
 test('an isolated Chromium unlocks the native capabilities', () => {
   const { sandbox } = load();
   const rows = byName(sandbox.probeCapabilities());
