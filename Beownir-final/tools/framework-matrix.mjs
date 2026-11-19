@@ -341,6 +341,17 @@ const profiles = [
     })()`,
   },
   {
+    name: 'vite-cli-production-build',
+    packages: [{ name: 'vite', range: '6' }],
+    files: {
+      'index.html': '<!doctype html><html><body><script type="module" src="/src/main.ts"></script></body></html>',
+      'src/main.ts': 'const greeting: string = "Vite CLI in single-file runtime"; document.body.textContent = greeting;',
+    },
+    command: 'vite --version && vite build --outDir build --emptyOutDir --no-minify',
+    verify: `(() => { const fs = require('fs'); const html = fs.readFileSync('/project/build/index.html', 'utf8'); const assets = fs.readdirSync('/project/build/assets'); const js = assets.find(name => name.endsWith('.js')); if (!html.includes('/assets/') || !js || !fs.readFileSync('/project/build/assets/' + js, 'utf8').includes('Vite CLI in single-file runtime')) throw new Error('Vite CLI did not emit the expected TypeScript app bundle'); return 'verified index.html and ' + js; })()`,
+    note: 'Runs the Vite 6 command through its installed Node API and WASM bundler; validates TypeScript output and bundle content; unsupported CLI options are rejected rather than silently ignored',
+  },
+  {
     name: 'vite-react-production-build',
     packages: [{ name: 'vite', range: '6' }, { name: 'react', range: '19' }, { name: 'react-dom', range: '19' }],
     note: 'Integrated Vite 6 + React 19 production build from a virtual project; validates JSX transform, package resolution, Rollup output and emitted entry bundle (not browser hydration or arbitrary plugins)',
@@ -609,6 +620,10 @@ const run = async ({ only, write, check }) => {
         const result = await rt.run(profile.command);
         outcome = (result.output || '').trim() || 'command completed with exit ' + result.code;
         code = result.code;
+        if (code === 0 && profile.verify) {
+          const verified = await rt.evaluate(`(() => { const require = CORE.module.createRequire('/project/index.js'); return (${profile.verify}); })()`);
+          outcome += '; ' + String(verified);
+        }
       } else {
         const value = await rt.evaluate(`(async () => { const require = CORE.module.createRequire('/project/index.js'); const http = CORE.http; return (${profile.smoke}); })()`);
         outcome = String(value); code = 0;

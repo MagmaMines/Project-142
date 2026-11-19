@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-18T14:06:21.947Z",
+  "generatedAt": "2026-11-19T18:05:59.904Z",
   "node": "v22.22.3",
   "runtime": "v20.11.0-beownir",
   "results": [
@@ -13,7 +13,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 847
+      "ms": 1089
     },
     {
       "name": "koa",
@@ -25,7 +25,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 269
+      "ms": 339
     },
     {
       "name": "fastify",
@@ -37,7 +37,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 837
+      "ms": 1022
     },
     {
       "name": "hono",
@@ -49,7 +49,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 99
+      "ms": 103
     },
     {
       "name": "react",
@@ -57,12 +57,12 @@
       "detail": "react 19.3.1 rendered <main><h1>beownir</h1></main>",
       "packages": 3,
       "versions": [
-        "react-dom@19.3.1",
-        "react@19.3.1"
+        "react@19.3.1",
+        "react-dom@19.3.1"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1408
+      "ms": 1714
     },
     {
       "name": "vue",
@@ -75,7 +75,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1080
+      "ms": 1148
     },
     {
       "name": "preact",
@@ -88,7 +88,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 245
+      "ms": 241
     },
     {
       "name": "svelte",
@@ -101,7 +101,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 789
+      "ms": 603
     },
     {
       "name": "vite",
@@ -114,7 +114,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1620
+      "ms": 1923
     },
     {
       "name": "hapi",
@@ -126,7 +126,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 597
+      "ms": 693
     },
     {
       "name": "zod",
@@ -138,7 +138,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 212
+      "ms": 215
     },
     {
       "name": "graphql",
@@ -150,7 +150,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 270
+      "ms": 298
     },
     {
       "name": "socket.io",
@@ -162,7 +162,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1347
+      "ms": 1865
     },
     {
       "name": "typescript",
@@ -175,7 +175,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 2297
+      "ms": 3404
     },
     {
       "name": "babel",
@@ -188,7 +188,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1142
+      "ms": 2808
     },
     {
       "name": "postcss",
@@ -200,7 +200,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 72
+      "ms": 80
     },
     {
       "name": "sass",
@@ -212,7 +212,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1016
+      "ms": 996
     },
     {
       "name": "yargs",
@@ -224,7 +224,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 280
+      "ms": 316
     },
     {
       "name": "chalk",
@@ -237,7 +237,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 34
+      "ms": 48
     },
     {
       "name": "dotenv",
@@ -249,7 +249,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 31
+      "ms": 40
     },
     {
       "name": "esbuild",
@@ -262,7 +262,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 454
+      "ms": 516
     },
     {
       "name": "vite-dev-transform",
@@ -275,7 +275,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 977
+      "ms": 1115
     },
     {
       "name": "vite-http-dev-server",
@@ -288,7 +288,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 447
+      "ms": 472
     },
     {
       "name": "vite-production-build",
@@ -301,7 +301,20 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 582
+      "ms": 554
+    },
+    {
+      "name": "vite-cli-production-build",
+      "passed": true,
+      "detail": "vite/6.4.6\nvite 6.4.6 built 2 output bundle item(s) from /project; verified index.html and index-pfxZuzYB.js",
+      "note": "Runs the Vite 6 command through its installed Node API and WASM bundler; validates TypeScript output and bundle content; unsupported CLI options are rejected rather than silently ignored",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 370
     },
     {
       "name": "vite-react-production-build",
@@ -316,7 +329,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 3697
+      "ms": 5489
     },
     {
       "name": "vite-react-dev-server",
@@ -331,7 +344,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 428
+      "ms": 429
     },
     {
       "name": "vite-hmr-websocket",
@@ -344,7 +357,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 278
+      "ms": 358
     },
     {
       "name": "vite-hmr-invalidation",
@@ -357,7 +370,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 635
+      "ms": 674
     },
     {
       "name": "tailwind-4",
@@ -372,7 +385,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 2743
+      "ms": 3090
     },
     {
       "name": "mocha",
@@ -385,7 +398,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 796
+      "ms": 993
     },
     {
       "name": "stylelint",
@@ -398,7 +411,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 806
+      "ms": 896
     },
     {
       "name": "chokidar",
@@ -411,7 +424,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1670
+      "ms": 1681
     },
     {
       "name": "prettier",
@@ -424,7 +437,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 346
+      "ms": 292
     },
     {
       "name": "eslint",
@@ -437,7 +450,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1403
+      "ms": 1511
     },
     {
       "name": "tailwind-3",
@@ -451,7 +464,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1408
+      "ms": 1595
     }
   ]
 }

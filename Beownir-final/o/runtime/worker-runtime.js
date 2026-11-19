@@ -9186,9 +9186,65 @@ async function runNpm(args) {
   }
   throw new Error('Unsupported npm command: ' + sub + '. This is a constrained registry client; type npm help.');
 }
+async function runViteCLI(args) {
+  const vite = makeRequire(CWD + '/package.json')('vite');
+  if (args.includes('--version') || args.includes('-v')) { out('vite/' + vite.version + '\n'); return 0; }
+  if (args.includes('--help') || args.includes('-h')) { out('vite [root] [--port N] [--host [HOST]] | vite build [root] [--outDir DIR] [--base PATH] [--mode MODE] [--minify] [--sourcemap]\n'); return 0; }
+  const action = args[0] === 'build' ? 'build' : 'serve';
+  let root = CWD, configFile, base, mode, port = 5173, host = '127.0.0.1', strictPort = false;
+  const build = {};
+  const valueOptions = new Map([['--config', 'config'], ['-c', 'config'], ['--base', 'base'], ['--mode', 'mode'], ['-m', 'mode'], ['--port', 'port'], ['-p', 'port'], ['--host', 'host'], ['--outDir', 'outDir']]);
+  for (let i = action === 'build' ? 1 : 0; i < args.length; i++) {
+    const arg = String(args[i]);
+    const equals = arg.indexOf('=');
+    const name = equals < 0 ? arg : arg.slice(0, equals);
+    let value = equals < 0 ? null : arg.slice(equals + 1);
+    if (valueOptions.has(name)) {
+      if (value === null) {
+        if (i + 1 >= args.length || String(args[i + 1]).startsWith('--')) {
+          if (name === '--host' && value === null) { host = '0.0.0.0'; continue; }
+          throw new Error('Vite option ' + name + ' requires a value.');
+        }
+        value = String(args[++i]);
+      }
+      switch (valueOptions.get(name)) {
+        case 'config': configFile = resolve(value); break;
+        case 'base': base = value; break;
+        case 'mode': mode = value; break;
+        case 'port': port = Number(value); if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Vite port must be between 0 and 65535.'); break;
+        case 'host': host = value; break;
+        case 'outDir': build.outDir = value; break;
+      }
+      continue;
+    }
+    if (arg === '--strictPort') { strictPort = true; continue; }
+    if (arg === '--emptyOutDir') { build.emptyOutDir = true; continue; }
+    if (arg === '--no-emptyOutDir') { build.emptyOutDir = false; continue; }
+    if (arg === '--minify') { build.minify = true; continue; }
+    if (arg === '--no-minify') { build.minify = false; continue; }
+    if (arg === '--sourcemap') { build.sourcemap = true; continue; }
+    if (arg === '--watch') throw new Error('Vite watch builds are not supported by this browser runtime.');
+    if (arg.startsWith('-')) throw new Error('Unsupported Vite CLI option: ' + arg);
+    if (root !== CWD) throw new Error('Vite accepts one project root argument.');
+    root = resolve(arg);
+  }
+  if (action === 'build') {
+    const result = await vite.build({ root, configFile, base, mode, logLevel: 'silent', build });
+    const output = Array.isArray(result) ? result.flatMap(item => item.output || []) : result?.output || [];
+    out('vite ' + vite.version + ' built ' + output.length + ' output bundle item(s) from ' + root + '\n');
+    return 0;
+  }
+  const server = await vite.createServer({ root, configFile, base, mode, logLevel: 'info', server: { host, port, strictPort } });
+  await server.listen();
+  const address = server.httpServer?.address?.();
+  const actualPort = typeof address === 'object' && address ? address.port : port;
+  out('VITE v' + vite.version + ' ready at http://' + host + ':' + actualPort + '/\n');
+  return 0;
+}
 async function runNpx(args) {
   const [tool, ...rest] = args;
   if (tool === 'esbuild') { await runEsbuild(rest); return 0; }
+  if (tool === 'vite' && packageRecord('/project/node_modules/vite')) return runViteCLI(rest);
   if (['serve', 'http-server', 'vite'].includes(tool)) {
     if (rest.includes('build') || rest.includes('--watch')) throw new Error('The preview adapter is not Vite itself and does not implement Vite build/HMR/plugins. Install Vite to use its real CLI, or use npx esbuild for a build.');
     devServer(tool, rest); return 0;
@@ -9209,7 +9265,8 @@ const NPM_HELP = `Beownir registry client — a subset, not the native npm progr
   npm start | dev | build | test
   npm uninstall <name> | ls | view <name> | init
   npx esbuild <entry> --bundle --outfile=dist/app.js
-  npx serve [--port 5173]     virtual preview + embedded esbuild bundling
+  npx vite build [options]   installed Vite 6 API + WASM Rollup/esbuild (bounded CLI subset)
+  npx serve [--port 5173]     lightweight virtual preview adapter
 Registry only. Install lifecycle scripts, optional/automatic peer dependencies,
 git/file/URL aliases, native executables, and native .node addons are unsupported.
 `;
@@ -9327,11 +9384,11 @@ npm install streams every tarball as parallel byte ranges ("packets") with
 resume and per-package retries, so large packages such as next install without
 a single-response size limit. node_modules never enters the source workspace;
 it is restored from a compressed dependency checkpoint after a reload.
-Live reload (no HMR): save a file and the preview refreshes while keeping the
-scroll offset, typed form values and focus. Native browser-WASM servers keep
-their own HMR.
+The lightweight serve adapter uses live reload (no HMR) and preserves scroll,
+form values and focus. Installed Vite 6 has a bounded Node-API path for builds
+and virtual dev/HMR tests; arbitrary CLI options and plugins are not supported.
 No native OS binaries, sync child processes, cross-process raw TCP/TLS,
-worker_threads, native addons or full Vite/Next.js/Nuxt CLIs.
+worker_threads, native addons or full Next.js/Nuxt CLIs.
 `;
 post({type:'boot'});
 
