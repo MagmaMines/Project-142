@@ -5459,10 +5459,21 @@ const COMPAT_LIGHTNINGCSS_SOURCE = "// Pass-through stand-in for lightningcss: T
  * initialize(), so a caller never stalls on a cold service. */
 const ESBUILD_SHIM_SOURCE = `"use strict";
 const api = require("/.beownir/runtime/esbuild.js");
-let ready = null;
-const ensure = () => ready || (ready = WebAssembly.compile(require("fs").readFileSync("/.beownir/runtime/esbuild.wasm"))
-  .then(wasmModule => api.initialize({ wasmModule, worker: false }))
-  .catch(error => { ready = null; throw error; }));
+/* Initialization is shared with the runtime's own embedded esbuild (see
+ * getEsbuildApi): the WASM binary calls WebAssembly initialize exactly once
+ * per process, so every path must await the same promise. */
+const ensure = () => {
+  /* The slot is claimed synchronously (before the first await) so concurrent
+   * callers in the same worker always await the one initialization. */
+  if (!globalThis.__beownirEsbuildInit) {
+    globalThis.__beownirEsbuildInit = (async () => {
+      const wasmModule = await WebAssembly.compile(require("fs").readFileSync("/.beownir/runtime/esbuild.wasm"));
+      await api.initialize({ wasmModule, worker: false });
+      return api;
+    })().catch(error => { globalThis.__beownirEsbuildInit = null; throw error; });
+  }
+  return globalThis.__beownirEsbuildInit;
+};
 const later = name => (...args) => ensure().then(() => api[name](...args));
 const synchronous = name => () => { throw new Error("esbuild." + name + " needs the native binary; use the async API instead"); };
 module.exports = Object.assign({}, api, {
@@ -8043,7 +8054,13 @@ self.onmessage=async ev=>{
     if(m.type==='http'){
       const staticFile=staticResponse(m.url);
       if(m.asset==='module'&&staticFile&&/\.(?:[cm]?js|jsx|tsx?|vue)$/.test(staticFile.file)){const code=await buildPreviewModule(staticFile.file);post({type:'httpres',id:m.id,status:200,headers:{'content-type':'text/javascript'},body:te.encode(code)});return;}
-      if(!SERVERS.has(m.port)&&staticFile){post({type:'httpres',id:m.id,status:200,headers:{'content-type':mime(staticFile.file)},body:readFileSync(staticFile.file)});return;}
+      if(!SERVERS.has(m.port)&&staticFile){
+        // No dev server on the port: TypeScript/JSX served raw would not parse,
+        // so compile those through esbuild instead. Plain JavaScript is served
+        // as-is so nested imports can be handled by the preview's module loader.
+        if(/\.(?:jsx|tsx?|vue)$/.test(staticFile.file)){const code=await buildPreviewModule(staticFile.file);post({type:'httpres',id:m.id,status:200,headers:{'content-type':'text/javascript'},body:te.encode(code)});return;}
+        post({type:'httpres',id:m.id,status:200,headers:{'content-type':mime(staticFile.file)},body:readFileSync(staticFile.file)});return;
+      }
       handleHttp(m);return;
     }
     if(m.type==='stdin'){if(pendingQuestion){const callback=pendingQuestion;pendingQuestion=null;callback(m.data);post({type:'questionend'});}else processObj.stdin.push(Buffer.from(String(m.data)+'\n'));return;}
@@ -9273,7 +9290,7 @@ git/file/URL aliases, native executables, and native .node addons are unsupporte
 
 let esbuildApiPromise = null;
 async function getEsbuildApi(){
- if(!esbuildApiPromise)esbuildApiPromise=(async()=>{const api=loadFile('/.beownir/runtime/esbuild.js');const wasmModule=await WebAssembly.compile(readFileSync('/.beownir/runtime/esbuild.wasm'));await api.initialize({wasmModule,worker:false});return api;})();
+ if(!esbuildApiPromise)esbuildApiPromise=(async()=>{ const api=loadFile('/.beownir/runtime/esbuild.js'); if(!globalThis.__beownirEsbuildInit){ globalThis.__beownirEsbuildInit=(async()=>{ const wasmModule=await WebAssembly.compile(readFileSync('/.beownir/runtime/esbuild.wasm')); await api.initialize({wasmModule,worker:false}); return api; })().catch(error=>{ globalThis.__beownirEsbuildInit=null; throw error; }); } return globalThis.__beownirEsbuildInit; })();
  return esbuildApiPromise;
 }
 function compileVueSfc(file,source){
@@ -9482,7 +9499,11 @@ prepareModules = async (...args) => { kernelInternalDepth++; try { return await 
 
 function applyKernelFiles(incoming, incomingVersions = {}, replace = false) {
   const allowed = p => p === '/project' || p.startsWith('/project/') || p === '/tmp' || p.startsWith('/tmp/');
-  if (replace) for (const path of Object.keys(FS)) if (allowed(path) && !Object.hasOwn(incoming, path) && !dirty.has(path)) { delete FS[path]; delete cache[path]; notifyFilesystem(path); }
+  // The workspace snapshot never contains the dependency tree or runtime scratch
+  // space (they are owned by the worker's dependency checkpoint, see syncBack),
+  // so the authoritative refresh must not delete them.
+  const dependencyOwned = path => path === '/project/node_modules' || path.startsWith('/project/node_modules/') || path === '/project/.beownir' || path.startsWith('/project/.beownir/');
+  if (replace) for (const path of Object.keys(FS)) if (allowed(path) && !dependencyOwned(path) && !Object.hasOwn(incoming, path) && !dirty.has(path)) { delete FS[path]; delete cache[path]; notifyFilesystem(path); }
   for (const [path, value] of Object.entries(incoming)) {
     if (!allowed(path)) continue;
     const revision = Number(incomingVersions[path]) || 0;
