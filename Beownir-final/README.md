@@ -68,9 +68,33 @@ npm run host      # serve the IDE on http://localhost:4173 (runtime 4174, previe
 npm run serve:static # serve the deploy artifact with the Netlify headers on :8080
 ```
 
-Requires Node 18.17+ for the test suite and the host. The browser app itself
-needs a Chromium-based browser; the native browser-WASM profile additionally
-needs cross-origin isolation (SharedArrayBuffer + JSPI).
+Requires Node 18.17+ for the test suite and the host.
+
+## Browser support
+
+| | Floor | Notes |
+| --- | --- | --- |
+| Chrome / Edge | 85 | Everything in this README works, including the service-worker preview and offline shell. |
+| Firefox | 79 | Same, with one caveat: the service-worker preview path is Chromium-tested only (see below). |
+| Safari | 14 | Same caveat; WebKit is untested (no runner in CI). |
+
+The floor is enforced, not aspirational: `npm run check` fails the build if the
+shipped bundle uses an unguarded language feature newer than the floor
+(`Object.hasOwn`, `String.prototype.replaceAll`, `Array.prototype.at`,
+`structuredClone`, `Promise.withResolvers`, `Array.fromAsync`,
+`Array.prototype.findLast`, `AbortSignal.timeout`). Platform features are not in
+that list because they are probed at boot and degrade with a visible reason
+rather than crashing: service worker, SharedArrayBuffer/JSPI, OPFS,
+CompressionStream, IndexedDB/localStorage, WebCrypto.
+
+What is *not* a support question: the native browser-WASM profile needs
+cross-origin isolation (SharedArrayBuffer + JSPI), which Safari only exposes
+inside a dedicated worker (no JSPI on the main thread as of Safari 18), so that
+profile is Chromium-only by design. And this release has been **verified in
+Chromium only** — the degraded-engine tests simulate missing APIs in a VM, which
+is not the same as running on Gecko. Treat Firefox/Safari as "should work from
+the feature floor, unverified here" until someone runs the suite in those
+engines.
 
 ## Two runtimes
 

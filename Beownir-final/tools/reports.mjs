@@ -307,6 +307,14 @@ exist in the code, not a third-party penetration test.
   builds listed in \`SINGLEFILE_BUILD_REPORT.md\`).
 - No audit of the host's behaviour behind a TLS-terminating proxy beyond the
   \`X-Forwarded-Proto\` handling visible in the source.
+- **No cross-engine run.** Every browser-level assertion in this repository was
+  produced by Chromium (headless, Playwright). The worker runtime itself is
+  engine-independent JavaScript and \`test/degraded-browser.test.mjs\` boots it with
+  APIs removed, but that is a simulation, not Gecko or WebKit. Firefox 79+ and
+  Safari 14+ are stated as a language-feature floor enforced by
+  \`tools/check.mjs\`, not as a tested target. Untested on Gecko: the
+  service-worker preview path, the offline shell, and JIT/heap behaviour under
+  the 9 MB single file.
 `;
 }
 

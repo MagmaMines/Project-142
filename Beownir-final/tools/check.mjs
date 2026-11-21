@@ -10,7 +10,8 @@
  *   3. every `$('#id')` lookup points at an element that exists
  *   4. every DOM id is unique
  *   5. the native runtime asset pack is valid: base64 -> gzip -> sha256
- *   6. the document keeps its required single-file anchors
+ *   6. the shipped bundle uses no language feature newer than the browser floor
+ *   7. the document keeps its required single-file anchors
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -112,7 +113,67 @@ try {
   fail('native asset check failed: ' + error.message);
 }
 
-/* 7. single-file anchors */
+/* 7. browser floor.
+ * The app is shipped as one modern-JS document with no transpile step, so a
+ * language or platform feature newer than the stated floor can only fail in
+ * someone else's browser. Everything below is *unguarded* use of a feature:
+ * the guarded ones (service worker, SharedArrayBuffer/JSPI, OPFS, compression
+ * streams, storage APIs) are probed at boot and degrade with a visible reason,
+ * which is why they are not in this list. Keep this list honest when the floor
+ * moves: it is the difference between "supports modern browsers" and a claim. */
+const FLOOR = { chrome: 85, edge: 85, firefox: 79, safari: 14 };
+/* Patterns are matched against executable source only: script bodies, with the
+ * embedded `type="text/plain"` sources checked separately. Prose in the UI
+ * (help text, terminal banners) is not code, so `node -e "code"` in a banner
+ * must not trip the Array.prototype.at check. */
+const UNSHIPPABLE = [
+  { pattern: String.raw`\.hasOwn\(`, feature: 'Object.hasOwn', needs: 'Chrome 93, Firefox 92, Safari 15.4' },
+  { pattern: String.raw`\.replaceAll\(`, feature: 'String.prototype.replaceAll', needs: 'Chrome 85, Firefox 77, Safari 13.1' },
+  { pattern: String.raw`\.at\(-\d\)`, feature: 'Array.prototype.at', needs: 'Chrome 92, Firefox 90, Safari 15.4' },
+  { pattern: String.raw`structuredClone\s*\(`, feature: 'structuredClone', needs: 'Chrome 98, Firefox 94, Safari 15.4', probe: "typeof structuredClone !== 'function'" },
+  { pattern: String.raw`Promise\.withResolvers`, feature: 'Promise.withResolvers', needs: 'Chrome 119, Firefox 121, Safari 17.4' },
+  { pattern: String.raw`Array\.fromAsync`, feature: 'Array.fromAsync', needs: 'Chrome 121, Firefox 121, Safari 16.4' },
+  { pattern: String.raw`\.findLast\(`, feature: 'Array.prototype.findLast', needs: 'Chrome 97, Firefox 104, Safari 15.4' },
+  { pattern: String.raw`AbortSignal\.timeout`, feature: 'AbortSignal.timeout', needs: 'Chrome 103, Firefox 100, Safari 16' },
+];
+const scriptBodies = [];
+{
+  const open = /<script([^>]*)>/g;
+  let match;
+  while ((match = open.exec(html))) {
+    const start = match.index + match[0].length;
+    const end = html.indexOf('</script>', start);
+    if (end < 0) break;
+    scriptBodies.push(html.slice(start, end));
+  }
+}
+const floorOffences = [];
+for (const { pattern, feature, needs, probe } of UNSHIPPABLE) {
+  const matcher = new RegExp(pattern, 'g');
+  let total = 0;
+  for (const body of scriptBodies) {
+    for (const line of body.split('\n')) {
+      const trimmed = line.trim();
+      /* Comments explain a feature; they do not call it. */
+      if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue;
+      if (!matcher.test(line)) continue;
+      matcher.lastIndex = 0;
+      /* A guarded use is fine: `typeof structuredClone !== 'function'` on the
+       * same line means the feature is probed before it is called. */
+      if (typeof probe === 'string' && line.includes(probe)) continue;
+      total += (line.match(matcher) || []).length;
+    }
+  }
+  if (total) floorOffences.push(feature + ' x' + total + ' (' + needs + ')');
+}
+if (floorOffences.length) {
+  fail('the shipped bundle uses features newer than the supported browser floor (' +
+    'Chrome ' + FLOOR.chrome + '+ / Firefox ' + FLOOR.firefox + '+ / Safari ' + FLOOR.safari + '+): ' +
+    floorOffences.join('; '));
+} else {
+  notes.push('browser floor: Chrome ' + FLOOR.chrome + '+ / Firefox ' + FLOOR.firefox + '+ / Safari ' + FLOOR.safari + '+ language features only');
+}
+/* 8. single-file anchors */
 for (const anchor of ['<!--BEOWNIR_HOST_CONFIG-->', '<meta name="beownir-origins"', 'id="runtimeSource"', 'id="runtimeFrameSource"', 'id="previewBridgeSource"', 'id="pakoSource"']) {
   if (!html.includes(anchor)) fail('missing anchor: ' + anchor);
 }
