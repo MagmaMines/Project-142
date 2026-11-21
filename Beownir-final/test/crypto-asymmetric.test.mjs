@@ -144,6 +144,9 @@ test('keys exported by the runtime are readable by OpenSSL and vice versa', asyn
 });
 
 test('unsupported asymmetric features fail loudly instead of returning wrong bytes', async () => {
+  /* createECDH now works for the NIST prime curves (see crypto.test.mjs for the
+   * OpenSSL-oracle tests); an unknown curve name must still fail loudly, which
+   * is what the second outcome checks. */
   const runtime = await runtimeWithKey();
   const result = run(runtime, `    const crypto = require('crypto');
     const fs = require('fs');
@@ -153,7 +156,7 @@ test('unsupported asymmetric features fail loudly instead of returning wrong byt
     ({
       outcomes: [
         outcome(() => crypto.sign('sha256', Buffer.from('x'), { key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING })),
-        outcome(() => crypto.createECDH('prime256v1')),
+        outcome(() => crypto.createECDH('not-a-curve')),
         outcome(() => crypto.createSign('RSA-SHA256').sign({ key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING }, 'hex')),
         outcome(() => crypto.createPrivateKey('not a key')),
         outcome(() => crypto.publicEncrypt(crypto.createPublicKey(key), Buffer.alloc(300))),

@@ -120,7 +120,14 @@ if (!runtime && !preview) {
   const allow = perms.match(/cross-origin-isolated=\(([^)]*)\)/)?.[1] || (/cross-origin-isolated=\*/.test(perms) ? '"' + origin(runtime) + '" "' + origin(preview) + '"' : '');
   out(allow.includes('"' + origin(runtime) + '"'), 'Permissions-Policy allows the runtime origin', allow ? 'allowlist: ' + allow : 'no cross-origin-isolated allowlist');
   out(allow.includes('"' + origin(preview) + '"'), 'Permissions-Policy allows the preview origin');
-  out(!!meta && meta.includes('runtime=' + origin(runtime)) && meta.includes('preview=' + origin(preview)), 'Origin meta matches the runtime and preview', 'meta content: "' + (meta ?? '') + '"');
+  let hostConfig = null;
+  const injectedConfig = /window\.__BEOWNIR_HOST__=(\{[^;]+\});/.exec(body)?.[1];
+  if (injectedConfig) {
+    try { hostConfig = JSON.parse(injectedConfig); } catch {}
+  }
+  const metaMatches = !!meta && meta.includes('runtime=' + origin(runtime)) && meta.includes('preview=' + origin(preview));
+  const hostMatches = hostConfig?.runtimeOrigin === origin(runtime) && hostConfig?.previewOrigin === origin(preview);
+  out(metaMatches || hostMatches, 'Runtime and preview origins match the deployment', hostMatches ? 'host-injected origin config' : 'meta content: "' + (meta ?? '') + '"');
 
   let rt;
   try { rt = await timeoutFetch(origin(runtime) + '/'); } catch (error) { out(false, 'Runtime host reachable', String(error.message || error)); }

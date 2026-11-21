@@ -139,14 +139,16 @@
   }
   window.XMLHttpRequest = VirtualXHR;
   // WebSocket to a virtual port (ws://localhost:<port>) goes through the runtime; every other URL
-  // keeps the browser's own WebSocket. Vite's HMR client connects this way.
+  // keeps the browser's own WebSocket. Vite's HMR client connects this way. Loopback names all
+  // point at the same in-process virtual servers, so all of them are virtualized.
   const NativeWebSocket = window.WebSocket;
   const sockets = new Map();
   let socketSequence = 0;
+  const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]']);
   function virtualSocketTarget(url) {
     try {
       const target = new URL(String(url), base);
-      if (target.hostname !== 'localhost' || (target.protocol !== 'ws:' && target.protocol !== 'wss:')) return null;
+      if (!LOOPBACK_NAMES.has(target.hostname) || (target.protocol !== 'ws:' && target.protocol !== 'wss:')) return null;
       return { port: Number(target.port) || (target.protocol === 'wss:' ? 443 : 80), path: target.pathname + target.search, href: target.href };
     } catch { return null; }
   }
@@ -193,4 +195,95 @@
     return new VirtualWebSocket(url, protocols);
   };
   Object.assign(window.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+
+  /* ES modules in the preview. `<script type="module">` cannot reach the virtual
+   * dev server on its own (the document URL is not the virtual origin), so every
+   * module — the initial page and Vite's HMR re-imports — is loaded here:
+   * fetch the transformed source through the virtual server, rewrite every
+   * static import to an inline data: module, and hand back a namespace.
+   * External origins are never fetched; they fail through the normal CSP. */
+  const moduleCache = new Map();
+  let totalModuleBytes = 0;
+  const MODULE_BYTES_LIMIT = 8 * 1024 * 1024;
+  const TOTAL_MODULE_BYTES_LIMIT = 48 * 1024 * 1024;
+  const DEPTH_LIMIT = 16;
+  const toBase64 = text => {
+    const bytes = new TextEncoder().encode(text);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += CHUNK) binary += String.fromCharCode(...bytes.subarray(offset, offset + CHUNK));
+    return btoa(binary);
+  };
+  const moduleKey = url => url.pathname + url.search;
+  function fetchModule(url) {
+    return window.fetch(moduleKey(url)).then(response => {
+      if (!response.ok) {
+        return response.text().then(text => { throw new Error('Module request failed (HTTP ' + response.status + '): ' + moduleKey(url) + (text ? '\n' + String(text).slice(0, 2000) : '')); });
+      }
+      return response.text();
+    });
+  }
+  // Static imports: `import ... from "spec"`, `export ... from "spec"`, `import "spec"`.
+  const STATIC_SPECIFIER = /(\bfrom\s*|\bimport\s*)(["'])([^"'\n]+)\2/g;
+  async function resolveSpecifier(spec, importer, depth, seen) {
+    if (/^(data:|blob:)/i.test(spec)) return spec;
+    const resolved = new URL(spec, importer);
+    if (/^https?:$/i.test(resolved.protocol) && resolved.origin !== virtualOrigin) return spec; // external: leave, CSP will refuse it
+    const key = moduleKey(resolved);
+    if (seen.has(key)) {
+      console.warn('[preview] circular module import stubbed: ' + key);
+      return 'data:text/javascript;base64,' + toBase64('export {}');
+    }
+    return loadModule(resolved, depth + 1, seen);
+  }
+  async function rewriteModule(code, importer, depth, seen) {
+    if (depth > DEPTH_LIMIT) throw new Error('Module graph nesting limit reached at ' + importer);
+    const next = new Set(seen || []);
+    next.add(moduleKey(new URL(importer)));
+    const jobs = [];
+    STATIC_SPECIFIER.lastIndex = 0;
+    let match;
+    while ((match = STATIC_SPECIFIER.exec(code)) !== null) jobs.push(match[3]);
+    const results = await Promise.all(jobs.map(spec => resolveSpecifier(spec, importer, depth, next)));
+    // Rebuild the source precisely: keyword + quote + rewritten specifier + quote.
+    const pieces = [];
+    let lastIndex = 0;
+    let jobIndex = 0;
+    STATIC_SPECIFIER.lastIndex = 0;
+    while ((match = STATIC_SPECIFIER.exec(code)) !== null) {
+      pieces.push(code.slice(lastIndex, match.index), match[1], match[2], results[jobIndex], match[2]);
+      lastIndex = match.index + match[0].length;
+      jobIndex += 1;
+    }
+    pieces.push(code.slice(lastIndex));
+    let out = pieces.join('');
+    // Any remaining dynamic imports (Vite's HMR re-import uses one) resolve at call time.
+    out = out.replace(/\bimport\s*\(/g, 'globalThis.__beownirDynamicImport(');
+    return out;
+  }
+  function loadModule(url, depth, seen) {
+    const key = moduleKey(url);
+    let entry = moduleCache.get(key);
+    if (!entry) {
+      entry = (async () => {
+        const code = await fetchModule(url);
+        totalModuleBytes += code.length;
+        if (code.length > MODULE_BYTES_LIMIT) throw new Error('Module exceeds the 8 MiB budget: ' + key);
+        if (totalModuleBytes > TOTAL_MODULE_BYTES_LIMIT) throw new Error('Module graph exceeds the 48 MiB session budget (last: ' + key + ')');
+        const rewritten = await rewriteModule(code, url.href, depth, seen || new Set([key]));
+        return 'data:text/javascript;base64,' + toBase64(rewritten);
+      })();
+      moduleCache.set(key, entry);
+      entry.catch(() => moduleCache.delete(key));
+    }
+    return entry;
+  }
+  window.__beownirDynamicImport = async spec => {
+    const text = String(spec);
+    if (/^data:/i.test(text)) return import(text);
+    const url = new URL(text, virtualOrigin + '/');
+    if (/^https?:$/i.test(url.protocol) && url.origin !== virtualOrigin) throw new TypeError('External module imports are disabled in the preview: ' + text);
+    const dataUrl = await loadModule(url, 0, new Set([moduleKey(url)]));
+    return import(dataUrl);
+  };
 })();

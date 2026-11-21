@@ -38,10 +38,10 @@ function loadWorker({ windows, shellBody = 'shell' }) {
   };
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: 'coi-sw.js' });
-  const fetchEvent = (url, method = 'GET', body) => {
-    const request = new Request(url, { method, body });
+  const fetchEvent = (url, method = 'GET', body, extra = {}) => {
+    const request = new Request(url, { method, body, headers: extra.headers });
     let answer;
-    const event = { request, respondWith: promise => { answer = promise; } };
+    const event = { request, clientId: extra.clientId, resultingClientId: extra.resultingClientId, respondWith: promise => { answer = promise; } };
     listeners.fetch(event);
     return { event, answer: () => answer };
   };
@@ -120,4 +120,45 @@ test('the IDE tab itself is never chosen as the preview client when only the pre
   const worker = loadWorker({ windows: [previewTab] });
   const response = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/').answer();
   assert.equal(response.status, 503, 'a preview tab cannot answer its own request');
+});
+
+test('after a preview navigation claims a client, root-relative subresources reach the same virtual port', async () => {
+  const tab = kernelTab();
+  const worker = loadWorker({ windows: [tab] });
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/', 'GET', undefined, { resultingClientId: 'client-1' }).answer();
+  assert.equal(worker.posted.length, 1);
+  const response = await worker.fetchEvent(ORIGIN + '/src/main.ts', 'GET', undefined, { clientId: 'client-1' }).answer();
+  assert.equal(await response.text(), '<h1>GET /src/main.ts</h1>');
+  const sent = worker.posted.at(-1).message;
+  assert.equal(sent.port, 3000);
+  assert.equal(sent.url, '/src/main.ts');
+});
+
+test('an unclaimed client is never routed to a preview port', async () => {
+  const tab = kernelTab();
+  const worker = loadWorker({ windows: [tab] });
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/', 'GET', undefined, { resultingClientId: 'client-1' }).answer();
+  await worker.fetchEvent(ORIGIN + '/src/main.ts', 'GET', undefined, { clientId: 'client-2' }).answer();
+  assert.equal(worker.posted.length, 1, 'the IDE tab must not be asked for unclaimed clients');
+});
+
+test('an invalid port under the preview prefix is rejected even for a claimed client', async () => {
+  const tab = kernelTab();
+  const worker = loadWorker({ windows: [tab] });
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/', 'GET', undefined, { resultingClientId: 'client-1' }).answer();
+  const response = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/70000/x', 'GET', undefined, { clientId: 'client-1' }).answer();
+  assert.equal(response.status, 404);
+  assert.equal(worker.posted.length, 1, 'an invalid port must not reach the IDE tab');
+});
+
+test('preview HTML documents get the WebSocket shim injected; other responses do not', async () => {
+  const tab = kernelTab();
+  const worker = loadWorker({ windows: [tab] });
+  const doc = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/', 'GET', undefined, { headers: { 'sec-fetch-dest': 'iframe' } }).answer();
+  const text = await doc.text();
+  assert.match(text, /__beownirSwWsShim/);
+  assert.match(text, /BroadcastChannel\('beownir-preview-ws'\)/);
+  assert.equal(doc.headers.get('content-length'), null, 'stale content-length must be dropped');
+  const plain = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/', 'GET').answer();
+  assert.equal(await plain.text(), '<h1>GET /</h1>', 'non-document responses pass through unchanged');
 });

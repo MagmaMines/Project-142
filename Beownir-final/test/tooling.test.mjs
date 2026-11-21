@@ -34,6 +34,28 @@ test('package metadata advertises a supported Node range and the documented scri
   assert.match(pkg.scripts.test, /node --test/);
 });
 
+test('release candidate packaging includes integrity and explicit commercial blockers', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-candidate-'));
+  try {
+    const out = path.join(temp, 'bundle');
+    const result = run(['tools/package-release.mjs', out]);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const status = fs.readFileSync(path.join(out, 'CANDIDATE-STATUS.txt'), 'utf8');
+    assert.match(status, /NOT CLEARED FOR COMMERCIAL DISTRIBUTION/);
+    assert.match(status, /native Node\/WASIX acceptance gates/);
+    const artifact = fs.readFileSync(path.join(out, 'beownir-standalone.html'));
+    const expected = fs.readFileSync(path.join(root, 'beownir-standalone.html'));
+    assert.deepEqual(artifact, expected);
+    /* The embed client ships in the same candidate: a host page needs the one
+     * file, and the bundle proves it is the verified build. */
+    const embed = fs.readFileSync(path.join(out, 'beownir-kernel.js'));
+    const expectedEmbed = fs.readFileSync(path.join(root, 'o', 'embed', 'beownir-kernel.js'));
+    assert.deepEqual(embed, expectedEmbed);
+    const checksum = fs.readFileSync(path.join(out, 'SHA256SUMS'), 'utf8');
+    assert.match(checksum, /^[a-f0-9]{64}  beownir-standalone\.html\n[a-f0-9]{64}  beownir-kernel\.js\n$/);
+  } finally { fs.rmSync(temp, {recursive:true, force:true}); }
+});
+
 test('deployment configuration points at files that exist', () => {
   const toml = fs.readFileSync(path.join(root, 'o', 'netlify.toml'), 'utf8');
   const publish = /publish\s*=\s*"([^"]+)"/.exec(toml)?.[1];

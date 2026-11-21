@@ -8,7 +8,5 @@ dist/
 out/
 .beownir/
 
-# The embedded runtime keeps its vendored SDK sources in the repository: they are
-# the editable copy of the blobs inside o/site/index.html (tools/native-assets.mjs).
-!o/native/node_modules/
-!o/native/node_modules/**
+# Vendored SDK source is stored under o/native/vendor/wasmer-sdk/ so it is
+# retained by snapshots and tooling while being packed at its upstream URL.

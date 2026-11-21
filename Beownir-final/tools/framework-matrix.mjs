@@ -294,6 +294,149 @@ const profiles = [
     })()`,
   },
   {
+    name: 'vite-http-dev-server',
+    packages: [{ name: 'vite', range: '6' }],
+    note: 'Vite dev server binds to the project virtual loopback; an HTTP client fetches the served HTML and transformed module over the runtime kernel',
+    smoke: `(async () => {
+      const fs = require('fs');
+      const http = require('http');
+      const root = '/project/smoke/vite-http';
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(root + '/index.html', '<html><body><script type="module" src="/src.js"></script></body></html>');
+      fs.writeFileSync(root + '/src.js', 'export const message = "hello vite";');
+      const vite = require('vite');
+      const server = await vite.createServer({ root, configFile: false, server: { host: '127.0.0.1', port: 0, strictPort: false, hmr: false, watch: null }, appType: 'spa', logLevel: 'silent', optimizeDeps: { noDiscovery: true, include: [] } });
+      const get = path => new Promise((resolve, reject) => http.get({host:'127.0.0.1', port:server.httpServer.address().port, path}, res => { const chunks=[]; res.on('data', c=>chunks.push(c)); res.on('end',()=>resolve({status:res.statusCode, body:Buffer.concat(chunks).toString()})); }).on('error', reject));
+      try {
+        await server.listen();
+        const page = await get('/');
+        const module = await get('/src.js');
+        if (page.status !== 200 || !page.body.includes('/@vite/client')) throw new Error('dev HTML not served: ' + page.status);
+        if (module.status !== 200 || !module.body.includes('hello vite')) throw new Error('module not served: ' + module.status + ' ' + module.body.slice(0,120));
+        return 'vite HTTP ' + page.status + ' index, ' + module.status + ' transformed module on virtual port ' + server.httpServer.address().port;
+      } finally { await server.close(); }
+    })()`,
+  },
+  {
+    name: 'vite-production-build',
+    packages: [{ name: 'vite', range: '6' }],
+    note: 'Vite 6 production build with the WASM Rollup/esbuild providers; verifies emitted HTML, JS bundle and CSS asset from a real virtual project',
+    smoke: `(async () => {
+      const fs = require('fs');
+      const root = '/project/smoke/vite-build';
+      fs.mkdirSync(root, {recursive:true});
+      fs.mkdirSync(root + '/src', {recursive:true});
+      fs.writeFileSync(root + '/index.html', '<html><head></head><body><div id="app"></div><script type="module" src="/src/main.js"></script></body></html>');
+      fs.writeFileSync(root + '/src/main.js', 'import "./style.css"; document.querySelector("#app").textContent = "vite production";');
+      fs.writeFileSync(root + '/src/style.css', '#app { color: rgb(1, 2, 3); }');
+      const vite = require('vite');
+      const result = await vite.build({root, configFile:false, logLevel:'silent', build:{outDir:'build', emptyOutDir:true, minify:false}, optimizeDeps:{noDiscovery:true,include:[]}});
+      const files = fs.readdirSync(root + '/build/assets');
+      const html = fs.readFileSync(root + '/build/index.html','utf8');
+      const js = files.find(f=>/^index-.*\\.js$/.test(f));
+      const css = files.find(f=>/^index-.*\\.css$/.test(f));
+      if (!html.includes('assets/') || !js || !css) throw new Error('expected HTML, JS and CSS outputs, got '+JSON.stringify(files));
+      if (!fs.readFileSync(root + '/build/assets/'+js,'utf8').includes('vite production')) throw new Error('JS output lost the app payload');
+      return 'vite ' + vite.version + ' production build emitted index.html, ' + js + ' and ' + css;
+    })()`,
+  },
+  {
+    name: 'vite-cli-production-build',
+    packages: [{ name: 'vite', range: '6' }],
+    files: {
+      'index.html': '<!doctype html><html><body><script type="module" src="/src/main.ts"></script></body></html>',
+      'src/main.ts': 'const greeting: string = "Vite CLI in single-file runtime"; document.body.textContent = greeting;',
+    },
+    command: 'vite --version && vite build --outDir build --emptyOutDir --no-minify',
+    verify: `(() => { const fs = require('fs'); const html = fs.readFileSync('/project/build/index.html', 'utf8'); const assets = fs.readdirSync('/project/build/assets'); const js = assets.find(name => name.endsWith('.js')); if (!html.includes('/assets/') || !js || !fs.readFileSync('/project/build/assets/' + js, 'utf8').includes('Vite CLI in single-file runtime')) throw new Error('Vite CLI did not emit the expected TypeScript app bundle'); return 'verified index.html and ' + js; })()`,
+    note: 'Runs the Vite 6 command through its installed Node API and WASM bundler; validates TypeScript output and bundle content; unsupported CLI options are rejected rather than silently ignored',
+  },
+  {
+    name: 'vite-react-production-build',
+    packages: [{ name: 'vite', range: '6' }, { name: 'react', range: '19' }, { name: 'react-dom', range: '19' }],
+    note: 'Integrated Vite 6 + React 19 production build from a virtual project; validates JSX transform, package resolution, Rollup output and emitted entry bundle (not browser hydration or arbitrary plugins)',
+    smoke: `(async () => {
+      const fs = require('fs');
+      const root = '/project/smoke/vite-react';
+      fs.mkdirSync(root + '/src', {recursive:true});
+      fs.writeFileSync(root + '/index.html', '<div id="root"></div><script type="module" src="/src/main.jsx"></script>');
+      fs.writeFileSync(root + '/src/main.jsx', 'import React from "react"; import { createRoot } from "react-dom/client"; function App(){ return <main>Beownir Vite React</main> }; createRoot(document.getElementById("root")).render(<App/>);');
+      const vite = require('vite');
+      await vite.build({root, configFile:false, logLevel:'silent', build:{outDir:'build', emptyOutDir:true, minify:false}, optimizeDeps:{noDiscovery:true,include:[]}});
+      const html = fs.readFileSync(root + '/build/index.html','utf8');
+      const assets = fs.readdirSync(root + '/build/assets');
+      const js = assets.find(name=>name.endsWith('.js'));
+      if (!html.includes('/assets/') || !js) throw new Error('Vite did not emit an HTML entry and JS asset: '+JSON.stringify(assets));
+      const bundle = fs.readFileSync(root + '/build/assets/'+js,'utf8');
+      if (!bundle.includes('Beownir Vite React') || !bundle.includes('createRoot')) throw new Error('React JSX/app entry missing from bundle');
+      return 'vite '+vite.version+' + React '+require('react/package.json').version+' production bundle emitted '+js+' with JSX and createRoot';
+    })()`,
+  },
+  {
+    name: 'vite-react-dev-server',
+    packages: [{ name: 'vite', range: '6' }, { name: 'react', range: '19' }, { name: 'react-dom', range: '19' }],
+    note: 'Integrated Vite 6 + React 19 dev server: serves project HTML and transforms JSX with package imports through the virtual HTTP loopback (not browser hydration or HMR WebSocket)',
+    smoke: `(async () => {
+      const fs = require('fs');
+      const root = '/project/smoke/vite-react-dev';
+      fs.mkdirSync(root + '/src', {recursive:true});
+      fs.writeFileSync(root + '/index.html', '<div id="root"></div><script type="module" src="/src/main.jsx"></script>');
+      fs.writeFileSync(root + '/src/main.jsx', 'import React from "react"; import { createRoot } from "react-dom/client"; function App(){ return <main>React dev smoke</main> }; createRoot(document.getElementById("root")).render(<App/>);');
+      const vite = require('vite');
+      const server = await vite.createServer({root, configFile:false, server:{host:'127.0.0.1',port:0,strictPort:false,hmr:false,watch:null}, appType:'spa', logLevel:'silent', optimizeDeps:{noDiscovery:true,include:[]}});
+      try {
+        await server.listen();
+        const port = server.httpServer.address().port;
+        const page = await probe(port, '/');
+        const module = await probe(port, '/src/main.jsx');
+        if (page.status !== 200 || !page.body.includes('/@vite/client')) throw new Error('React dev HTML failed: '+page.status);
+        if (module.status !== 200 || !module.body.includes('React dev smoke') || !module.body.includes('react-dom')) throw new Error('React JSX transform failed: '+module.status+' '+module.body.slice(0,180));
+        return 'vite '+vite.version+' + React '+require('react/package.json').version+' dev HTTP '+page.status+' HTML, '+module.status+' JSX module with React imports';
+      } finally { await server.close(); }
+    })()`,
+  },
+  {
+    name: 'vite-hmr-websocket',
+    packages: [{ name: 'vite', range: '6' }],
+    note: 'End-to-end Vite HMR over the runtime virtual WebSocket: handshake, connected frame, file edit and update frame. Does not assert browser DOM rendering.',
+    smoke: `(async () => {
+      const fs = require('fs');
+      const vite = require('vite');
+      const root='/project/smoke/vite-hmr-ws';
+      fs.mkdirSync(root,{recursive:true});
+      fs.writeFileSync(root+'/index.html','<script type="module" src="/src.js"></script>');
+      fs.writeFileSync(root+'/src.js','export const ready=true;');
+      const server=await vite.createServer({root,configFile:false,server:{host:'127.0.0.1',port:0,strictPort:false},appType:'spa',logLevel:'silent',optimizeDeps:{noDiscovery:true,include:[]}});
+      let socket, buffer=Buffer.alloc(0), waiters=[];
+      const deliver=chunk=>{
+        buffer=Buffer.concat([buffer,Buffer.from(chunk)]);
+        while(buffer.length>=2){let len=buffer[1]&127,offset=2;if(len===126){if(buffer.length<4)return;len=buffer.readUInt16BE(2);offset=4;}else if(len===127){if(buffer.length<10)return;len=Number(buffer.readBigUInt64BE(2));offset=10;}if(buffer.length<offset+len)return;const opcode=buffer[0]&15,payload=buffer.subarray(offset,offset+len);buffer=buffer.subarray(offset+len);if(opcode===1){const next=waiters.shift();if(next)next(payload.toString('utf8'));}}
+      };
+      const nextMessage=label=>new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Vite HMR '+label+' message timed out')),4000);waiters.push(text=>{clearTimeout(timer);resolve(text);});});
+      try {
+        await server.listen();
+        const port=server.httpServer.address().port;
+        await probe(port,'/');
+        await probe(port,'/src.js');
+        const response=await new Promise((resolve,reject)=>{
+          const req=http.request({host:'127.0.0.1',port,path:'/',headers:{Connection:'Upgrade',Upgrade:'websocket','Sec-WebSocket-Key':'dGhlIHNhbXBsZSBub25jZQ==','Sec-WebSocket-Version':'13','Sec-WebSocket-Protocol':'vite-hmr'}});
+          const timer=setTimeout(()=>{req.destroy();reject(new Error('Vite HMR upgrade timed out'));},3000);
+          req.on('upgrade',(res,upgraded,head)=>{clearTimeout(timer);socket=upgraded;socket.on('data',deliver);socket.once('error',reject);if(head?.length)deliver(head);resolve(res.statusCode);});
+          req.on('response',res=>{clearTimeout(timer);res.resume();reject(new Error('Vite HMR returned HTTP '+res.statusCode));});
+          req.on('error',error=>{clearTimeout(timer);reject(error);});req.end();
+        });
+        if(response!==101)throw new Error('Expected 101 upgrade, got '+response);
+        const connected=await nextMessage('connected');
+        if(!connected.includes('connected'))throw new Error('Expected Vite connected frame, got '+connected.slice(0,120));
+        fs.writeFileSync(root+'/src.js','export const ready=false;');
+        let update='';
+        for(let i=0;i<8;i++){update=await nextMessage('update');if(update.includes('update')||update.includes('full-reload'))break;}
+        if(!update.includes('update')&&!update.includes('full-reload'))throw new Error('Expected HMR update/reload frame, got '+update.slice(0,160));
+        return 'vite '+vite.version+' HMR WebSocket sent connected then update after src.js edit';
+      } finally { if(socket&&!socket.destroyed)socket.destroy(); await server.close(); }
+    })()`,
+  },
+  {
     name: 'vite-hmr-invalidation',
     packages: [{ name: 'vite', range: '6' }],
     note: 'HMR core: a file edit is seen by the watcher, the module graph invalidates, and the next transform returns the new code. The WebSocket transport is not part of this row',
@@ -469,11 +612,22 @@ const run = async ({ only, write, check }) => {
     const tree = await resolveTree(profile.packages);
     const { files, installed, failures } = await installTree(tree.packages);
     rt.sandbox.__inject('/project/', files);
+    if (profile.files) rt.sandbox.__inject('/project/', profile.files);
     const versions = installed.filter(item => profile.packages.some(root => root.name === item.name)).map(item => item.name + '@' + item.version);
     let outcome, code;
     try {
-      const value = await rt.evaluate(`(async () => { const require = CORE.module.createRequire('/project/index.js'); const http = CORE.http; return (${profile.smoke}); })()`);
-      outcome = String(value); code = 0;
+      if (profile.command) {
+        const result = await rt.run(profile.command);
+        outcome = (result.output || '').trim() || 'command completed with exit ' + result.code;
+        code = result.code;
+        if (code === 0 && profile.verify) {
+          const verified = await rt.evaluate(`(() => { const require = CORE.module.createRequire('/project/index.js'); return (${profile.verify}); })()`);
+          outcome += '; ' + String(verified);
+        }
+      } else {
+        const value = await rt.evaluate(`(async () => { const require = CORE.module.createRequire('/project/index.js'); const http = CORE.http; return (${profile.smoke}); })()`);
+        outcome = String(value); code = 0;
+      }
     } catch (failure) { outcome = formatError(failure); code = 1; }
     results.push({ name: profile.name, passed: code === 0, detail: outcome, note: profile.note, packages: installed.length, versions, installFailures: failures.length, resolveFailures: tree.failures.length, ms: Date.now() - started });
     console.log(`${code === 0 ? '  ok  ' : ' FAIL '} ${profile.name.padEnd(9)} ${outcome}`);

@@ -1,0 +1,41 @@
+name: release-candidate
+
+# Creates an integrity-checked internal bundle on demand. This does not publish
+# to npm, GitHub Releases, or a marketplace; licensing and native-runtime gates
+# remain explicit owner decisions.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify generated sources, artifact, compatibility floor and tests
+        run: npm run verify
+      - name: Run the differential Node behavior suite
+        run: npm run differential
+      - name: Re-run the framework compatibility matrix
+        run: npm run matrix:check
+      - name: Smoke the standalone product
+        run: npm run standalone:smoke
+      - name: Package a verified internal candidate
+        run: npm run release:candidate -- ./dist/beownir-candidate
+      - name: Upload candidate bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: beownir-${{ github.sha }}-candidate
+          path: dist/beownir-candidate/
+          if-no-files-found: error
+          retention-days: 30
