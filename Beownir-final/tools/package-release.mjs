@@ -16,7 +16,13 @@ const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 const digest = crypto.createHash('sha256').update(html).digest('hex');
 fs.mkdirSync(outDir, { recursive: true });
 fs.writeFileSync(path.join(outDir, 'beownir-standalone.html'), html);
-fs.writeFileSync(path.join(outDir, 'SHA256SUMS'), `${digest}  beownir-standalone.html\n`);
+/* The headless embed client ships next to the IDE file: third-party pages load
+ * it instead of the whole IDE (see EMBEDDING.md). */
+const embedPath = path.join(root, 'o', 'embed', 'beownir-kernel.js');
+if (!fs.existsSync(embedPath)) throw new Error('embed bundle is missing; run node tools/build-embed.mjs');
+const embed = fs.readFileSync(embedPath);
+fs.writeFileSync(path.join(outDir, 'beownir-kernel.js'), embed);
+fs.writeFileSync(path.join(outDir, 'SHA256SUMS'), `${digest}  beownir-standalone.html\n${crypto.createHash('sha256').update(embed).digest('hex')}  beownir-kernel.js\n`);
 fs.writeFileSync(path.join(outDir, 'CANDIDATE-STATUS.txt'), [
   `Product: ${pkg.name} ${pkg.version}`,
   `Artifact SHA-256: ${digest}`,

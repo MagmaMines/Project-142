@@ -96,6 +96,33 @@ is not the same as running on Gecko. Treat Firefox/Safari as "should work from
 the feature floor, unverified here" until someone runs the suite in those
 engines.
 
+## Embedding the runtime in your own web IDE
+
+The IDE's runtime is also shipped as **one drop-in file**,
+`o/embed/beownir-kernel.js` (5.6 MiB, generated from the application's own
+sources so it cannot drift). If you build your own HTML/CSS IDE, add one
+script tag and you get the virtual filesystem, `node`, `npm install` from the
+real registry, and virtual dev servers on an in-page loopback — with named
+errors (`EPERM`, `ENOSYS`, `EAGAIN`, `Unknown command: …`) for the things a
+page cannot do:
+
+```html
+<script src="beownir-kernel.js"></script>
+<script>
+  const kernel = BeownirKernel.create();
+  kernel.whenReady().then(async () => {
+    await kernel.writeFile('app.js', "console.log('hi from your own IDE');\n");
+    console.log(await kernel.run('node app.js'));
+  });
+</script>
+```
+
+The full API, the security model (sandboxed opaque-origin iframe, your page's
+CSP never needs `unsafe-eval`), the measured 16/16 headless-Chromium test
+suite and the honest list of limits are in **[EMBEDDING.md](EMBEDDING.md)**.
+`npm run embed:e2e` re-runs the suite; `npm run check` fails a release if the
+bundle is stale or breaks the browser floor.
+
 ## Two runtimes
 
 | | Limited compatibility engine | Native browser-WASM profile |

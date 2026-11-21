@@ -46,8 +46,13 @@ test('release candidate packaging includes integrity and explicit commercial blo
     const artifact = fs.readFileSync(path.join(out, 'beownir-standalone.html'));
     const expected = fs.readFileSync(path.join(root, 'beownir-standalone.html'));
     assert.deepEqual(artifact, expected);
+    /* The embed client ships in the same candidate: a host page needs the one
+     * file, and the bundle proves it is the verified build. */
+    const embed = fs.readFileSync(path.join(out, 'beownir-kernel.js'));
+    const expectedEmbed = fs.readFileSync(path.join(root, 'o', 'embed', 'beownir-kernel.js'));
+    assert.deepEqual(embed, expectedEmbed);
     const checksum = fs.readFileSync(path.join(out, 'SHA256SUMS'), 'utf8');
-    assert.match(checksum, /^[a-f0-9]{64}  beownir-standalone\.html\n$/);
+    assert.match(checksum, /^[a-f0-9]{64}  beownir-standalone\.html\n[a-f0-9]{64}  beownir-kernel\.js\n$/);
   } finally { fs.rmSync(temp, {recursive:true, force:true}); }
 });
 

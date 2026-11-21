@@ -104,7 +104,7 @@ test('a plain static host reports exactly what is missing and why', () => {
   for (const name of ['Editor, terminal, virtual filesystem', 'npm installs', 'Servers and the preview panel']) {
     assert.equal(rows[name].ok, true, name + ' stays available');
   }
-  for (const name of ['Framework dev servers (Vite, Next.js, Nuxt)', 'TLS, raw TCP/UDP, native addons, RSA key generation']) {
+  for (const name of ['Framework dev servers (Vite, Next.js, Nuxt)', 'TLS, raw TCP/UDP, native addons, X.509 certificate parsing']) {
     assert.equal(rows[name].ok, false, name + ' is never claimed');
   }
 });

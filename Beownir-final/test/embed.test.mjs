@@ -1,0 +1,97 @@
+/**
+ * The headless embed bundle is a shipped surface: third-party web IDEs load
+ * o/embed/beownir-kernel.js and nothing else from Beownir. These tests pin the
+ * two ways it can silently rot:
+ *
+ *   1. drift — the payload inside the bundle must be byte-identical to the
+ *      sources embedded in the application, so a host always gets the runtime
+ *      that was verified, not an older copy;
+ *   2. surface — the bundle must actually evaluate and export the documented
+ *      API with the product's version.
+ *
+ * The browser end-to-end (boot, node, npm install, virtual dev server, sync,
+ * teardown) lives in test/embed/embed-e2e.cjs, which needs a Chromium binary.
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { build, payload, block, root, templatePath, outputPath } from '../tools/build-embed.mjs';
+
+const appHtml = fs.readFileSync(path.join(root, 'o', 'site', 'index.html'), 'utf8');
+const template = fs.readFileSync(templatePath, 'utf8');
+
+test('the generator extracts every asset block from the application source', () => {
+  for (const id of ['runtimeSource', 'runtimeFrameSource', 'pakoSource', 'esbuildWasm', 'esbuildBrowser']) {
+    assert.ok(appHtml.includes('<script id="' + id + '"'), id + ' anchor is present');
+  }
+  assert.equal(payload().runtime, block(appHtml, 'runtimeSource'));
+  assert.equal(payload().kernel, block(appHtml, 'runtimeFrameSource'));
+});
+
+test('the built bundle is generated from the application, not a copy', () => {
+  const built = build();
+  assert.ok(!built.includes('__BEOWNIR_EMBED_BUILD__'), 'the placeholder is replaced');
+  assert.ok(built.includes(template.slice(0, built.length ? 120 : 0).slice(0, 60).trim() || '/*! Beownir headless kernel'), 'the template header opens the bundle');
+  /* The JSON literal is escaped for every HTML context: no raw `</script`, no
+   * raw <, > or & that could break a host page that inlines the bundle. */
+  const literal = built.slice(built.indexOf('const BUILD = '), built.indexOf(';\n', built.indexOf('const BUILD = ')));
+  assert.ok(!/[<>]/.test(literal.slice(0, 200)), 'the literal is escaped');
+  const parsed = JSON.parse(literal.slice('const BUILD = '.length));
+  assert.equal(parsed.runtime, payload().runtime, 'the worker runtime matches the IDE byte for byte');
+  assert.equal(parsed.kernel, payload().kernel, 'the frame kernel matches the IDE byte for byte');
+  assert.equal(parsed.pako, payload().pako, 'pako matches the IDE byte for byte');
+});
+
+test('the committed bundle is current', () => {
+  assert.ok(fs.existsSync(outputPath), 'o/embed/beownir-kernel.js exists: run node tools/build-embed.mjs');
+  assert.equal(fs.readFileSync(outputPath, 'utf8'), build(), 'o/embed/beownir-kernel.js matches the sources: run node tools/build-embed.mjs');
+});
+
+test('the bundle parses as JavaScript', () => {
+  execFileSync(process.execPath, ['--check', outputPath]);
+});
+
+test('the bundle evaluates and exports the documented API', () => {
+  const source = fs.readFileSync(outputPath, 'utf8');
+  const globalThisBackup = globalThis.BeownirKernel;
+  try {
+    const evaluate = new Function(source + '\n;return BeownirKernel;');
+    const api = evaluate();
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    assert.equal(api.version, pkg.version);
+    assert.equal(typeof api.create, 'function');
+    assert.equal(typeof api.BeownirKernel, 'function');
+    assert.equal(typeof api.normalisePath, 'function');
+    assert.equal(typeof api.capabilities, 'function');
+    assert.ok(Object.isFrozen(api), 'the API object is frozen');
+    /* Two loads must not fight over the global (the IIFE is idempotent). */
+    const second = new Function(source + '\n;return BeownirKernel;')();
+    assert.equal(second, api);
+  } finally {
+    if (globalThisBackup === undefined) delete globalThis.BeownirKernel;
+    else globalThis.BeownirKernel = globalThisBackup;
+  }
+});
+
+test('normalisePath applies Node-style rules relative to /project', () => {
+  const api = new Function(fs.readFileSync(outputPath, 'utf8') + '\n;return BeownirKernel;')();
+  const normalisePath = api.normalisePath;
+  assert.equal(normalisePath('app.js'), '/project/app.js');
+  assert.equal(normalisePath('/project/app.js'), '/project/app.js');
+  assert.equal(normalisePath('a/../b'), '/project/b');
+  assert.equal(normalisePath('./a/./b'), '/project/a/b');
+  assert.equal(normalisePath('\\tmp\\x'), '/tmp/x');
+  assert.throws(() => normalisePath(''), TypeError);
+  assert.throws(() => normalisePath('   '), TypeError);
+  assert.throws(() => normalisePath(42), TypeError);
+});
+
+test('the template documents what the kernel cannot do', () => {
+  /* The header is the contract: no raw TCP/UDP, no native addons, no real
+   * ports. If this assertion fails, the docs and the code have drifted. */
+  for (const claim of ['raw TCP/UDP', 'native addons (.node)', 'real ports']) {
+    assert.ok(template.includes(claim), 'the header names the limit: ' + claim);
+  }
+});

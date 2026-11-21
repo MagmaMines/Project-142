@@ -1,0 +1,232 @@
+<!doctype html>
+<!-- A deliberately ordinary third-party page: its own HTML/CSS, its own editor
+     and console, plus ONE script from Beownir. No other Beownir files, no CDN.
+     The automated checklist at the bottom exercises the embed end to end. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Studio — someone else's web IDE</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #101418; color: #d7dee6; display: grid; grid-template-rows: auto 1fr 1fr; height: 100vh; }
+  header { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid #232b33; }
+  header h1 { font-size: 15px; margin: 0; }
+  #status { margin-left: auto; padding: 2px 10px; border-radius: 99px; background: #333; font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
+  textarea { width: 100%; height: 100%; box-sizing: border-box; resize: none; border: 0; background: #0b0e11; color: #c7d0d9; font: 12px/1.55 ui-monospace, monospace; padding: 12px; border-right: 1px solid #232b33; }
+  pre { margin: 0; padding: 12px; overflow: auto; font: 12px/1.55 ui-monospace, monospace; background: #0b0e11; }
+  footer { border-top: 1px solid #232b33; display: grid; grid-template-columns: 140px 1fr; min-height: 0; }
+  footer .pad { padding: 8px; display: flex; flex-direction: column; gap: 6px; border-right: 1px solid #232b33; }
+  button { background: #1d5c45; color: #eafff5; border: 0; border-radius: 6px; padding: 8px; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #333; color: #888; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mini Studio</h1>
+  <span>(an imaginary customer's IDE)</span>
+  <span id="status">booting…</span>
+</header>
+<main>
+  <textarea id="editor" spellcheck="false">console.log('hello from the editor');</textarea>
+  <pre id="console"></pre>
+</main>
+<footer>
+  <div class="pad">
+    <button id="run">Run</button>
+    <button id="stop">Stop</button>
+  </div>
+  <pre id="checks">waiting for kernel…</pre>
+</footer>
+
+<!-- The one file a host adds. Nothing else from Beownir is on this page. -->
+<script src="./beownir-kernel.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const status = text => { $('status').textContent = text; };
+  const log = text => { $('console').textContent += text; $('console').scrollTop = 1e9; };
+  const checks = [];
+  const add = (name, fn) => checks.push({ name, fn });
+
+  add('exports one global with a version', async () => {
+    if (!window.BeownirKernel) throw new Error('window.BeownirKernel is missing');
+    if (typeof window.BeownirKernel.create !== 'function') throw new Error('create() is missing');
+    if (!/^\d+\.\d+/.test(String(window.BeownirKernel.version))) throw new Error('version missing: ' + window.BeownirKernel.version);
+    return 'v' + window.BeownirKernel.version;
+  });
+
+  add('capabilities() reports webassembly', async () => {
+    const caps = window.BeownirKernel.capabilities();
+    if (caps.webassembly !== true || caps.worker !== true) throw new Error('unexpected: ' + JSON.stringify(caps));
+    return 'worker+webassembly';
+  });
+
+  add('writes outside /project and /tmp fail with EPERM', async () => {
+    try { await window.BeownirKernel.create({ autostart: false }).writeFile('/etc/passwd', 'x'); }
+    catch (error) {
+      if (error.code === 'EPERM') return 'EPERM as promised';
+      throw new Error('wrong error: ' + error);
+    }
+    throw new Error('the write was accepted');
+  });
+
+  add('boots to ready', async () => {
+    kernel = window.BeownirKernel.create();
+    kernel.on('stdout', e => log(e.data));
+    kernel.on('stderr', e => log(e.data));
+    kernel.on('server', e => status(e.listening ? 'server on :' + e.port : 'server stopped'));
+    const timer = setTimeout(() => { throw new Error('boot deadline'); }, 90000);
+    await kernel.whenReady();
+    clearTimeout(timer);
+    if (kernel.state !== 'ready') throw new Error('state: ' + kernel.state);
+    status('ready');
+    return 'state=ready';
+  });
+
+  add('writeFile creates nested directories', async () => {
+    await kernel.writeFile('src/generated/deep/app.js', "console.log('HELLO_FROM_APP');\n");
+    if (!kernel.exists('src/generated/deep/app.js')) throw new Error('file missing after write');
+    return 'src/generated/deep/app.js';
+  });
+
+  add("run('node …') captures stdout and the exit code", async () => {
+    const result = await kernel.run('node src/generated/deep/app.js');
+    if (result.code !== 0) throw new Error('exit ' + result.code + ': ' + result.stderr);
+    if (!result.stdout.includes('HELLO_FROM_APP')) throw new Error('stdout: ' + JSON.stringify(result.stdout));
+    return 'exit 0, stdout captured';
+  });
+
+  add('multi-file require() resolves', async () => {
+    await kernel.writeFile('main.js', "const util = require('./lib/util');\nconsole.log('UTIL=' + util.answer);\n");
+    await kernel.writeFile('lib/util.js', 'exports.answer = 42;\n');
+    const result = await kernel.run('node main.js');
+    if (result.code !== 0 || !result.stdout.includes('UTIL=42')) throw new Error(JSON.stringify(result));
+    return 'UTIL=42';
+  });
+
+  add("node -e runs a quoted one-liner", async () => {
+    const result = await kernel.run('node -e "process.stdout.write(\'INLINE_OK\\n\')"');
+    if (result.code !== 0 || !result.stdout.includes('INLINE_OK')) throw new Error(JSON.stringify(result));
+    return 'INLINE_OK';
+  });
+
+  add('unknown binaries fail with a named error, not a hang', async () => {
+    const result = await kernel.run('python --version');
+    if (result.code === 0) throw new Error('python somehow succeeded');
+    if (!/python/i.test(result.stderr + result.stdout)) throw new Error(JSON.stringify(result));
+    return 'nonzero exit: ' + (result.stderr.trim().split('\n')[0] || '').slice(0, 60);
+  });
+
+  add('npm install fetches a real package', async () => {
+    const result = await kernel.run('npm install ms', { timeoutMs: 120000 });
+    if (result.code !== 0) throw new Error(result.stderr.slice(0, 400));
+    return 'installed';
+  });
+
+  add('installed package is requirable', async () => {
+    await kernel.writeFile('use-ms.js', "console.log('MS=' + require('ms')('2 days'));\n");
+    const result = await kernel.run('node use-ms.js');
+    if (result.code !== 0 || !result.stdout.includes('MS=172800000')) throw new Error(JSON.stringify(result));
+    return 'MS=172800000';
+  });
+
+  add('http dev server serves through the virtual port', async () => {
+    await kernel.writeFile('server.js', [
+      "const http = require('http');",
+      "const server = http.createServer((req, res) => {",
+      "  if (req.url === '/write') { require('fs').writeFileSync('/project/out.txt', 'SYNCED'); res.end('written'); return; }",
+      "  res.writeHead(200, { 'content-type': 'text/html' });",
+      "  res.end('<h1>SERVER_OK</h1>');",
+      "});",
+      "server.listen(5173, () => console.log('listening on 5173'));",
+      '',
+    ].join('\n'));
+    serverRun = kernel.run('node server.js'); // resolves once the entry file is evaluated; the server keeps serving
+    serverRun.catch(() => {});
+    const response = await kernel.waitForServer(5173, { path: '/', timeoutMs: 45000 });
+    if (response.status !== 200) throw new Error('status ' + response.status);
+    if (!response.body.includes('SERVER_OK')) throw new Error('body: ' + response.body.slice(0, 100));
+    if (!/text\/html/.test(String(response.headers['content-type'] || response.headers['Content-Type'] || ''))) throw new Error('headers: ' + JSON.stringify(response.headers));
+    return '200 text/html on :5173';
+  });
+
+  add('commands still run while the dev server is up', async () => {
+    const result = await kernel.run('node -e "process.stdout.write(\'AFTER_SERVER\\n\')"');
+    if (result.code !== 0 || !result.stdout.includes('AFTER_SERVER')) throw new Error(JSON.stringify(result));
+    if (!kernel.ports.includes(5173)) throw new Error('the server stopped: ports=' + JSON.stringify(kernel.ports));
+    const probe = await kernel.http('http://localhost:5173/');
+    if (!probe.body.includes('SERVER_OK')) throw new Error('the server stopped answering');
+    return 'server kept serving across commands';
+  });
+
+  add('files written by the program sync back to the host', async () => {
+    const response = await kernel.http('http://localhost:5173/write');
+    if (!String(response.body).includes('written')) throw new Error('route failed: ' + response.status);
+    for (let attempt = 0; attempt < 40 && kernel.readFile('out.txt') !== 'SYNCED'; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    if (kernel.readFile('out.txt') !== 'SYNCED') throw new Error('out.txt never synced back: ' + JSON.stringify(kernel.readFile('out.txt')));
+    return "out.txt === 'SYNCED'";
+  });
+
+  add('boots without DecompressionStream (pako iframe fallback)', async () => {
+    const native = window.DecompressionStream;
+    delete window.DecompressionStream; // Firefox < 113 / Safari < 16.4 path
+    try {
+      fallbackKernel = window.BeownirKernel.create();
+      await fallbackKernel.whenReady();
+      const result = await fallbackKernel.run('node -e "process.stdout.write(\'FALLBACK_OK\\n\')"');
+      if (result.code !== 0 || !result.stdout.includes('FALLBACK_OK')) throw new Error(JSON.stringify(result));
+    } finally {
+      if (native) window.DecompressionStream = native;
+      fallbackKernel.destroy();
+    }
+    return 'gunzipped 12.3 MiB of esbuild wasm in a sandboxed iframe';
+  });
+
+  add('destroy() tears everything down', async () => {
+    kernel.destroy();
+    if (kernel.state !== 'destroyed') throw new Error('state: ' + kernel.state);
+    if (document.getElementById('beownir-kernel-host')) throw new Error('the hidden frame is still in the DOM');
+    let rejected = false;
+    try { await kernel.run('node -e 1'); } catch { rejected = true; }
+    if (!rejected) throw new Error('commands still accepted after destroy');
+    status('destroyed');
+    return 'frame removed, commands rejected';
+  });
+
+  let kernel = null;
+  let fallbackKernel = null;
+  let serverRun = null;
+
+  /* The harness polls these two. */
+  window.__embedResult = null;
+  window.__embedDone = false;
+
+  $('run').onclick = () => { log('$ run\n'); kernel && kernel.run('node ' + $('editor').value.trim().split('\n')[0]).catch(() => {}); };
+  $('stop').onclick = () => { kernel && kernel.destroy(); };
+
+  (async () => {
+    const results = [];
+    for (const check of checks) {
+      const started = performance.now();
+      try {
+        const detail = await check.fn();
+        results.push({ name: check.name, ok: true, detail: detail || '', ms: Math.round(performance.now() - started) });
+        $('checks').textContent = results.map(r => (r.ok ? 'PASS' : 'FAIL') + '  ' + r.name + (r.detail ? ' — ' + r.detail : '')).join('\n');
+      } catch (error) {
+        results.push({ name: check.name, ok: false, detail: String(error && error.message || error).slice(0, 500), ms: Math.round(performance.now() - started) });
+        $('checks').textContent = results.map(r => (r.ok ? 'PASS' : 'FAIL') + '  ' + r.name + (r.detail ? ' — ' + r.detail : '')).join('\n');
+        break; // later checks depend on earlier ones
+      }
+    }
+    window.__embedResult = results;
+    window.__embedDone = true;
+  })();
+})();
+</script>
+</body>
+</html>

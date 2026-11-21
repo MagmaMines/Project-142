@@ -12,6 +12,8 @@
  *   5. the native runtime asset pack is valid: base64 -> gzip -> sha256
  *   6. the shipped bundle uses no language feature newer than the browser floor
  *   7. the document keeps its required single-file anchors
+ *   8. the headless embed bundle (o/embed/beownir-kernel.js) is current and
+ *      its client code respects the same browser floor
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -147,25 +149,29 @@ const scriptBodies = [];
     scriptBodies.push(html.slice(start, end));
   }
 }
-const floorOffences = [];
-for (const { pattern, feature, needs, probe } of UNSHIPPABLE) {
-  const matcher = new RegExp(pattern, 'g');
-  let total = 0;
-  for (const body of scriptBodies) {
-    for (const line of body.split('\n')) {
-      const trimmed = line.trim();
-      /* Comments explain a feature; they do not call it. */
-      if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue;
-      if (!matcher.test(line)) continue;
-      matcher.lastIndex = 0;
-      /* A guarded use is fine: `typeof structuredClone !== 'function'` on the
-       * same line means the feature is probed before it is called. */
-      if (typeof probe === 'string' && line.includes(probe)) continue;
-      total += (line.match(matcher) || []).length;
+const floorIn = bodies => {
+  const offences = [];
+  for (const { pattern, feature, needs, probe } of UNSHIPPABLE) {
+    const matcher = new RegExp(pattern, 'g');
+    let total = 0;
+    for (const body of bodies) {
+      for (const line of body.split('\n')) {
+        const trimmed = line.trim();
+        /* Comments explain a feature; they do not call it. */
+        if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue;
+        if (!matcher.test(line)) continue;
+        matcher.lastIndex = 0;
+        /* A guarded use is fine: `typeof structuredClone !== 'function'` on the
+         * same line means the feature is probed before it is called. */
+        if (typeof probe === 'string' && line.includes(probe)) continue;
+        total += (line.match(matcher) || []).length;
+      }
     }
+    if (total) offences.push(feature + ' x' + total + ' (' + needs + ')');
   }
-  if (total) floorOffences.push(feature + ' x' + total + ' (' + needs + ')');
-}
+  return offences;
+};
+const floorOffences = floorIn(scriptBodies);
 if (floorOffences.length) {
   fail('the shipped bundle uses features newer than the supported browser floor (' +
     'Chrome ' + FLOOR.chrome + '+ / Firefox ' + FLOOR.firefox + '+ / Safari ' + FLOOR.safari + '+): ' +
@@ -178,6 +184,23 @@ for (const anchor of ['<!--BEOWNIR_HOST_CONFIG-->', '<meta name="beownir-origins
   if (!html.includes(anchor)) fail('missing anchor: ' + anchor);
 }
 notes.push((html.length / 1024 / 1024).toFixed(2) + ' MiB single file');
+
+/* 9. headless embed bundle. Third-party pages load o/embed/beownir-kernel.js
+ *    instead of the IDE, so it is a shipped surface: it must exist, match the
+ *    app's embedded sources byte for byte (a stale copy would silently give a
+ *    host an older runtime), and respect the same browser floor. */
+try {
+  const { build, templatePath, outputPath } = await import('./build-embed.mjs');
+  const templateSource = fs.readFileSync(templatePath, 'utf8');
+  if (!fs.existsSync(outputPath)) fail('o/embed/beownir-kernel.js is missing: run node tools/build-embed.mjs');
+  else if (fs.readFileSync(outputPath, 'utf8') !== build()) fail('o/embed/beownir-kernel.js is stale: run node tools/build-embed.mjs');
+  else notes.push('embed bundle current (' + (fs.statSync(outputPath).size / 1048576).toFixed(1) + ' MiB)');
+  const embedFloor = floorIn([templateSource]);
+  if (embedFloor.length) fail('the embed client uses features newer than the browser floor: ' + embedFloor.join('; '));
+  else notes.push('embed client respects the browser floor');
+} catch (error) {
+  fail('embed check failed: ' + error.message);
+}
 
 for (const note of notes) console.log('  ok  ' + note);
 for (const message of failures) console.error('FAIL  ' + message);
