@@ -88,9 +88,17 @@ test('crypto covers randomness, kdf and honest failures for signing', () => {
   assert.equal(local.createHash('sha256').update('x').digest('hex'), crypto.createHash('sha256').update('x').digest('hex'));
   // RSA signing and encryption are implemented in test/crypto-asymmetric.test.mjs;
   // what still needs OpenSSL must say so instead of faking it.
-  for (const name of ['generateKeyPairSync', 'generateKeyPair', 'createECDH']) {
+  for (const name of ['generateKeyPairSync', 'generateKeyPair']) {
     assert.throws(() => local[name](), error => error.code === 'ERR_CRYPTO_OPERATION_FAILED', name + ' fails predictably');
   }
+  // ECDH is implemented for the NIST prime curves; the agreement itself is
+  // checked against OpenSSL in test/crypto.test.mjs.
+  assert.equal(typeof local.createECDH, 'function');
+  const ecdh = local.createECDH('prime256v1');
+  assert.ok(ecdh.generateKeys().length > 0);
+  assert.throws(() => local.createECDH('nope'), error => error.code === 'ERR_CRYPTO_INVALID_CURVE');
+  // scrypt is implemented in-house (RFC 7914 vectors live in crypto.test.mjs).
+  assert.equal(local.scryptSync('p', 's', 16, { N: 16, r: 1, p: 1 }).toString('hex'), crypto.scryptSync('p', 's', 16, { N: 16, r: 1, p: 1 }).toString('hex'));
   assert.equal(typeof local.createSign, 'function');
   assert.equal(typeof local.createVerify, 'function');
   assert.equal(typeof local.createPrivateKey, 'function');

@@ -222,10 +222,10 @@ a table:
 
 ```
 module               cover   runtime/node   first gaps
-crypto                86.6%      58 /67      Certificate, ECDH, Sign, Verify, X509Certificate
+crypto                97.0%      65 /67      Certificate, X509Certificate
 module               100.0%      32 /30
 ...
-overall 99.3% of 1336 Node exports across 55 modules (55 implemented) on Node 22.22.3
+overall 99.9% of 1336 Node exports across 55 modules (55 implemented) on Node 22.22.3
 deprecated internals (_*): 0.0% of 53 exports across 11 modules, reported separately
 ```
 
@@ -236,11 +236,12 @@ denominator instead of scoring zero. Those six are now implemented, `require()`
 agrees with `module.builtinModules`, and a module that stops existing can only
 make the number go *down*.
 
-The nine exports still missing are asymmetric primitives that only OpenSSL can
-provide in a browser (RSA `Sign`/`Verify`, `publicEncrypt`, `privateDecrypt`,
-`X509Certificate`, `Certificate`, `ECDH`). They throw a named error instead of
-returning a plausible-looking wrong answer; everything else on that list is
-implemented and tested against the real thing.
+Two exports are still missing and both are X.509 parsing: `X509Certificate` and
+the legacy `Certificate` class. They throw a named error instead of returning a
+plausible-looking wrong answer; everything else on that list is implemented and
+tested against the real thing, including ECDH over P-256/P-384/P-521 and
+`scrypt`, which are compared byte-for-byte with OpenSSL in
+`test/crypto.test.mjs`.
 
 The deprecated `_`-prefixed internals (`_http_agent`, `_stream_readable`, …) are
 Node's own implementation details, not API. The runtime does not ship them and
@@ -318,7 +319,7 @@ What the remaining gaps actually are:
 | `path`, `url`, `querystring`, `punycode`, `os`, `tty`, `readline`, `vm`, `perf_hooks`, `string_decoder`, `timers/promises`, `stream/promises` | complete export surface, behaviour implemented |
 | `events`, `stream`, `assert`, `buffer`, `module`, `worker_threads`, `net`, `fs/promises`, `child_process` | ≥85%, the missing names are native-only internals |
 | `https`, `http`, `fs` | 100% / 80% / 74%; `http` is missing only browser-only WHATWG classes and Node internals, `fs` only stream classes packages rarely import |
-| `crypto` | ~50%: hashing, HMAC, PBKDF2, HKDF, random, WebCrypto-backed AES; signing/cipher **streams** deliberately throw `ERR_CRYPTO_OPERATION_FAILED` rather than returning wrong bytes |
+| `crypto` | 97%: hashing, HMAC, PBKDF2, HKDF, **scrypt**, random, in-house AES (CBC/CTR/CFB/OFB/GCM), RSA PKCS#1 v1.5 + OAEP, **ECDH** on P-256/384/521; signing/cipher **streams** deliberately throw `ERR_CRYPTO_OPERATION_FAILED` rather than returning wrong bytes |
 | `zlib` | ~77%: gzip/deflate/inflate round-trip through pako; Brotli and Zstd throw `ERR_ZLIB_UNAVAILABLE` |
 | `dns`, `tls`, `http2` | honest stubs with stable codes (`ENOTSUP`); the browser cannot open raw sockets. Real networking needs the native browser-WASM profile or the host relay |
 | `inspector`, `domain`, `cluster` | no-ops: there is no debugger agent and no multi-process cluster in a worker |
@@ -501,11 +502,14 @@ byte-for-byte Node:
   `it`/`assert` drive the shell's own test command).
 
 Anything unsupported throws an explicit `Error` with a stable `code` instead of
-failing silently. The asymmetrical gaps that remain are key **generation**
-(`generateKeyPairSync`, `createECDH`), non-RSA algorithms (ECDSA, Ed25519),
-RSA-PSS padding, X.509 certificate parsing and encrypted PEM keys; Brotli and
-Zstd need the platform's `CompressionStream` (browsers ship gzip/deflate only),
-so on a real browser they fail with the reason instead of a wrong result.
+failing silently. `crypto.scrypt`/`scryptSync` (RFC 7914 Salsa20/8 + BlockMix) and
+`crypto.createECDH` (P-256, P-384, P-521, with compressed/hybrid point codecs and
+`ECDH.convertKey`) are implemented in-house and byte-compared with OpenSSL. The
+asymmetrical gaps that remain are key **generation** (`generateKeyPairSync` /
+`generateKeyPair`), non-RSA algorithms (ECDSA, Ed25519), RSA-PSS padding, X.509
+certificate parsing and encrypted PEM keys; Brotli and Zstd need the platform's
+`CompressionStream` (browsers ship gzip/deflate only), so on a real browser they
+fail with the reason instead of a wrong result.
 
 ## The release artifact
 

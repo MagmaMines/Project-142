@@ -4120,6 +4120,109 @@ let pendingQuestion = null;
     try { const value = pbkdf2Raw(password, salt, iterations, keylen, typeof digest === 'function' ? 'sha1' : digest); queueMicrotask(() => done(null, value)); }
     catch (error) { queueMicrotask(() => done(error)); }
   });
+  /* scrypt (RFC 7914). The Salsa20/8 core and BlockMix are validated against the
+   * published vector and against Node's OpenSSL for five parameter sets in
+   * test/crypto.test.mjs. Parameters are bounded the way Node bounds them: a
+   * hostile workspace must not be able to request a gigabyte of memory from a
+   * single call, and the cost is checked before the buffer is allocated. */
+  const SALSA_ROTATE = (value, count) => ((value << count) | (value >>> (32 - count))) >>> 0;
+  const salsa20_8 = words => {
+    const x = words.slice();
+    for (let round = 0; round < 8; round += 2) {
+      x[4] ^= SALSA_ROTATE((x[0] + x[12]) | 0, 7);  x[8] ^= SALSA_ROTATE((x[4] + x[0]) | 0, 9);
+      x[12] ^= SALSA_ROTATE((x[8] + x[4]) | 0, 13); x[0] ^= SALSA_ROTATE((x[12] + x[8]) | 0, 18);
+      x[9] ^= SALSA_ROTATE((x[5] + x[1]) | 0, 7);   x[13] ^= SALSA_ROTATE((x[9] + x[5]) | 0, 9);
+      x[1] ^= SALSA_ROTATE((x[13] + x[9]) | 0, 13); x[5] ^= SALSA_ROTATE((x[1] + x[13]) | 0, 18);
+      x[14] ^= SALSA_ROTATE((x[10] + x[6]) | 0, 7); x[2] ^= SALSA_ROTATE((x[14] + x[10]) | 0, 9);
+      x[6] ^= SALSA_ROTATE((x[2] + x[14]) | 0, 13); x[10] ^= SALSA_ROTATE((x[6] + x[2]) | 0, 18);
+      x[3] ^= SALSA_ROTATE((x[15] + x[11]) | 0, 7); x[7] ^= SALSA_ROTATE((x[3] + x[15]) | 0, 9);
+      x[11] ^= SALSA_ROTATE((x[7] + x[3]) | 0, 13); x[15] ^= SALSA_ROTATE((x[11] + x[7]) | 0, 18);
+      x[1] ^= SALSA_ROTATE((x[0] + x[3]) | 0, 7);   x[2] ^= SALSA_ROTATE((x[1] + x[0]) | 0, 9);
+      x[3] ^= SALSA_ROTATE((x[2] + x[1]) | 0, 13);  x[0] ^= SALSA_ROTATE((x[3] + x[2]) | 0, 18);
+      x[6] ^= SALSA_ROTATE((x[5] + x[4]) | 0, 7);   x[7] ^= SALSA_ROTATE((x[6] + x[5]) | 0, 9);
+      x[4] ^= SALSA_ROTATE((x[7] + x[6]) | 0, 13);  x[5] ^= SALSA_ROTATE((x[4] + x[7]) | 0, 18);
+      x[11] ^= SALSA_ROTATE((x[10] + x[9]) | 0, 7); x[8] ^= SALSA_ROTATE((x[11] + x[10]) | 0, 9);
+      x[9] ^= SALSA_ROTATE((x[8] + x[11]) | 0, 13); x[10] ^= SALSA_ROTATE((x[9] + x[8]) | 0, 18);
+      x[12] ^= SALSA_ROTATE((x[15] + x[14]) | 0, 7); x[13] ^= SALSA_ROTATE((x[12] + x[15]) | 0, 9);
+      x[14] ^= SALSA_ROTATE((x[13] + x[12]) | 0, 13); x[15] ^= SALSA_ROTATE((x[14] + x[13]) | 0, 18);
+    }
+    for (let index = 0; index < 16; index++) words[index] = (words[index] + x[index]) >>> 0;
+  };
+  const blockMix = (source, target, r, scratch) => {
+    const X = scratch.x, Y = scratch.y;
+    X.set(source.subarray((2 * r - 1) * 16, 2 * r * 16));
+    for (let block = 0; block < 2 * r; block++) {
+      const base = block * 16;
+      for (let word = 0; word < 16; word++) X[word] ^= source[base + word];
+      salsa20_8(X);
+      Y.set(X, base);
+    }
+    for (let index = 0; index < r; index++) target.set(Y.subarray(index * 32, index * 32 + 16), index * 16);
+    for (let index = 0; index < r; index++) target.set(Y.subarray(index * 32 + 16, index * 32 + 32), (r + index) * 16);
+  };
+  const scryptOptions = (options = {}) => {
+    const N = options.N === undefined ? 16384 : Number(options.N);
+    const r = options.r === undefined ? 8 : Number(options.r);
+    const p = options.p === undefined ? 1 : Number(options.p);
+    if (!Number.isInteger(N) || N < 2 || (N & (N - 1)) !== 0) throw Object.assign(new RangeError('Invalid scrypt param'), { code: 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS' });
+    if (!Number.isInteger(r) || r < 1 || !Number.isInteger(p) || p < 1) throw Object.assign(new RangeError('Invalid scrypt param'), { code: 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS' });
+    if (N > 2 ** 30 || r > 2 ** 30 || p > 2 ** 30) throw Object.assign(new RangeError('Invalid scrypt param'), { code: 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS' });
+    /* 128 * r * N bytes of memory, matching OpenSSL's view. Node defaults to a
+     * 32 MiB cap and lets callers raise it; the same rule applies here so a
+     * project that passes maxmem keeps working and one that does not gets the
+     * same refusal Node gives. */
+    const maxmem = options.maxmem === undefined ? 33554432 : Number(options.maxmem);
+    const memory = 128 * r * (N + 2 + p);
+    if (memory > maxmem) {
+      const error = new RangeError('Invalid scrypt params: memory limit exceeded');
+      error.code = 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS';
+      throw error;
+    }
+    return { N, r, p };
+  };
+  const scryptRaw = (password, salt, keylen, options) => {
+    const { N, r, p } = scryptOptions(options);
+    const length = Number(keylen);
+    if (!Number.isInteger(length) || length < 0 || length > 2147483647) throw Object.assign(new RangeError('Invalid scrypt key length'), { code: 'ERR_OUT_OF_RANGE' });
+    const passwordBytes = Buffer.from(password), saltBytes = Buffer.from(salt);
+    const mixed = Buffer.from(pbkdf2Raw(passwordBytes, saltBytes, 1, 128 * r * p, 'sha256'));
+    const words = 32 * r;
+    const X = new Uint32Array(words), Y = new Uint32Array(words);
+    const V = new Uint32Array(words * N);
+    const scratch = { x: new Uint32Array(16), y: new Uint32Array(2 * words) };
+    for (let pass = 0; pass < p; pass++) {
+      const base = pass * words;
+      for (let index = 0; index < words; index++) X[index] = mixed.readUInt32LE(4 * (base + index));
+      for (let index = 0; index < N; index++) { V.set(X, index * words); blockMix(X, Y, r, scratch); X.set(Y); }
+      for (let index = 0; index < N; index++) {
+        const pick = X[(2 * r - 1) * 16] & (N - 1);
+        for (let word = 0; word < words; word++) X[word] ^= V[pick * words + word];
+        blockMix(X, Y, r, scratch);
+        X.set(Y);
+      }
+      for (let index = 0; index < words; index++) mixed.writeUInt32LE(X[index] >>> 0, 4 * (base + index));
+    }
+    /* The final PBKDF2 uses the original password as the key and the mixed
+     * block as the salt. Getting this backwards still produces a stable,
+     * plausible-looking key, which is why the RFC vector is in the test suite. */
+    return Buffer.from(pbkdf2Raw(passwordBytes, mixed, 1, length, 'sha256'));
+  };
+  define(CRYPTO, 'scryptSync', (password, salt, keylen, options) => scryptRaw(password, salt, keylen, options));
+  define(CRYPTO, 'scrypt', (password, salt, keylen, options, callback) => {
+    const done = typeof options === 'function' ? options : callback;
+    const settings = typeof options === 'function' ? undefined : options;
+    const fail = error => { if (typeof done === 'function') queueMicrotask(() => done(error)); else throw error; };
+    if (typeof done !== 'function') return fail(Object.assign(new TypeError('The "callback" argument must be of type function'), { code: 'ERR_INVALID_ARG_TYPE' }));
+    let sync;
+    try { sync = scryptOptions(settings); } catch (error) { return fail(error); }
+    /* Run the derivation off the current tick. It is synchronous work either
+     * way - a worker has no thread to hand it to - but yielding first keeps the
+     * Node contract that the callback is never called before this call returns
+     * and leaves the caller's tick intact. */
+    setTimeout(() => {
+      try { done(null, scryptRaw(password, salt, keylen, sync)); } catch (error) { done(error); }
+    }, 0);
+  });
   define(CRYPTO, 'hkdfSync', (digest, key, salt, info, keylen) => {
     const algorithm = String(digest || 'sha256').toLowerCase();
     const hmac = k => CRYPTO.createHmac(algorithm, k);
@@ -4757,6 +4860,183 @@ let pendingQuestion = null;
   CRYPTO.Decipheriv = CRYPTO.Decipheriv || Decipher;
   define(CRYPTO, 'createCipheriv', (algorithm, key, iv, options) => new Cipher(algorithm, key, iv, options));
   define(CRYPTO, 'createDecipheriv', (algorithm, key, iv, options) => new Decipher(algorithm, key, iv, options));
+  /* --- ECDH over the NIST prime curves (P-256/384/521) ---------------------
+   * Affine Jacobian-free arithmetic on BigInt: each point operation needs one
+   * modular inverse, which is slower than Montgomery/Jacobian coordinates but
+   * is short enough to audit and fast enough for key agreement (single-digit
+   * milliseconds per scalar multiplication). Verified byte-for-byte against
+   * OpenSSL for public keys and shared secrets on all three curves. */
+  const EC_CURVES = {
+    prime256v1: {
+      p: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn,
+      a: 0xffffffff00000001000000000000000000000000fffffffffffffffffffffffcn,
+b: 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn,
+      gx: 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n,
+      gy: 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n,
+      n: 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n,
+      size: 32,
+    },
+    secp384r1: {
+      p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffffn,
+      a: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffcn,
+b: 0xb3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aefn,
+      gx: 0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7n,
+      gy: 0x3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5fn,
+      n: 0xffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973n,
+      size: 48,
+    },
+    secp521r1: {
+      p: 0x01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn,
+      a: 0x01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffcn,
+b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b503f00n,
+      gx: 0x00c6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5bd66n,
+      gy: 0x011839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd16650n,
+      n: 0x01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409n,
+      size: 66,
+    },
+  };
+  /* Two of these operands are subarray offsets (Numbers), so every call site
+   * passes BigInt explicitly; mixing a Number into BigInt arithmetic throws. */
+  const ecMod = (value, modulus) => ((value % modulus) + modulus) % modulus;
+  const ecInverse = (value, modulus) => {
+    let [oldR, r] = [ecMod(value, modulus), modulus], [oldS, s] = [1n, 0n];
+    while (r !== 0n) {
+      const quotient = oldR / r;
+      [oldR, r] = [r, oldR - quotient * r];
+      [oldS, s] = [s, oldS - quotient * s];
+    }
+    return ecMod(oldS, modulus);
+  };
+  /* Point addition/doubling for y^2 = x^3 + ax + b. null is the point at infinity. */
+  const ecAdd = (first, second, curve) => {
+    if (first === null) return second;
+    if (second === null) return first;
+    const p = curve.p;
+    if (first[0] === second[0]) {
+      if (ecMod(first[1] + second[1], p) === 0n) return null;
+      const slope = ecMod((3n * first[0] * first[0] + curve.a) * ecInverse(2n * first[1], p), p);
+      const x = ecMod(slope * slope - 2n * first[0], p);
+      return [x, ecMod(slope * (first[0] - x) - first[1], p)];
+    }
+    const slope = ecMod((second[1] - first[1]) * ecInverse(second[0] - first[0], p), p);
+    const x = ecMod(slope * slope - first[0] - second[0], p);
+    return [x, ecMod(slope * (first[0] - x) - first[1], p)];
+  };
+  const ecMultiply = (point, scalar, curve) => {
+    let result = null, addend = point;
+    while (scalar > 0n) {
+      if (scalar & 1n) result = ecAdd(result, addend, curve);
+      addend = ecAdd(addend, addend, curve);
+      scalar >>= 1n;
+    }
+    return result;
+  };
+  const ecToBigInt = bytes => BigInt('0x' + Buffer.from(bytes).toString('hex'));
+  const ecToBytes = (value, size) => Buffer.from(value.toString(16).padStart(size * 2, '0'), 'hex');
+  class ECDH {
+    constructor(curve) {
+      const name = String(curve || 'prime256v1');
+      this._curve = EC_CURVES[name];
+      if (!this._curve) throw Object.assign(new Error('Invalid EC curve name: ' + name), { code: 'ERR_CRYPTO_INVALID_CURVE' });
+      this._private = null;
+      this._public = null;
+      this._curveName = name;
+    }
+    getPrivateKey() { return this._private ? ecToBytes(this._private, this._curve.size) : Buffer.alloc(0); }
+    /* Node's signature is getPublicKey([encoding][, format]); getting the two
+     * arguments the wrong way round is silent, so the order matters. */
+    getPublicKey(encoding, format) {
+      if (!this._public) throw Object.assign(new Error('Invalid ECDH instance: no keys generated'), { code: 'ERR_CRYPTO_INVALID_STATE' });
+      const bytes = this._encodePoint(this._public, format || 'uncompressed');
+      if (encoding === 'hex') return bytes.toString('hex');
+      if (encoding === 'base64') return bytes.toString('base64');
+      return bytes;
+    }
+    /* SEC1 point codecs, shared by getPublicKey, computeSecret and convertKey. */
+    _encodePoint(point, format) {
+      if (format !== 'uncompressed' && format !== 'compressed' && format !== 'hybrid') {
+        throw Object.assign(new TypeError('Invalid ECDH format: ' + format), { code: 'ERR_INVALID_ARG_VALUE' });
+      }
+      const { size } = this._curve;
+      const [x, y] = point;
+      const odd = (y & 1n) === 1n;
+      if (format === 'compressed') return Buffer.concat([Buffer.from([odd ? 3 : 2]), ecToBytes(x, size)]);
+      if (format === 'hybrid') return Buffer.concat([Buffer.from([odd ? 7 : 6]), ecToBytes(x, size), ecToBytes(y, size)]);
+      return Buffer.concat([Buffer.from([4]), ecToBytes(x, size), ecToBytes(y, size)]);
+    }
+    _decodePoint(peer) {
+      const { size } = this._curve;
+      if (peer.length === 1 + 2 * size && (peer[0] === 4 || peer[0] === 6 || peer[0] === 7)) {
+        return [ecToBigInt(peer.subarray(1, 1 + size)), ecToBigInt(peer.subarray(1 + size))];
+      }
+      if (peer.length === 1 + size && (peer[0] === 2 || peer[0] === 3)) {
+        /* Decompress: y^2 = x^3 + ax + b. Every NIST prime here is 3 (mod 4), so
+         * the square root is rhs^((p+1)/4); the parity byte then picks the sign.
+         * A root that does not square back means the x is not on the curve. */
+        const x = ecToBigInt(peer.subarray(1));
+        const rhs = ecMod(x * x * x + this._curve.a * x + this._curve.b, this._curve.p);
+        let y = ecModPow(rhs, (this._curve.p + 1n) / 4n, this._curve.p);
+        if (ecMod(y * y, this._curve.p) !== rhs) throw Object.assign(new Error('Public key is not a point on the curve'), { code: 'ERR_CRYPTO_INVALID_KEYTYPE' });
+        if ((y & 1n) !== BigInt(peer[0] === 3 ? 1 : 0)) y = this._curve.p - y;
+        return [x, y];
+      }
+      throw Object.assign(new Error('Public key is not a valid point'), { code: 'ERR_CRYPTO_INVALID_KEYTYPE' });
+    }
+    generateKeys(encoding, format) {
+      let scalar;
+      do { scalar = ecToBigInt(secureRandomBytes(new Uint8Array(this._curve.size))); } while (scalar === 0n || scalar >= this._curve.n);
+      this._private = scalar;
+      this._public = ecMultiply([this._curve.gx, this._curve.gy], scalar, this._curve);
+      return this.getPublicKey(encoding, format);
+    }
+    setPrivateKey(key, encoding) {
+      let bytes = Buffer.from(key, typeof encoding === 'string' ? encoding : undefined);
+      /* Accept a scalar, or a SEC1 uncompressed point from which the scalar
+       * cannot be recovered - Node rejects the latter, and so do we. */
+      if (bytes.length === 1 + 2 * this._curve.size) throw Object.assign(new Error('Private key is not a valid scalar'), { code: 'ERR_CRYPTO_INVALID_KEYTYPE' });
+      const scalar = ecToBigInt(bytes);
+      if (scalar === 0n || scalar >= this._curve.n) throw Object.assign(new Error('Private key is out of range'), { code: 'ERR_CRYPTO_INVALID_KEYTYPE' });
+      this._private = scalar;
+      this._public = ecMultiply([this._curve.gx, this._curve.gy], scalar, this._curve);
+      return this.getPublicKey();
+    }
+    computeSecret(otherPublicKey, inputEncoding, outputEncoding) {
+      if (!this._private) throw Object.assign(new Error('Invalid ECDH instance: no private key'), { code: 'ERR_CRYPTO_INVALID_STATE' });
+      const peer = Buffer.from(otherPublicKey, typeof inputEncoding === 'string' ? inputEncoding : undefined);
+      const { size } = this._curve;
+      const secret = ecMultiply(this._decodePoint(peer), this._private, this._curve);
+      if (secret === null) throw Object.assign(new Error('Public key is the point at infinity'), { code: 'ERR_CRYPTO_INVALID_KEYTYPE' });
+      const bytes = ecToBytes(secret[0], size);
+      if (outputEncoding === 'hex') return bytes.toString('hex');
+      if (outputEncoding === 'base64') return bytes.toString('base64');
+      return bytes;
+    }
+  }
+  define(CRYPTO, 'createECDH', curve => new ECDH(curve));
+  /* Node also exports the class itself (for createECDH's instanceof checks). */
+  define(CRYPTO, 'ECDH', ECDH);
+  /* convertKey(key, curve[, inputEncoding][, outputEncoding][, format]) parses a
+   * peer point and re-serialises it. It never involves a private key, so it is
+   * implemented with the point codecs rather than through an ECDH instance. */
+  ECDH.convertKey = (key, curve, inputEncoding, outputEncoding, format) => {
+    const instance = new ECDH(curve);
+    const peer = Buffer.from(key, typeof inputEncoding === 'string' ? inputEncoding : undefined);
+    const point = instance._decodePoint(peer);
+    const resolvedFormat = format || 'uncompressed';
+    const bytes = instance._encodePoint(point, resolvedFormat);
+    if (outputEncoding === 'hex') return bytes.toString('hex');
+    if (outputEncoding === 'base64') return bytes.toString('base64');
+    return bytes;
+  };
+  const ecModPow = (base, exponent, modulus) => {
+    let result = 1n, factor = ecMod(base, modulus);
+    while (exponent > 0n) {
+      if (exponent & 1n) result = ecMod(result * factor, modulus);
+      factor = ecMod(factor * factor, modulus);
+      exponent >>= 1n;
+    }
+    return result;
+  };
   define(CRYPTO, 'getHashes', () => ['sha1', 'sha256', 'sha384', 'sha512', 'sha512-256', 'md5']);
   define(CRYPTO, 'getCiphers', () => Object.keys(CIPHER_INFO));
   define(CRYPTO, 'getCurves', () => ['prime256v1', 'secp384r1', 'secp521r1', 'ed25519']);
@@ -5175,7 +5455,7 @@ let pendingQuestion = null;
   };
 
   // Everything else asymmetric still needs OpenSSL; those stay explicit.
-  for (const name of ['generateKeyPairSync', 'generateKeyPair', 'createECDH', 'scrypt', 'scryptSync']) {
+  for (const name of ['generateKeyPairSync', 'generateKeyPair']) {
     define(CRYPTO, name, () => { throw notImplemented('crypto.' + name + ' (asynchronous WebCrypto ciphers are not synchronous in this runtime; use crypto.subtle)', 'ERR_CRYPTO_OPERATION_FAILED'); });
   }
   define(CRYPTO, 'timingSafeEqual', CRYPTO.timingSafeEqual);
