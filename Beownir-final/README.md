@@ -109,10 +109,43 @@ files / 186 MiB in about 28 s inside the worker. `node_modules` never enters the
 editor's source workspace; it is compressed into a dependency checkpoint and
 restored after a reload.
 
-## Live preview without HMR
+## Preview: native modules where it is safe, a rewriting loader everywhere else
 
-There is no hot module replacement. Instead the IDE detects edits and re-applies
-them:
+Two preview paths exist and the IDE chooses between them per page load.
+
+**Same-origin service worker (default on loopback).** When the page is served
+from `localhost` / `127.0.0.1` / `::1` *and* a service worker is controlling the
+page, `o/site/coi-sw.js` turns the IDE origin into a proxy for the project's
+virtual dev ports. The preview frame is loaded from
+`/__beownir_preview__/<port>/<path>`; the worker forwards each request to the
+open IDE tab, which answers it from the worker runtime's virtual loopback. Once
+a preview document has claimed its client, that client's root-relative
+subresources (`/src/main.js`, `/style.css`, `/logo.svg`) route to the same
+virtual port, so the page runs as a normal origin: ES modules load natively, Vite
+serves `/@vite/client`, assets stream as usual. For HTML documents the worker
+injects a small WebSocket shim that bridges `ws://` to the IDE tab over a
+`BroadcastChannel`; the tab feeds those frames into the same kernel upgrade path
+the srcdoc preview uses. The result is framework HMR — a Vite update reaching a
+real `import.meta.hot` handler and touching the DOM — without a reload or a
+rewritten transport.
+
+**Sandboxed `srcdoc` (deployed and non-loopback).** Everywhere else — every
+hosted deployment of the IDE, and any browser where the worker is not
+registered — the preview stays an opaque-origin `srcdoc` iframe and modules go
+through the rewriting loader (`o/runtime/preview-bridge.js`), with the same
+live-reload behaviour as before. The same worker is served from a static host,
+so a deployment that loses `/coi-sw.js` degrades to this path rather than
+failing.
+
+Why the split is deliberate: the service-worker path gives the project's code
+same-origin privileges on the IDE origin. That is fine for a developer running
+their own project on their own machine, and it is exactly what Nodepod-style
+previews do. It is not something to hand to a hosted multi-tenant IDE without a
+separate origin, so the gate is loopback-only and the deployed path keeps the
+sandboxed frame.
+
+Under either path the IDE's own live reload still runs for projects without a
+framework dev server:
 
 - every save marks the file changed; live reload waits for the write to settle
   (500 ms web / 1500 ms native) and refreshes the preview;
@@ -370,13 +403,20 @@ Known limits, measured rather than hidden:
   transport/invalidation pass. `vite build` now runs through a tested CLI
   compatibility path for a TypeScript entry and emits a production bundle.
   Common options in that adapter are intentionally limited; arbitrary CLI
-  options, plugins, optimizeDeps, browser DOM HMR, and large projects are not
-  established. Unsupported options fail explicitly instead of being ignored.
-- **`http` upgrade / WebSocket handshakes are not carried over the virtual
-  loopback.** An HTTP server answers ordinary requests, but `'upgrade'` has no
-  duplex socket to hand out, so a `ws` client receives `426 Upgrade Required`
-  from its own server. WebSocket transports therefore fall back to polling
-  (socket.io's Engine.IO polling row is certified) or to the host relay.
+  options, plugins, optimizeDeps and large projects are not established.
+  Unsupported options fail explicitly instead of being ignored. Browser DOM HMR
+  has been verified for one fixture (Vite 6, one CSS+SVG module graph, loopback
+  service-worker preview): an edit reaches `import.meta.hot` and updates the DOM
+  with no reload. Plugin fast-refresh (React/Vue), multi-module update graphs and
+  other frameworks' HMR clients remain unverified.
+- **`http` upgrade / WebSocket handshakes work on the virtual loopback, not
+  across a real socket.** An in-process duplex stands in for the TCP pair: the
+  client writes an RFC 6455 handshake, the server sees `'upgrade'` with one half
+  and the client reads `101` from the other. That is enough for a Vite HMR client
+  (verified in-browser) and for `ws`-style servers that do not inspect the
+  socket. What is missing is an OS socket: `getsockname()`/`remoteAddress` are
+  synthesized, backpressure and half-close are approximated, and a library that
+  needs the real descriptor will notice.
 - native addons (SWC, lightningcss, Turbopack) still need the WASM/native
   profile, and frameworks that gate on `process.versions.node >= 20` see the
   disclosed `v20.11.0-beownir` version string.
@@ -527,6 +567,14 @@ Environment: `PORT` (base port), `BEOWNIR_BIND` (`127.0.0.1` by default; set `0.
 Connect the repository and deploy. There is nothing else to configure: the
 repository-root `netlify.toml` publishes `o/site` and sends the headers the
 runtime needs.
+
+`o/site` also carries `coi-sw.js`, the preview service worker. It is fetched
+same-origin and must be served as JavaScript from the site root (the deploy
+step writes the file; do not bundle or rename it). On a deployed host the worker
+registers but the loopback gate keeps the same-origin preview off, so the page
+behaves exactly as it did before: sandboxed `srcdoc` preview through the
+rewriting loader. If the file is missing, the IDE does not attempt the worker
+path at all.
 
 ```toml
 [build]
