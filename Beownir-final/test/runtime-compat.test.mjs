@@ -577,3 +577,109 @@ test('fs.promises.watch, npm run -- args, npx flags, and shared esbuild API work
   const stdout2 = posts.slice(outFrom2).filter(m => m.type === 'stdout').map(m => m.data).join('');
   assert.match(stdout2, /CLI:one two/);
 });
+
+test('Writable cork/_writev, vm context isolation, and recursive node:test runner behave cleanly', async () => {
+  const { evaluate } = loadRuntime();
+  const result = JSON.parse(await evaluate(`(async () => {
+    const { Writable } = require('stream');
+    const vm = require('vm');
+    const nodeTest = require('node:test');
+    const assert = require('node:assert/strict');
+
+    // 1. Writable corking + _writev batching + async flush before finish
+    const batches = [];
+    let finalRan = false;
+    const events = [];
+    const w = new Writable({
+      writev(chunks, cb) {
+        batches.push(chunks.map(c => c.chunk.toString('utf8')));
+        setTimeout(cb, 5);
+      },
+      write(chunk, _enc, cb) {
+        batches.push([chunk.toString('utf8')]);
+        cb();
+      },
+      final(cb) {
+        finalRan = true;
+        events.push('final');
+        cb();
+      },
+    });
+    w.on('finish', () => events.push('finish'));
+    w.cork();
+    w.cork();
+    w.write('a');
+    w.write('b');
+    w.uncork();
+    const stillCorked = batches.length === 0 && w.writableCorked === 1;
+    w.cork();
+    w.write('c');
+    await new Promise(resolve => w.end(resolve));
+
+    // 2. vm context writes stay inside context instead of leaking to globalThis
+    const ctx = vm.createContext({ a: 10 });
+    const sum = vm.runInContext('b = a + 32; a = 99; b', ctx);
+    const leaked = typeof globalThis.b;
+    const newCtx = { base: 7 };
+    const doubled = vm.runInNewContext('out = base * 2', newCtx);
+    const leakedNew = typeof globalThis.out;
+
+    // 3. node:test nested suites, t.test subtests, (t, done), skip/todo, run() reset
+    nodeTest._root.length = 0;
+    const trace = [];
+    nodeTest.describe('outer', () => {
+      nodeTest.it('sync pass', t => {
+        trace.push(t.fullName);
+      });
+      nodeTest.it('done callback', (t, done) => {
+        setTimeout(() => { trace.push(t.name); done(); }, 2);
+      });
+      nodeTest.skip('skipped', () => { trace.push('BAD'); });
+      nodeTest.todo('planned', () => {});
+      nodeTest.describe('inner', () => {
+        nodeTest.it('subtest parent', async t => {
+          await t.test('child step', sub => {
+            assert.equal(sub.fullName, 'subtest parent > child step');
+            trace.push('sub');
+          });
+        });
+      });
+    });
+    const run1 = await nodeTest.run();
+    const run2 = await nodeTest.run();
+
+    // Test .only filtering
+    nodeTest._root.length = 0;
+    const onlyTrace = [];
+    nodeTest.it('ignored', () => { onlyTrace.push('no'); });
+    nodeTest.describe.only('focused suite', () => {
+      nodeTest.it('included', () => { onlyTrace.push('yes'); });
+    });
+    const onlyRun = await nodeTest.run();
+    nodeTest._root.length = 0;
+
+    return JSON.stringify({
+      batches,
+      stillCorked,
+      finalRan,
+      events,
+      vm: { sum, a: ctx.a, b: ctx.b, leaked, doubled, out: newCtx.out, leakedNew },
+      run1: { passed: run1.passed, failed: run1.failed.length, skipped: run1.skipped },
+      run2: { passed: run2.passed, failed: run2.failed.length, skipped: run2.skipped },
+      trace,
+      onlyRun: { passed: onlyRun.passed, failed: onlyRun.failed.length, skipped: onlyRun.skipped },
+      onlyTrace,
+    });
+  })()`));
+
+  assert.deepEqual(result.batches, [['a', 'b', 'c']]);
+  assert.equal(result.stillCorked, true);
+  assert.equal(result.finalRan, true);
+  assert.deepEqual(result.events, ['final', 'finish']);
+  assert.deepEqual(result.vm, { sum: 42, a: 99, b: 42, leaked: 'undefined', doubled: 14, out: 14, leakedNew: 'undefined' });
+  assert.deepEqual(result.run1, { passed: 4, failed: 0, skipped: 2 });
+  assert.deepEqual(result.run2, { passed: 4, failed: 0, skipped: 2 });
+  assert.deepEqual(result.trace, ['sync pass', 'done callback', 'sub', 'sync pass', 'done callback', 'sub']);
+  assert.deepEqual(result.onlyRun, { passed: 1, failed: 0, skipped: 0 });
+  assert.deepEqual(result.onlyTrace, ['yes']);
+});

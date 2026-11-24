@@ -388,4 +388,76 @@ export const checks = [
     const thrower = fn => { try { fn(); return 'no-throw'; } catch (error) { return [error.code, /too large/.test(error.message)]; } };
     return [thrower(() => crypto.publicEncrypt(publicKey, Buffer.alloc(300))), thrower(() => crypto.createPrivateKey('-----BEGIN PRIVATE KEY-----\\nAAAA\\n-----END PRIVATE KEY-----'))];
   })()`],
+  ['crypto-hashes-extended', `(() => {
+    const crypto = require('crypto');
+    const data = Buffer.from('differential-digest');
+    return ['sha224', 'sha512-224', 'sha512-256', 'ripemd160'].map(alg => [
+      crypto.createHash(alg).update(data).digest('hex'),
+      crypto.createHmac(alg, 'k').update(data).digest('hex'),
+    ]);
+  })()`],
+  ['stream-writable-cork-writev', `(async () => {
+    const { Writable } = require('stream');
+    const seen = [];
+    const w = new Writable({
+      writev(items, cb) { seen.push(items.map(i => i.chunk.toString('utf8'))); cb(); },
+      write(chunk, _e, cb) { seen.push([chunk.toString('utf8')]); cb(); },
+    });
+    w.cork();
+    w.cork();
+    w.write('1');
+    w.write('2');
+    w.uncork();
+    const mid = [seen.length, w.writableCorked];
+    w.uncork();
+    const after = [seen.length, w.writableCorked];
+    w.cork();
+    w.write('3');
+    await new Promise(resolve => w.end(resolve));
+    return [mid, after, seen];
+  })()`],
+  ['rsa-pss-sign-verify', `(() => {
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const priv = crypto.createPrivateKey(fs.readFileSync('key.pem', 'utf8'));
+    const pub = crypto.createPublicKey(fs.readFileSync('key.pub.pem', 'utf8'));
+    const data = Buffer.from('beownir-pss-diff');
+    const opts = { padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST };
+    const sig = crypto.sign('sha256', data, { key: priv, ...opts });
+    const sig512 = crypto.sign('sha512', data, { key: priv, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 16 });
+    return [
+      sig.length,
+      crypto.verify('sha256', data, { key: pub, ...opts }, sig),
+      crypto.verify('sha256', Buffer.from('wrong'), { key: pub, ...opts }, sig),
+      crypto.verify('sha512', data, { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 16 }, sig512),
+    ];
+  })()`],
+  ['ecdsa-ecdh-keypair-roundtrip', `(() => {
+    const crypto = require('crypto');
+    const alice = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const bob = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const payload = Buffer.from('ecdsa-diff');
+    const sigDer = crypto.sign('sha256', payload, alice.privateKey);
+    const sigP1363 = crypto.sign('sha256', payload, { key: alice.privateKey, dsaEncoding: 'ieee-p1363' });
+    const s1 = crypto.diffieHellman({ privateKey: alice.privateKey, publicKey: bob.publicKey });
+    const s2 = crypto.diffieHellman({ privateKey: bob.privateKey, publicKey: alice.publicKey });
+    const rt = crypto.createPrivateKey(alice.privateKey.export({ format: 'pem', type: 'sec1' }));
+    return [
+      alice.privateKey.asymmetricKeyType,
+      alice.privateKey.asymmetricKeyDetails.namedCurve,
+      crypto.verify('sha256', payload, alice.publicKey, sigDer),
+      crypto.verify('sha256', payload, { key: alice.publicKey, dsaEncoding: 'ieee-p1363' }, sigP1363),
+      crypto.verify('sha256', Buffer.from('bad'), alice.publicKey, sigDer),
+      sigP1363.length,
+      s1.equals(s2),
+      s1.length,
+      alice.privateKey.equals(rt),
+    ];
+  })()`],
+  ['vm-context-isolation', `(() => {
+    const vm = require('vm');
+    const c = vm.createContext({ x: 5 });
+    const v = vm.runInContext('y = x * 3; v = y + 1; v', c);
+    return [v, c.y, c.v, typeof globalThis.y];
+  })()`],
 ];
