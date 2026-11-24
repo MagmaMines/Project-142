@@ -111,7 +111,194 @@ test('positional reads and writes, size changes, allocation, renumbering and adv
   assert.equal(r.renumber, 0);
   assert.equal(r.oldFdGone, 8, 'the old descriptor is gone after renumbering');
   assert.equal(r.newFdWorks, 0);
-  assert.equal(r.reserved, 52, 'sockets stay ENOSYS');
+  assert.equal(r.notSock, 57, 'ENOTSOCK on non-socket stdin fd 0');
+});
+
+test('virtual loopback WASI sockets support listen, accept, peek, send/recv, poll_oneoff, shutdown and external host refusal', async () => {
+  const r = JSON.parse(await rt.evaluate(`(async () => {
+    const req = CORE.module.createRequire('/project/index.js');
+    const net = req('net');
+    const { WASI } = req('wasi');
+    const wasi = new WASI({ version: 'preview1' });
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    wasi.initialize({ exports: { memory } });
+    const imp = wasi.wasiImport;
+    const view = new DataView(memory.buffer);
+    const bytes = new Uint8Array(memory.buffer);
+
+    // Non-loopback host is strictly refused with ENOTCAPABLE
+    let extErr = null;
+    try { await wasi.openListener({ host: '8.8.8.8', port: 0 }); } catch (e) { extErr = e.code; }
+
+    // Synchronous in-runtime socket pair exercises peek, send, recv, poll, fd_read/fd_write, shutdown, close
+    const [pairA, pairB] = wasi.openSocketPair();
+    const statRc = imp.fd_fdstat_get(pairA, 16);
+    const fdType = view.getUint8(16);
+
+    const msg = Buffer.from('ping-loopback');
+    bytes.set(msg, 128);
+    view.setUint32(64, 128, true);
+    view.setUint32(68, msg.length, true);
+    const sendRc = imp.sock_send(pairA, 64, 1, 0, 80);
+    const sent = view.getUint32(80, true);
+
+    // Poll pairB for readable data
+    bytes.fill(0, 200, 320);
+    view.setBigUint64(200, 11n, true);
+    view.setUint8(208, 1);
+    view.setInt32(216, pairB, true);
+    const pollReadRc = imp.poll_oneoff(200, 320, 1, 400);
+    const pollReadCount = view.getUint32(400, true);
+    const pollReadAvail = Number(view.getBigUint64(336, true));
+
+    // Peek without consuming
+    view.setUint32(64, 512, true);
+    view.setUint32(68, 32, true);
+    const peekRc = imp.sock_recv(pairB, 64, 1, 1, 84, 88);
+    const peekBytes = view.getUint32(84, true);
+    const peekText = Buffer.from(bytes.subarray(512, 512 + peekBytes)).toString();
+
+    // Actual recv consumes
+    bytes.fill(0, 512, 544);
+    const recvRc = imp.sock_recv(pairB, 64, 1, 0, 84, 88);
+    const recvBytes = view.getUint32(84, true);
+    const recvText = Buffer.from(bytes.subarray(512, 512 + recvBytes)).toString();
+
+    // Now empty open socket returns EAGAIN (6)
+    const emptyRc = imp.sock_recv(pairB, 64, 1, 0, 84, 88);
+
+    // Shutdown write on A -> B sees EOF (0 bytes, rc=0), A write fails with EPIPE (64)
+    const shutRc = imp.sock_shutdown(pairA, 2);
+    const eofRc = imp.sock_recv(pairB, 64, 1, 0, 84, 88);
+    const eofBytes = view.getUint32(84, true);
+    const epipeRc = imp.sock_send(pairA, 64, 1, 0, 80);
+
+    // Also test virtual net.createServer/net.connect loopback with openListener + sock_accept
+    const listener = await wasi.openListener({ host: '127.0.0.1', port: 0 });
+    const acceptEmptyRc = imp.sock_accept(listener.fd, 0, 92);
+
+    const jsClient = net.connect({ host: '127.0.0.1', port: listener.port });
+    await new Promise(resolve => jsClient.once('connect', resolve));
+    jsClient.write('hello-from-net-socket');
+    await new Promise(r => setTimeout(r, 10));
+
+    // Poll listener for incoming connection
+    bytes.fill(0, 200, 320);
+    view.setBigUint64(200, 22n, true);
+    view.setUint8(208, 1);
+    view.setInt32(216, listener.fd, true);
+    const pollListenRc = imp.poll_oneoff(200, 320, 1, 400);
+    const pollListenNbytes = Number(view.getBigUint64(336, true));
+
+    const acceptRc = imp.sock_accept(listener.fd, 0, 92);
+    const connFd = view.getUint32(92, true);
+    bytes.fill(0, 600, 664);
+    view.setUint32(64, 600, true);
+    view.setUint32(68, 64, true);
+    const netRecvRc = imp.sock_recv(connFd, 64, 1, 0, 84, 88);
+    const netRecvText = Buffer.from(bytes.subarray(600, 600 + view.getUint32(84, true))).toString();
+
+    const reply = Buffer.from('ack-from-wasi');
+    bytes.set(reply, 700);
+    view.setUint32(64, 700, true);
+    view.setUint32(68, reply.length, true);
+    const jsGot = new Promise(resolve => jsClient.once('data', d => resolve(d.toString())));
+    const netSendRc = imp.sock_send(connFd, 64, 1, 0, 80);
+    const jsReply = await jsGot;
+
+    jsClient.destroy();
+    wasi.close();
+    return JSON.stringify({
+      extErr, statRc, fdType, sendRc, sent,
+      pollReadRc, pollReadCount, pollReadAvail,
+      peekRc, peekText, recvRc, recvText, emptyRc,
+      shutRc, eofRc, eofBytes, epipeRc,
+      acceptEmptyRc, pollListenRc, pollListenNbytes,
+      acceptRc, netRecvRc, netRecvText, netSendRc, jsReply
+    });
+  })()`));
+
+  assert.equal(r.extErr, 'ENOTCAPABLE');
+  assert.equal(r.statRc, 0);
+  assert.equal(r.fdType, 6, 'SOCKET_STREAM filetype');
+  assert.equal(r.sendRc, 0);
+  assert.equal(r.sent, 13);
+  assert.equal(r.pollReadRc, 0);
+  assert.equal(r.pollReadCount, 1);
+  assert.equal(r.pollReadAvail, 13);
+  assert.equal(r.peekRc, 0);
+  assert.equal(r.peekText, 'ping-loopback');
+  assert.equal(r.recvRc, 0);
+  assert.equal(r.recvText, 'ping-loopback');
+  assert.equal(r.emptyRc, 6, 'EAGAIN on open empty socket');
+  assert.equal(r.shutRc, 0);
+  assert.equal(r.eofRc, 0);
+  assert.equal(r.eofBytes, 0);
+  assert.equal(r.epipeRc, 64, 'EPIPE after SHUT_WR');
+  assert.equal(r.acceptEmptyRc, 6, 'EAGAIN when listener queue is empty');
+  assert.equal(r.pollListenRc, 0);
+  assert.equal(r.pollListenNbytes, 1);
+  assert.equal(r.acceptRc, 0);
+  assert.equal(r.netRecvRc, 0);
+  assert.equal(r.netRecvText, 'hello-from-net-socket');
+  assert.equal(r.netSendRc, 0);
+  assert.equal(r.jsReply, 'ack-from-wasi');
+});
+
+test('WASI symlink, hardlink, timestamps and stdin buffering stay inside preopen boundaries', () => {
+  const r = JSON.parse(rt.evaluate(`(() => {
+    const req = CORE.module.createRequire('/project/index.js');
+    const fs = req('fs');
+    const { WASI } = req('wasi');
+    fs.rmSync('/project/wasi-extra', { recursive: true, force: true });
+    fs.mkdirSync('/project/wasi-extra', { recursive: true });
+    fs.writeFileSync('/project/wasi-extra/src.txt', 'alpha');
+    const wasi = new WASI({ version: 'preview1', preopens: { '/work': '/project/wasi-extra' }, stdin: 'input-bytes' });
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    wasi.initialize({ exports: { memory } });
+    const imp = wasi.wasiImport;
+    const view = new DataView(memory.buffer);
+    const bytes = new Uint8Array(memory.buffer);
+    const put = (ptr, str) => { const b = Buffer.from(str); bytes.set(b, ptr); return b.length; };
+
+    // Read stdin
+    view.setUint32(64, 200, true);
+    view.setUint32(68, 32, true);
+    const stdinRc = imp.fd_read(0, 64, 1, 80);
+    const stdinText = Buffer.from(bytes.subarray(200, 200 + view.getUint32(80, true))).toString();
+
+    // Symlink inside preopen + readlink + escape attempt blocked
+    const tLen = put(300, 'src.txt');
+    const lLen = put(320, 'link.txt');
+    const symRc = imp.path_symlink(300, tLen, 3, 320, lLen);
+    const rlRc = imp.path_readlink(3, 320, lLen, 400, 32, 84);
+    const rlTarget = Buffer.from(bytes.subarray(400, 400 + view.getUint32(84, true))).toString();
+
+    const absLen = put(350, '/etc/passwd');
+    const escLen = put(370, 'bad.txt');
+    const symEscRc = imp.path_symlink(350, absLen, 3, 370, escLen);
+
+    // Hard link + timestamp update
+    const hLen = put(380, 'hard.txt');
+    const linkRc = imp.path_link(3, 0, 300, tLen, 3, 380, hLen);
+    const tsNs = 1700000000000n * 1000000n;
+    const timeRc = imp.path_filestat_set_times(3, 0, 300, tLen, tsNs, tsNs, 1 | 4);
+    imp.path_filestat_get(3, 0, 300, tLen, 500);
+    const mtimeNs = Number(view.getBigUint64(500 + 48, true));
+
+    wasi.close();
+    return JSON.stringify({ stdinRc, stdinText, symRc, rlRc, rlTarget, symEscRc, linkRc, timeRc, mtimeNs });
+  })()`));
+
+  assert.equal(r.stdinRc, 0);
+  assert.equal(r.stdinText, 'input-bytes');
+  assert.equal(r.symRc, 0);
+  assert.equal(r.rlRc, 0);
+  assert.equal(r.rlTarget, 'src.txt');
+  assert.equal(r.symEscRc, 76, 'ENOTCAPABLE for absolute symlink target');
+  assert.equal(r.linkRc, 0);
+  assert.equal(r.timeRc, 0);
+  assert.equal(r.mtimeNs, 1700000000000000000);
 });
 
 test('poll_oneoff handles FD_WRITE, FD_READ, BADF, CLOCK timers, and 0-subscription EINVAL', () => {

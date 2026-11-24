@@ -257,3 +257,68 @@ test('dependency checkpoints round-trip node_modules outside the source workspac
     await new Promise(resolve => server.close(resolve));
   }
 });
+
+test('streamPackage resets hash, tar parser and partial files cleanly when a tarball download retries', { skip: !tarAvailable }, async () => {
+  const { server, origin } = await createRegistry({});
+  // Build a valid package tarball directly using the registry builder via npm-like request on a custom server:
+  await new Promise(resolve => server.close(resolve));
+
+  const cryptoMod = await import('node:crypto');
+  const http = await import('node:http');
+  const os = await import('node:os');
+  const pathMod = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const stage = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'beownir-retry-'));
+  try {
+    fs.mkdirSync(pathMod.join(stage, 'package'));
+    fs.writeFileSync(pathMod.join(stage, 'package', 'package.json'), JSON.stringify({ name: 'retry-pkg', version: '1.0.0' }));
+    fs.writeFileSync(pathMod.join(stage, 'package', 'good.txt'), 'clean-after-reset\n');
+    const tgzPath = pathMod.join(stage, 'retry-pkg-1.0.0.tgz');
+    execFileSync('tar', ['-czf', tgzPath, '-C', stage, 'package']);
+    const tgz = fs.readFileSync(tgzPath);
+    const sha512 = 'sha512-' + cryptoMod.createHash('sha512').update(tgz).digest('base64');
+
+    let tarCalls = 0;
+    const retryServer = http.createServer((req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      if (u.pathname === '/retry-pkg') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          name: 'retry-pkg',
+          'dist-tags': { latest: '1.0.0' },
+          versions: { '1.0.0': { name: 'retry-pkg', version: '1.0.0', dist: { tarball: retryOrigin + '/retry-pkg/-/retry-pkg-1.0.0.tgz', integrity: sha512 } } }
+        }));
+        return;
+      }
+      if (u.pathname === '/retry-pkg/-/retry-pkg-1.0.0.tgz') {
+        tarCalls++;
+        if (tarCalls === 1) {
+          // Stream the first half of the real gzip tarball, then abruptly drop the socket so downloadToConsumer triggers onReset + retry.
+          res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(tgz.length) });
+          res.write(tgz.subarray(0, Math.max(32, Math.floor(tgz.length / 2))));
+          setTimeout(() => req.socket.destroy(), 15);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(tgz.length) });
+        res.end(tgz);
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise(resolve => retryServer.listen(0, '127.0.0.1', resolve));
+    const retryOrigin = 'http://127.0.0.1:' + retryServer.address().port;
+    try {
+      const { source } = installerSource({ registry: retryOrigin });
+      const { sandbox, vfs } = createInstallerSandbox();
+      bootstrap(null, vfs);
+      const installer = loadInstaller(sandbox, source);
+      await installer.npmInstall(['retry-pkg']);
+      assert.ok(tarCalls >= 2, 'tarball download retried after mid-stream drop');
+      assert.equal(vfs.readFileSync('/project/node_modules/retry-pkg/good.txt', 'utf8'), 'clean-after-reset\n');
+    } finally {
+      await new Promise(resolve => retryServer.close(resolve));
+    }
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
+});

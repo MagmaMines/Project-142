@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import { loadRuntime } from './helpers/runtime.mjs';
+import { loadRuntime, initToolchain } from './helpers/runtime.mjs';
 
 /* The runtime is a worker source. This harness evaluates it once in a VM with a
  * worker-shaped global object, then checks the Node compatibility surface that
@@ -445,4 +445,135 @@ test('cross-realm ArrayBuffers and TypedArrays work with Buffer.from and util.ty
     delete sandbox.__hostTestAb;
     delete sandbox.__hostTestU8;
   }
+});
+
+test('node:zlib Brotli codec matches Node across sync, callback, promises, streaming and error paths', async () => {
+  const { evaluate } = loadRuntime();
+  const payloadText = 'beownir-brotli-codec-roundtrip-'.repeat(120);
+  const nodeCompressed = zlib.brotliCompressSync(Buffer.from(payloadText));
+
+  const res = JSON.parse(await evaluate(`(async () => {
+    const z = require('zlib');
+    const { pipeline } = require('stream/promises');
+    const { Readable, Writable } = require('stream');
+    const src = ${JSON.stringify(payloadText)};
+
+    // Sync round-trip & Node interop (both directions)
+    const compSync = z.brotliCompressSync(src, { params: { [z.constants.BROTLI_PARAM_QUALITY]: 4 } });
+    const decompFromNode = z.brotliDecompressSync(Buffer.from(${JSON.stringify(nodeCompressed.toString('base64'))}, 'base64')).toString('utf8');
+
+    // Callback & promises APIs
+    const compCb = await new Promise((resolve, reject) => z.brotliCompress(src, (e, out) => e ? reject(e) : resolve(out)));
+    const decompProm = (await z.promises.brotliDecompress(compCb)).toString('utf8');
+
+    // Streaming CompressStream & DecompressStream via pipeline
+    const compChunks = [];
+    await pipeline(
+      Readable.from([src.slice(0, 500), src.slice(500, 1500), src.slice(1500)]),
+      z.createBrotliCompress({ params: { [z.constants.BROTLI_PARAM_QUALITY]: 2 } }),
+      new Writable({ write(c, _e, cb) { compChunks.push(Buffer.from(c)); cb(); } })
+    );
+    const streamCompressed = Buffer.concat(compChunks);
+    const decompChunks = [];
+    await pipeline(
+      Readable.from([streamCompressed.subarray(0, 7), streamCompressed.subarray(7)]),
+      z.createBrotliDecompress(),
+      new Writable({ write(c, _e, cb) { decompChunks.push(Buffer.from(c)); cb(); } })
+    );
+    const streamOut = Buffer.concat(decompChunks).toString('utf8');
+
+    // Invalid input throws structured error and runtime recovers cleanly afterwards
+    let badCode = null;
+    try { z.brotliDecompressSync(Buffer.from('corrupt-brotli-data')); }
+    catch (e) { badCode = e && e.code; }
+    let truncCode = null;
+    try {
+      await pipeline(
+        Readable.from([streamCompressed.subarray(0, Math.floor(streamCompressed.length / 2))]),
+        z.createBrotliDecompress(),
+        new Writable({ write(_c, _e, cb) { cb(); } })
+      );
+    } catch (e) { truncCode = e && e.code; }
+    const recovered = z.brotliDecompressSync(compSync).toString('utf8') === src;
+
+    return JSON.stringify({
+      compSyncB64: compSync.toString('base64'),
+      decompFromNodeMatch: decompFromNode === src,
+      decompPromMatch: decompProm === src,
+      streamOutMatch: streamOut === src,
+      badCode,
+      truncCode,
+      recovered,
+      qualityConst: z.constants.BROTLI_PARAM_QUALITY,
+    });
+  })()`));
+
+  assert.equal(zlib.brotliDecompressSync(Buffer.from(res.compSyncB64, 'base64')).toString('utf8'), payloadText);
+  assert.equal(res.decompFromNodeMatch, true);
+  assert.equal(res.decompPromMatch, true);
+  assert.equal(res.streamOutMatch, true);
+  assert.equal(res.badCode, 'Z_DATA_ERROR');
+  assert.equal(res.truncCode, 'Z_BUF_ERROR');
+  assert.equal(res.recovered, true);
+  assert.equal(res.qualityConst, zlib.constants.BROTLI_PARAM_QUALITY);
+});
+
+test('fs.promises.watch, npm run -- args, npx flags, and shared esbuild API work cleanly', async () => {
+  const { evaluate, executeLine, posts } = await initToolchain(loadRuntime({ keep: true }));
+  const fs = evaluate('CORE.fs');
+  fs.mkdirSync('/project/watch-dir', { recursive: true });
+  fs.writeFileSync('/project/package.json', JSON.stringify({
+    name: 'cli-flags-test',
+    version: '1.0.0',
+    scripts: { echo: 'node -e "console.log(process.argv.slice(1).join(\',\'))"' },
+  }));
+  fs.mkdirSync('/project/node_modules/hello-cli', { recursive: true });
+  fs.writeFileSync('/project/node_modules/hello-cli/package.json', JSON.stringify({ name: 'hello-cli', version: '1.0.0', bin: { 'hello-cli': 'cli.js' } }));
+  fs.writeFileSync('/project/node_modules/hello-cli/cli.js', 'console.log("CLI:" + process.argv.slice(2).join(" "));\n');
+
+  const ac = new AbortController();
+  const watchPromise = evaluate(`(async (signal) => {
+    const events = [];
+    for await (const ev of CORE.fs.promises.watch('/project/watch-dir', { signal })) {
+      events.push(ev);
+      if (events.length >= 1) break;
+    }
+    return JSON.stringify(events);
+  })`)(ac.signal);
+  await new Promise(r => setTimeout(r, 15));
+  fs.writeFileSync('/project/watch-dir/a.txt', 'v1');
+  const watched = JSON.parse(await watchPromise);
+  assert.equal(watched.length, 1);
+  assert.equal(watched[0].filename, 'a.txt');
+  ac.abort();
+
+  const esbResult = JSON.parse(await evaluate(`(async () => {
+    const esb = require('esbuild');
+    const out1 = await esb.transform('const x: number = 1;', { loader: 'ts' });
+    // Also exercise VirtualNodeWorker sharing globalThis.__beownirEsbuildApi without re-initializing WASM:
+    const { Worker } = require('worker_threads');
+    const workerCode = "const { parentPort } = require('worker_threads'); require('esbuild').transform('const y: number = 2;', { loader: 'ts' }).then(r => parentPort.postMessage(r.code), e => { throw e; });";
+    const workerOut = await new Promise((resolve, reject) => {
+      const w = new Worker(workerCode, { eval: true });
+      w.once('message', resolve);
+      w.once('error', reject);
+    });
+    return JSON.stringify({ out1: out1.code.trim(), workerOut: workerOut.trim(), hasGlobal: Boolean(globalThis.__beownirEsbuildApi) });
+  })()`));
+  assert.equal(esbResult.out1, 'const x = 1;');
+  assert.equal(esbResult.workerOut, 'const y = 2;');
+  assert.equal(esbResult.hasGlobal, true);
+
+  // npm run -- forwarding and npx -y flag stripping
+  const outFrom1 = posts.length;
+  const code1 = await executeLine('npm run echo -- --alpha beta');
+  assert.equal(code1, 0);
+  const stdout1 = posts.slice(outFrom1).filter(m => m.type === 'stdout').map(m => m.data).join('');
+  assert.match(stdout1, /--alpha,beta/);
+
+  const outFrom2 = posts.length;
+  const code2 = await executeLine('npx -y hello-cli one two');
+  assert.equal(code2, 0);
+  const stdout2 = posts.slice(outFrom2).filter(m => m.type === 'stdout').map(m => m.data).join('');
+  assert.match(stdout2, /CLI:one two/);
 });

@@ -11,7 +11,7 @@
     "test": "node --test \"test/*.test.mjs\"",
     "check": "node tools/check.mjs",
     "sync": "node tools/sync-embedded.mjs",
-    "verify": "node tools/native-assets.mjs --check && node tools/sync-embedded.mjs --check && node tools/gen-rollup-compat.mjs --check && node tools/gen-compat-shims.mjs --check && node tools/gen-node-path.mjs --check && node tools/gen-node-querystring.mjs --check && node tools/gen-wasi.mjs --check && node tools/deploy-files.mjs && node tools/check.mjs && node tools/build-standalone.mjs --check && node tools/compat-report.mjs --fail-under 0.985 && node --test \"test/*.test.mjs\"",
+    "verify": "node tools/native-assets.mjs --check && node tools/sync-embedded.mjs --check && node tools/gen-rollup-compat.mjs --check && node tools/gen-compat-shims.mjs --check && node tools/gen-node-path.mjs --check && node tools/gen-node-querystring.mjs --check && node tools/gen-wasi.mjs --check && node tools/gen-brotli.mjs --check && node tools/deploy-files.mjs && node tools/check.mjs && node tools/build-standalone.mjs --check && node tools/compat-report.mjs --fail-under 0.985 && node --test \"test/*.test.mjs\"",
     "host": "node o/host/beownir-host.mjs o/site/index.html",
     "serve:static": "node tools/serve-static.mjs",
     "configure": "node o/deploy/configure.mjs",

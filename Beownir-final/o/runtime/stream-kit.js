@@ -747,19 +747,22 @@
     };
     const integrity = parseIntegrity(options.integrity);
     if (!integrity) throw new Error('Package has no supported integrity hash. Refusing an unverified download');
-    const hash = createSha512();
-    const parser = createTarParser({
-      onEntry: options.onEntry,
-      onEntryData: options.onEntryData,
-      onEntryEnd: options.onEntryEnd,
-      onDirectory: options.onDirectory,
-      maxEntries: limits.entries,
-      maxEntryBytes: limits.entryBytes,
-      maxTotalBytes: limits.expandedBytes
-    });
+    let hash = null;
+    let parser = null;
     let inflate = null;
     let decompressed = 0;
-    const openInflate = () => {
+    const resetPipeline = () => {
+      hash = createSha512();
+      decompressed = 0;
+      parser = createTarParser({
+        onEntry: options.onEntry,
+        onEntryData: options.onEntryData,
+        onEntryEnd: options.onEntryEnd,
+        onDirectory: options.onDirectory,
+        maxEntries: limits.entries,
+        maxEntryBytes: limits.entryBytes,
+        maxTotalBytes: limits.expandedBytes
+      });
       inflate = new pako.Inflate({ chunkSize: 64 * 1024 });
       inflate.onData = chunk => {
         decompressed += chunk.length;
@@ -767,7 +770,7 @@
         parser.push(chunk);
       };
     };
-    openInflate();
+    resetPipeline();
 
     const received = await downloadToConsumer(options.tarball, {
       fetch: options.fetch,
@@ -781,7 +784,10 @@
       segmentBytes: options.segmentBytes,
       concurrency: options.concurrency,
       onRangeFallback: options.onRangeFallback,
-      onReset: () => { openInflate(); },
+      onReset: () => {
+        resetPipeline();
+        if (typeof options.onReset === 'function') options.onReset();
+      },
       onChunk: chunk => { hash.update(chunk); inflate.push(chunk, false); }
     });
     inflate.push(new Uint8Array(0), true);
