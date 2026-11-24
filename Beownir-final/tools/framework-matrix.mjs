@@ -631,7 +631,7 @@ const profiles = [
   {
     name: 'nuxt',
     packages: [{ name: 'nuxt', range: '4.4.8' }],
-    note: 'Nuxt 4.4.8 (last Rollup-based line; >=4.5.0 needs vite 8 / rolldown whose @rolldown/binding-wasm32-wasi spawns a real worker_threads WASI thread pool at require time - impossible in a single-threaded browser worker). The tree installs fully (~530 packages incl. nested version conflicts); loadNuxt + nuxt.ready() complete in-VM in roughly 210 s (telemetry disabled: it prompts on stdin otherwise); the nitro dev server listens on the virtual loopback - but the first SSR request never finishes, so the row times out honestly. Nuxt >=4.5.0 recorded as blocked, not claimed',
+    note: 'Nuxt 4.4.8 (last Rollup-based line; >=4.5.0 needs vite 8 / rolldown whose @rolldown/binding-wasm32-wasi spawns a real worker_threads WASI thread pool at require time - impossible in a single-threaded browser worker). Installs cleanly with Vite 7, runs loadNuxt + build(nuxt) in-VM, connects Vite-node over Unix socket IPC to Nitro in its virtual worker_threads Worker, and SSR-renders app/app.vue over loopback HTTP. Nuxt >=4.5.0 recorded as blocked, not claimed',
     files: {
       'package.json': '{"name":"nuxt-smoke","private":true,"type":"module"}\n',
       'nuxt.config.js': 'export default { devtools: { enabled: false }, telemetry: false, compatibilityDate: \'2026-11-01\' };\n',
@@ -639,14 +639,16 @@ const profiles = [
     },
     timeoutMs: 420000,
     smoke: `(async () => {
-      const { loadNuxt } = require('nuxt');
+      const { loadNuxt, build } = require('nuxt');
       const nuxt = await loadNuxt({ cwd: '/project', dev: true });
+      await build(nuxt);
       const { toNodeListener } = require('h3');
       const handler = toNodeListener(nuxt.server.app);
       const server = http.createServer(handler);
       server.listen(0);
       await once(server, 'listening');
       const response = await probe(server.port, '/');
+      await nuxt.close();
       server.close();
       const body = String(response.body);
       if (!body.includes('NUXT_SMOKE_OK')) throw new Error('nuxt answered ' + response.status + ' without the marker: ' + body.slice(0, 300));

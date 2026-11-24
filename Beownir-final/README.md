@@ -413,7 +413,7 @@ platform's WHATWG `WebSocket` classes when present.
 filesystem, boots them inside the worker runtime and records what happened. These
 are not mock packages: the tarballs, dependency trees and integrity metadata come
 from registry.npmjs.org, and each row runs the framework's own API. The latest
-run passes **42 / 43** checks across 2,291 installed packages (see
+run passes **43 / 43** checks across 2,314 installed packages (see
 [FRAMEWORK_COMPATIBILITY_REPORT.md](FRAMEWORK_COMPATIBILITY_REPORT.md) for the
 verbatim table and notes):
 
@@ -433,7 +433,7 @@ verbatim table and notes):
 | sveltekit | 2.70.4 | `svelte-kit sync` + Vite 7.3.8 + `@sveltejs/adapter-node` build (SvelteKit 3 / Rolldown thread pools excluded) |
 | remix | 2.17.5 | Remix v2 esbuild server build (`@remix-run/dev`) emitting the server bundle |
 | next | 15.5.29 | loads `next` and resolves native `@next/swc-linux-x64-gnu` to `@next/swc-wasm-nodejs` via the native-fallback map, compiling JSX via `transformSync` |
-| nuxt | 4.4.8 | **FAIL (honest timeout)**: `loadNuxt` + `nuxt.ready()` bind loopback, but the first Nitro SSR request times out (`>90 s`); Nuxt `>=4.5.0` needs Rolldown worker threads |
+| nuxt | 4.4.8 | bounded Nuxt 4 dev SSR: `loadNuxt` + `build(nuxt)` connects Vite-node over Unix socket IPC to Nitro in its virtual `worker_threads.Worker` and renders `app/app.vue` over loopback HTTP; Nuxt `>=4.5.0` needs Rolldown worker threads |
 | vite (+ 8 vite-* rows) | 6.4.6 | bounded Vite 6 coverage: Node API dev transform/serving, React dev/build, CLI `vite build`, and HMR WebSocket/invalidation using embedded WASM Rollup/esbuild |
 | esbuild | 0.28.2 / 0.25.12 WASM | embedded Go-WASM `esbuild` transforms TypeScript/JS through the bridged `fs` |
 | tailwind-4 / tailwind-3 | 4.3.5 / 3.4.19 | compiles CSS utilities (`@tailwindcss/postcss` and v3 PostCSS plugin) |

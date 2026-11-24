@@ -189,8 +189,14 @@ export async function resolveTree(roots, { concurrency = 8, maxPackages = 400, l
   /* key = install dir (relative), value = { name, version, tarball, dir, dependencies }. */
   const nested = new Map();
   const queue = roots.map(({ name, range }) => ({ name, range, from: '<root>' }));
+  /* Optional and peer dependencies resolve after hard dependencies finish so a
+   * wide peer range (e.g. vite ">=5 || ^8" on a vue plugin) cannot hijack the
+   * hoisted slot from a direct dependency that pins an exact major (nuxt's
+   * @nuxt/vite-builder requiring vite ^7). */
+  const softQueue = [];
   const failures = [];
   let active = 0;
+  let hardActive = 0;
   let done = false;
   /* Every dependent re-checks its ranges against the hoisted tree (that is how
    * conflicts are discovered), so identical (name, range) lookups repeat
@@ -219,11 +225,13 @@ export async function resolveTree(roots, { concurrency = 8, maxPackages = 400, l
   return await new Promise(resolve => {
     const pump = () => {
       if (done) return;
-      while (active < concurrency && queue.length) {
-        const job = queue.shift();
+      while (active < concurrency && (queue.length || (hardActive === 0 && softQueue.length))) {
+        const job = queue.length ? queue.shift() : softQueue.shift();
         active++;
+        if (!job.soft) hardActive++;
         cachedResolve(job.name, job.range).then(meta => {
           active--;
+          if (!job.soft) hardActive--;
           if (meta.skipped) { failures.push({ name: job.name, range: job.range, from: job.from, reason: meta.reason }); return pump(); }
           // npm installs an optional dependency only when its os/cpu fields accept the platform.
           // The runtime identifies as browser/wasm32 (WASI-compatible), so native-only binaries are skipped.
@@ -245,15 +253,16 @@ export async function resolveTree(roots, { concurrency = 8, maxPackages = 400, l
            * still need a different version (path-scurry wants lru-cache ^10
            * while cacache's ^7 got hoisted) — the handler records the conflict. */
           for (const [dep, depRange] of Object.entries({ ...(meta.dependencies || {}) })) queue.push({ name: dep, range: depRange, from: job.name, nestedDir: job.nestedDir });
-          for (const [dep, depRange] of Object.entries({ ...(meta.optionalDependencies || {}), ...requiredPeers(meta) })) if (!resolved.has(dep)) queue.push({ name: dep, range: depRange, from: job.name, soft: true });
+          for (const [dep, depRange] of Object.entries({ ...(meta.optionalDependencies || {}), ...requiredPeers(meta) })) if (!resolved.has(dep)) softQueue.push({ name: dep, range: depRange, from: job.name, soft: true });
           pump();
         }).catch(failure => {
           active--;
+          if (!job.soft) hardActive--;
           if (!job.soft) failures.push({ name: job.name, range: job.range, from: job.from, reason: failure.message });
           pump();
         });
       }
-      if (active === 0 && queue.length === 0) { done = true; resolve({ packages: resolved, failures, nested }); }
+      if (active === 0 && queue.length === 0 && softQueue.length === 0) { done = true; resolve({ packages: resolved, failures, nested }); }
     };
     pump();
   });

@@ -486,7 +486,7 @@ function Stream(options) {
 }
 Stream.prototype = Object.create(EventEmitter.prototype);
 Stream.prototype.constructor = Stream;
-Stream.prototype.pipe = function (dst,opts={}){const end=opts.end!==false;this.on('data',d=>{if(dst.write(d)===false)this.pause&&this.pause();});dst.on&&dst.on('drain',()=>this.resume&&this.resume());this.once('end',()=>{if(end&&dst.end)dst.end();});this.on('error',e=>dst.emit&&dst.emit('error',e));this.resume&&this.resume();return dst;};
+Stream.prototype.pipe = function (dst,opts={}){const end=opts.end!==false;const alreadyEnded=!!this.readableEnded;this.on('data',d=>{if(dst.write(d)===false)this.pause&&this.pause();});dst.on&&dst.on('drain',()=>this.resume&&this.resume());this.once('end',()=>{if(end&&dst.end)dst.end();});this.on('error',e=>dst.emit&&dst.emit('error',e));this.resume&&this.resume();if(end&&alreadyEnded&&dst.end)queueMicrotask(()=>dst.end());return dst;};
 class Readable extends Stream {
   constructor(opts={}){super();this.readable=true;this._buf=[];this._ended=false;this._paused=true;this._encoding=null;this.readableFlowing=null;this.readableEnded=false;this._objectMode=!!opts.objectMode;this._highWaterMark=Number.isFinite(opts.highWaterMark)?opts.highWaterMark:(this._objectMode?16:65536);this._reading=false;this._wantRead=false;if(opts.read)this._read=opts.read;}
   on(n,f){super.on(n,f);if(n==='data')this.resume();return this;}
@@ -849,11 +849,11 @@ function statOf(p){
   p=resolve(p);p=wasmCompanion(p)||p;const e=FS[p];if(!e)throw fsError('ENOENT','stat',p);
   const perm=typeof e.mode==='number'?(e.mode&0o7777):(e.d?0o755:0o644);
   const mtime=e.m||Date.now(), atime=typeof e.a==='number'?e.a:mtime, birth=typeof e.b=== 'number'?e.b:mtime;
-  const size=e.d?0:(typeof e.c==='string'?te.encode(e.c).length:e.c.length),mode=(e.d?0o40000:0o100000)|perm;
+  const size=e.d?0:(typeof e.c==='string'?te.encode(e.c).length:e.c.length),mode=(e.d?0o40000:(e.socket?0o140000:0o100000))|perm;
   // stat() follows the link; statL() below reports the link itself.
   return {dev:0,ino:e.ino||0,mode,nlink:1,uid:typeof e.uid==='number'?e.uid:0,gid:typeof e.gid==='number'?e.gid:0,rdev:0,size,blksize:4096,blocks:Math.ceil(size/512),
     atime:new Date(atime),atimeMs:atime,mtime:new Date(mtime),mtimeMs:mtime,ctime:new Date(mtime),ctimeMs:mtime,birthtime:new Date(birth),birthtimeMs:birth,
-    isFile:()=>!e.d,isDirectory:()=>!!e.d,isBlockDevice:()=>false,isCharacterDevice:()=>false,isSymbolicLink:()=>false,isFIFO:()=>false,isSocket:()=>false};
+    isFile:()=>!e.d&&!e.socket,isDirectory:()=>!!e.d,isBlockDevice:()=>false,isCharacterDevice:()=>false,isSymbolicLink:()=>false,isFIFO:()=>false,isSocket:()=>!!e.socket};
 }
 // Node's fs.statSync/lstatSync(path, { throwIfNoEntry: false }) returns undefined for a
 // missing path instead of throwing. Tools such as stylelint rely on that to probe for files.
@@ -1020,10 +1020,10 @@ function readdirSync(p,opt){
     names=walk(p);
   }
   if(opt&&opt.withFileTypes)return names.map(n=>{
-    const full=pre+n, e=FS[full], d=!!(e&&e.d);
+    const full=pre+n, e=FS[full], d=!!(e&&e.d), s=!!(e&&e.socket);
     return {name:d?n:(n.split('/').pop()),path:pre+(n.includes('/')?n.slice(0,n.lastIndexOf('/')):''),parentPath:pre+(n.includes('/')?n.slice(0,n.lastIndexOf('/')):''),
-      isDirectory:()=>d,isFile:()=>!!e&&!d,isSymbolicLink:()=>Boolean(e&&typeof e.link==='string'),
-      isBlockDevice:()=>false,isCharacterDevice:()=>false,isFIFO:()=>false,isSocket:()=>false};
+      isDirectory:()=>d,isFile:()=>!!e&&!d&&!s,isSymbolicLink:()=>Boolean(e&&typeof e.link==='string'),
+      isBlockDevice:()=>false,isCharacterDevice:()=>false,isFIFO:()=>false,isSocket:()=>s};
   });
   return names;
 }
@@ -1148,6 +1148,7 @@ class IncomingMessage extends Readable {
 class ServerResponse extends EventEmitter {
   constructor(done){ super(); this.statusCode=200; this.statusMessage='OK'; this._headers={}; this._body=[]; this._done=done; this.socket=virtualSocket();this.connection=this.socket; this.finished=false; this.headersSent=false; }
   setHeader(k,v){ this._headers[String(k).toLowerCase()]=v; return this; }
+  appendHeader(k,v){ const cur=this.getHeader(k); return this.setHeader(k,cur===undefined?v:(Array.isArray(cur)?cur.concat(v):[cur].concat(v))); }
   getHeader(k){ return this._headers[String(k).toLowerCase()]; }
   removeHeader(k){ delete this._headers[String(k).toLowerCase()]; }
   getHeaders(){return {...this._headers};} getHeaderNames(){return Object.keys(this._headers);} hasHeader(k){return Object.prototype.hasOwnProperty.call(this._headers,String(k).toLowerCase());}
@@ -1419,15 +1420,17 @@ class ClientRequest extends EventEmitter {
     if (callback) this.once('response', callback);
     if (opts.timeout) this._timeout = Number(opts.timeout) || 0;
     this._responded = false;
+    this._socketShim();
   }
   _socketShim() {
     if (!this._socket) {
-      this._socket = { remoteAddress: '127.0.0.1', remotePort: this.port, address: () => ({ address: '127.0.0.1', port: this.port, family: 'IPv4' }), setNoDelay: () => this._socket, setKeepAlive: () => this._socket, setTimeout: (ms, cb) => { if (cb) this.once('timeout', cb); return this._socket; }, destroy: () => {}, end: () => {}, write: () => true, on: () => this._socket };
+      this._socket = { writable: true, readable: true, destroyed: false, remoteAddress: '127.0.0.1', remotePort: this.port, address: () => ({ address: '127.0.0.1', port: this.port, family: 'IPv4' }), setNoDelay: () => this._socket, setKeepAlive: () => this._socket, setTimeout: (ms, cb) => { if (cb) this.once('timeout', cb); return this._socket; }, destroy: () => { if (this._socket) { this._socket.destroyed = true; this._socket.writable = false; } }, end: () => {}, write: () => true, on: () => this._socket, once: () => this._socket, off: () => this._socket, removeListener: () => this._socket };
       queueMicrotask(() => { if (!this.destroyed) this.emit('socket', this._socket); });
     }
     return this._socket;
   }
   setHeader(name, value) { if (this.headersSent) throw Object.assign(new Error('Cannot set headers after they are sent'), { code: 'ERR_HTTP_HEADERS_SENT' }); validateHeaderName(name); validateHeaderValue(name, value); this._headers[String(name).toLowerCase()] = value; return this; }
+  appendHeader(name, value) { const cur = this.getHeader(name); if (cur === undefined) return this.setHeader(name, value); return this.setHeader(name, Array.isArray(cur) ? cur.concat(value) : [cur].concat(value)); }
   setHeaders(headers) { if (headers instanceof Map) for (const [name, value] of headers) this.setHeader(name, value); else for (const [name, value] of Object.entries(headers || {})) this.setHeader(name, value); return this; }
   getHeader(name) { return this._headers[String(name).toLowerCase()]; }
   getHeaders() { return { ...this._headers }; }
@@ -1950,7 +1953,31 @@ const NET_SERVERS=new Map();
 function netError(code,message){const e=new Error(message||code);e.code=code;return e;}
 class NetSocket extends Duplex {
   constructor(options={}){super();this.connecting=false;this.destroyed=false;this.writable=true;this.readable=true;this.bytesRead=0;this.bytesWritten=0;this.remoteAddress=undefined;this.remotePort=undefined;this.localAddress='127.0.0.1';this.localPort=0;this._peer=null;this._timer=null;this._allowHalfOpen=!!options.allowHalfOpen;}
-  connect(port,host,cb){if(typeof host==='function'){cb=host;host='127.0.0.1';}if(typeof port==='object'){cb=host;host=port.host||port.hostname||'127.0.0.1';port=port.port;}if(cb)this.once('connect',cb);this.connecting=true;this.remotePort=Number(port);this.remoteAddress=host||'127.0.0.1';queueMicrotask(()=>{const h=String(this.remoteAddress).toLowerCase();if(!['127.0.0.1','localhost','::1','0.0.0.0'].includes(h)){this.connecting=false;const e=netError('ENOTSUP','Raw outbound TCP is unavailable in browser-only mode; only virtual loopback sockets are supported.');this.emit('error',e);this.destroy(e);return;}const server=NET_SERVERS.get(this.remotePort);if(!server||!server.listening){this.connecting=false;const e=netError('ECONNREFUSED','connect ECONNREFUSED '+h+':'+this.remotePort);this.emit('error',e);this.destroy(e);return;}const peer=new NetSocket({allowHalfOpen:server.allowHalfOpen});this._peer=peer;peer._peer=this;peer._server=server;server.connections++;peer.once('close',()=>{server.connections=Math.max(0,server.connections-1);});peer.remoteAddress='127.0.0.1';peer.remotePort=this.localPort;peer.localPort=this.remotePort;this.localPort=server.port;this.connecting=false;this.emit('connect');server.emit('connection',peer);});return this;}
+  connect(...args){
+    const cb=args.find(x=>typeof x==='function');
+    const first=args[0];
+    const pipe=typeof first==='string'&&!/^\d+$/.test(first)?first:(first&&typeof first==='object'&&first.path&&first.port===undefined?first.path:null);
+    if(cb)this.once('connect',cb);
+    this.connecting=true;
+    if(pipe){
+      const sockPath=resolve(String(pipe));
+      this.remoteAddress=undefined;this.remotePort=undefined;
+      queueMicrotask(()=>{
+        const server=NET_SERVERS.get(sockPath);
+        if(!server||!server.listening){this.connecting=false;const code=FS[sockPath]?'ECONNREFUSED':'ENOENT';const e=netError(code,'connect '+code+' '+sockPath);this.emit('error',e);this.destroy(e);return;}
+        const peer=new NetSocket({allowHalfOpen:server.allowHalfOpen});
+        this._peer=peer;peer._peer=this;peer._server=server;server.connections++;
+        peer.once('close',()=>{server.connections=Math.max(0,server.connections-1);});
+        this.connecting=false;this.emit('connect');server.emit('connection',peer);
+      });
+      return this;
+    }
+    let port=first,host=typeof args[1]==='string'?args[1]:'127.0.0.1';
+    if(first&&typeof first==='object'){host=first.host||first.hostname||'127.0.0.1';port=first.port;}
+    this.remotePort=Number(port);this.remoteAddress=host||'127.0.0.1';
+    queueMicrotask(()=>{const h=String(this.remoteAddress).toLowerCase();if(!['127.0.0.1','localhost','::1','0.0.0.0'].includes(h)){this.connecting=false;const e=netError('ENOTSUP','Raw outbound TCP is unavailable in browser-only mode; only virtual loopback sockets are supported.');this.emit('error',e);this.destroy(e);return;}const server=NET_SERVERS.get(this.remotePort);if(!server||!server.listening){this.connecting=false;const e=netError('ECONNREFUSED','connect ECONNREFUSED '+h+':'+this.remotePort);this.emit('error',e);this.destroy(e);return;}const peer=new NetSocket({allowHalfOpen:server.allowHalfOpen});this._peer=peer;peer._peer=this;peer._server=server;server.connections++;peer.once('close',()=>{server.connections=Math.max(0,server.connections-1);});peer.remoteAddress='127.0.0.1';peer.remotePort=this.localPort;peer.localPort=this.remotePort;this.localPort=server.port;this.connecting=false;this.emit('connect');server.emit('connection',peer);});
+    return this;
+  }
   write(chunk,encoding,cb){if(typeof encoding==='function'){cb=encoding;encoding=undefined;}if(!this.writable||this.destroyed){const e=netError('ERR_STREAM_WRITE_AFTER_END','write after end');if(cb)queueMicrotask(()=>cb(e));else this.emit('error',e);return false;}const data=typeof chunk==='string'?Buffer.from(chunk,encoding):Buffer.from(chunk);this.bytesWritten+=data.length;if(this._peer&&!this._peer.destroyed){this._peer.bytesRead+=data.length;this._peer.push(data);}if(cb)queueMicrotask(()=>cb());return true;}
   end(data,encoding,cb){if(typeof data==='function'){cb=data;data=undefined;}else if(typeof encoding==='function'){cb=encoding;encoding=undefined;}if(data!==undefined)this.write(data,encoding);this.writable=false;if(this._peer&&!this._peer.destroyed)this._peer.push(null);if(cb)this.once('finish',cb);queueMicrotask(()=>{this.emit('finish');if(!this._allowHalfOpen)this.destroy();});return this;}
   setTimeout(ms,cb){clearTimeout(this._timer);if(ms>0)this._timer=setTimeout(()=>{this.emit('timeout');cb&&cb();},ms);return this;}
@@ -1959,10 +1986,59 @@ class NetSocket extends Duplex {
   destroy(err){if(this.destroyed)return this;this.destroyed=true;this.writable=false;this.readable=false;clearTimeout(this._timer);if(err&&this.listenerCount('error'))this.emit('error',err);const peer=this._peer;this._peer=null;if(peer&&!peer.destroyed){peer._peer=null;peer.push(null);}queueMicrotask(()=>this.emit('close',!!err));return this;}
 }
 class NetServer extends EventEmitter {
-  constructor(listener){super();this.listening=false;this.allowHalfOpen=false;this.connections=0;this.maxConnections=Infinity;if(listener)this.on('connection',listener);}
-  listen(port,host,cb){if(typeof host==='function'){cb=host;host='127.0.0.1';}if(typeof port==='object'){const o=port;cb=host;host=o.host;port=o.port;this.allowHalfOpen=!!o.allowHalfOpen;}this.port=Number(port)||0;if(!this.port){this.port=30000+Math.floor(Math.random()*20000);}if(NET_SERVERS.has(this.port)||SERVERS.has(this.port)){const e=netError('EADDRINUSE','address already in use: '+this.port);queueMicrotask(()=>this.emit('error',e));return this;}this.host=host||'127.0.0.1';this.listening=true;NET_SERVERS.set(this.port,this);queueMicrotask(()=>{this.emit('listening');cb&&cb();});return this;}
-  address(){return this.listening?{address:this.host,family:netIsIP(this.host)===6?'IPv6':'IPv4',port:this.port}:null;}
-  close(cb){if(this.listening){NET_SERVERS.delete(this.port);this.listening=false;}queueMicrotask(()=>{this.emit('close');cb&&cb();});return this;}
+  constructor(listener){super();this.listening=false;this.allowHalfOpen=false;this.connections=0;this.maxConnections=Infinity;this._pipe=null;if(listener)this.on('connection',listener);}
+  listen(...args){
+    const cb = args.find(x => typeof x === 'function');
+    const first = args[0];
+    const pipe = typeof first === 'string' && !/^\d+$/.test(first) ? first : (first && typeof first === 'object' && first.path && first.port === undefined && first.fd === undefined ? first.path : null);
+    if (pipe) {
+      const sockPath = resolve(String(pipe));
+      const parent = dirname(sockPath);
+      if (!FS[parent] || !FS[parent].d) {
+        const e = fsError('ENOENT', 'listen', sockPath);
+        queueMicrotask(() => this.emit('error', e));
+        return this;
+      }
+      if (NET_SERVERS.has(sockPath) || FS[sockPath]) {
+        const e = netError('EADDRINUSE', 'listen EADDRINUSE: address already in use ' + sockPath);
+        queueMicrotask(() => this.emit('error', e));
+        return this;
+      }
+      this._pipe = sockPath;
+      this.port = undefined;
+      this.host = undefined;
+      this.listening = true;
+      NET_SERVERS.set(sockPath, this);
+      FS[sockPath] = { c: '', socket: true, m: Date.now(), mode: 0o755 };
+      mark(sockPath);
+      queueMicrotask(() => { this.emit('listening'); if (cb) cb(); });
+      return this;
+    }
+    let port = first, host = args[1];
+    if (port && typeof port === 'object') {
+      const o = port;
+      host = o.host;
+      port = o.port;
+      this.allowHalfOpen = !!o.allowHalfOpen;
+    } else if (typeof host !== 'string') {
+      host = '127.0.0.1';
+    }
+    this._pipe = null;
+    this.port = Number(port) || 0;
+    if (!this.port) this.port = 30000 + Math.floor(Math.random() * 20000);
+    if (NET_SERVERS.has(this.port) || SERVERS.has(this.port)) {
+      const e = netError('EADDRINUSE', 'address already in use: ' + this.port);
+      queueMicrotask(() => this.emit('error', e));
+      return this;
+    }
+    this.host = host || '127.0.0.1';
+    this.listening = true;
+    NET_SERVERS.set(this.port, this);
+    queueMicrotask(() => { this.emit('listening'); if (cb) cb(); });
+    return this;
+  }
+  address(){return this.listening?(this._pipe||{address:this.host,family:netIsIP(this.host)===6?'IPv6':'IPv4',port:this.port}):null;}
+  close(cb){if(this.listening){if(this._pipe){NET_SERVERS.delete(this._pipe);if(FS[this._pipe]&&FS[this._pipe].socket){delete FS[this._pipe];mark(this._pipe);}this._pipe=null;}else{NET_SERVERS.delete(this.port);}this.listening=false;}queueMicrotask(()=>{this.emit('close');cb&&cb();});return this;}
   getConnections(cb){const n=this.connections;cb&&cb(null,n);return this;}
   ref(){return this;}unref(){return this;}
 }
@@ -2008,7 +2084,11 @@ class VirtualNodeWorker {
       };
       this._port = port;
       const savedParentPort = CORE.worker_threads.parentPort;
+      const savedWorkerData = CORE.worker_threads.workerData;
+      const savedThreadId = CORE.worker_threads.threadId;
       CORE.worker_threads.parentPort = port;
+      CORE.worker_threads.workerData = options && Object.prototype.hasOwnProperty.call(options, 'workerData') ? options.workerData : null;
+      CORE.worker_threads.threadId = worker.threadId;
       const savedChildCache = CHILD_MODULE_CACHE;
       CHILD_MODULE_CACHE = Object.create(null);
       const envBackup = {};
@@ -2018,11 +2098,15 @@ class VirtualNodeWorker {
       } catch (error) {
         CHILD_MODULE_CACHE = savedChildCache;
         CORE.worker_threads.parentPort = savedParentPort;
+        CORE.worker_threads.workerData = savedWorkerData;
+        CORE.worker_threads.threadId = savedThreadId;
         for (const [key, value] of Object.entries(envBackup)) { if (value === undefined) delete processObj.env[key]; else processObj.env[key] = value; }
         setTimeout(() => { worker._emit('error', error); worker._emit('exit', 1); }, 0);
         return;
       }
       CORE.worker_threads.parentPort = savedParentPort;
+      CORE.worker_threads.workerData = savedWorkerData;
+      CORE.worker_threads.threadId = savedThreadId;
       CHILD_MODULE_CACHE = savedChildCache;
       for (const [key, value] of Object.entries(envBackup)) { if (value === undefined) delete processObj.env[key]; else processObj.env[key] = value; }
       this._loaded = true;
@@ -2064,7 +2148,7 @@ const CORE = {
   timers:{setTimeout,setInterval,clearTimeout,clearInterval,setImmediate:(f,...a)=>setTimeout(f,0,...a)},
   'timers/promises':{ setTimeout:(ms,v)=>new Promise(r=>setTimeout(()=>r(v),ms)) },
   child_process:CHILD_PROCESS,
-  worker_threads:{isMainThread:true,parentPort:null,Worker:VirtualNodeWorker,markAsUntransferable:()=>{},moveMessagePortToContext:()=>{throw new Error('moveMessagePortToContext is not available in the virtual runtime.');},transferListIsEmpty:()=>true,isMarkedAsUntransferable:()=>false},
+  worker_threads:{isMainThread:true,parentPort:null,workerData:null,threadId:0,Worker:VirtualNodeWorker,markAsUntransferable:()=>{},moveMessagePortToContext:()=>{throw new Error('moveMessagePortToContext is not available in the virtual runtime.');},transferListIsEmpty:()=>true,isMarkedAsUntransferable:()=>false},
   cluster:{isMaster:true,isPrimary:true,fork:()=>{throw new Error('cluster requires native Node processes.');},on(){}},
   readline:{ createInterface:()=>{ const e=new EventEmitter(); e.question=(q,cb)=>{pendingQuestion=cb;post({type:'question',data:String(q)});}; e.close=()=>{}; e.prompt=()=>{}; return e; } },
   perf_hooks:{ performance }, v8:{ getHeapStatistics:()=>({}) }, vm:{ runInNewContext:(c,ctx)=>Function('with(this){return eval('+JSON.stringify(c)+')}').call(ctx||{}) },
@@ -10408,7 +10492,7 @@ function timerFunction(fn, repeating) {
 }
 self.setTimeout = timerFunction(runtimeNativeSetTimeout, false);
 self.setInterval = timerFunction(runtimeNativeSetInterval, true);
-self.clearTimeout = self.clearInterval = timer => { const id = timer && typeof timer === 'object' ? timer._id : timer; kernelTimers.delete(id); runtimeNativeClearTimeout(id); runtimeNativeClearInterval(id); kernelMaybeIdle(); };
+self.clearTimeout = self.clearInterval = timer => { const id = timer && typeof timer === 'object' && Object.prototype.hasOwnProperty.call(timer, '_id') ? timer._id : timer; kernelTimers.delete(id); runtimeNativeClearTimeout(id); runtimeNativeClearInterval(id); kernelMaybeIdle(); };
 self.setImmediate = (fn, ...args) => self.setTimeout(fn, 0, ...args); self.clearImmediate = self.clearTimeout;
 Object.assign(CORE.timers, { setTimeout: self.setTimeout, setInterval: self.setInterval, clearTimeout: self.clearTimeout, clearInterval: self.clearInterval, setImmediate: self.setImmediate, clearImmediate: self.clearImmediate });
 CORE['timers/promises'].setTimeout = (ms, value) => new Promise(resolve => self.setTimeout(() => resolve(value), ms));

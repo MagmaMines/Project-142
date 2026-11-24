@@ -1,7 +1,7 @@
 {
-  "generatedAt": "2026-11-06T07:54:04.781Z",
+  "generatedAt": "2026-11-24T09:34:44.646Z",
   "node": "22.22.3",
-  "runtime": "v20.11.0-beownir",
+  "runtime": "v22.22.3-beownir",
   "modules": 55,
   "implementedModules": 55,
   "unimplementedModules": [],
@@ -9,8 +9,8 @@
     "crypto/webcrypto"
   ],
   "nodeExports": 1336,
-  "covered": 1333,
-  "overall": 0.9978,
+  "covered": 1334,
+  "overall": 0.9985,
   "internals": {
     "modules": 11,
     "implementedModules": 0,
@@ -18,7 +18,7 @@
     "covered": 0,
     "overall": 0
   },
-  "baseline": 0.9978,
+  "baseline": 0.9985,
   "perModule": {
     "assert": {
       "coverage": 1,
@@ -61,11 +61,10 @@
       "missing": []
     },
     "crypto": {
-      "coverage": 0.9552,
-      "missingCount": 3,
+      "coverage": 0.9701,
+      "missingCount": 2,
       "missing": [
         "Certificate",
-        "ECDH",
         "X509Certificate"
       ]
     },
