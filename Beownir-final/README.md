@@ -273,10 +273,10 @@ a table:
 
 ```
 module               cover   runtime/node   first gaps
-crypto                97.0%      65 /67      Certificate, X509Certificate
+crypto               100.0%      67 /67
 module               100.0%      32 /30
 ...
-overall 99.9% of 1336 Node exports across 55 modules (55 implemented) on Node 22.22.3
+overall 100.0% of 1336 Node exports across 55 modules (55 implemented) on Node 22.22.3
 deprecated internals (_*): 0.0% of 53 exports across 11 modules, reported separately
 ```
 
@@ -287,12 +287,14 @@ denominator instead of scoring zero. Those six are now implemented, `require()`
 agrees with `module.builtinModules`, and a module that stops existing can only
 make the number go *down*.
 
-Two exports are still missing and both are X.509 parsing: `X509Certificate` and
-the legacy `Certificate` class. They throw a named error instead of returning a
-plausible-looking wrong answer; everything else on that list is implemented and
-tested against the real thing, including ECDH over P-256/P-384/P-521 and
-`scrypt`, which are compared byte-for-byte with OpenSSL in
-`test/crypto.test.mjs`.
+All `1336` public Node exports across all `55` modules now exist on the exported
+surface (`100.0%`), including `crypto.X509Certificate` (PEM/DER certificate
+parsing, `subject`/`issuer`/`subjectAltName`/`infoAccess`, host/email/IP/issuer/private-key/signature
+checks, `toLegacyObject()`), `crypto.Certificate` (SPKAC `verifySpkac`,
+`exportPublicKey`, `exportChallenge`), `crypto.createECDH` (P-256/P-384/P-521
+with compressed/hybrid point codecs and `ECDH.convertKey`), and `crypto.scrypt`
+— compared against OpenSSL in `test/crypto.test.mjs` and
+`test/crypto-asymmetric.test.mjs`.
 
 The deprecated `_`-prefixed internals (`_http_agent`, `_stream_readable`, …) are
 Node's own implementation details, not API. The runtime does not ship them and
@@ -363,17 +365,17 @@ package from the registry before it was fixed:
   report also counts own property names on both sides now, so an existing but
   non-enumerable member (`process.pid`) is no longer scored as absent.
 
-What the remaining gaps actually are:
+What the remaining behavioural boundaries actually are (export surface is 100.0% across all 55 Node modules):
 
 | Area | Status |
 |---|---|
 | `path`, `url`, `querystring`, `punycode`, `os`, `tty`, `readline`, `vm`, `perf_hooks`, `string_decoder`, `timers/promises`, `stream/promises` | complete export surface, behaviour implemented |
-| `events`, `stream`, `assert`, `buffer`, `module`, `worker_threads`, `net`, `fs/promises`, `child_process` | ≥85%, the missing names are native-only internals |
-| `https`, `http`, `fs` | 100% / 80% / 74%; `http` is missing only browser-only WHATWG classes and Node internals, `fs` only stream classes packages rarely import |
-| `crypto` | 97%: hashing, HMAC, PBKDF2, HKDF, **scrypt**, random, in-house AES (CBC/CTR/CFB/OFB/GCM), RSA PKCS#1 v1.5 + OAEP, **ECDH** on P-256/384/521; signing/cipher **streams** deliberately throw `ERR_CRYPTO_OPERATION_FAILED` rather than returning wrong bytes |
-| `zlib` | ~77%: gzip/deflate/inflate round-trip through pako; Brotli and Zstd throw `ERR_ZLIB_UNAVAILABLE` |
-| `dns`, `tls`, `http2` | honest stubs with stable codes (`ENOTSUP`); the browser cannot open raw sockets. Real networking needs the native browser-WASM profile or the host relay |
-| `inspector`, `domain`, `cluster` | no-ops: there is no debugger agent and no multi-process cluster in a worker |
+| `events`, `stream`, `assert`, `buffer`, `module`, `worker_threads`, `net`, `fs/promises`, `child_process`, `fs`, `http`, `https` | 100% export surface; `fs` stores in virtual FS, `http`/`https` over virtual loopback, `worker_threads` runs real sibling workers with `SharedArrayBuffer` SPSC rings, and `child_process` supports both async (`spawn`/`exec`/`execFile`/`fork`) and COI sync (`spawnSync`/`execSync`/`execFileSync`) |
+| `crypto` | 100% export surface: hashing, HMAC, PBKDF2, HKDF, **scrypt**, random, in-house AES (CBC/CTR/CFB/OFB/GCM), RSA PKCS#1 v1.5 + OAEP, **ECDH** on P-256/384/521, **`X509Certificate`** (PEM/DER), and **`Certificate`** (SPKAC); unimplemented algorithms (e.g. ECDSA/Ed25519/keypair generation) throw `ERR_CRYPTO_OPERATION_FAILED` rather than returning wrong bytes |
+| `zlib` | 100% export surface: gzip/deflate/inflate round-trip through pako; Brotli and Zstd throw `ERR_ZLIB_UNAVAILABLE` |
+| `wasi` | Preview 1 WASI host (`args`, `environ`, `clock`, `random`, virtual-FS `fd_*`/`path_*`, `poll_oneoff` clocks & fds, `runChild`, SAB-backed memories); socket syscalls return `ENOSYS` |
+| `dns`, `tls`, `http2` | honest stubs with stable codes (`ENOTSUP` / DNS-over-HTTPS for `dns`); the browser cannot open raw sockets. Real networking needs the native browser-WASM profile or the host relay |
+| `inspector`, `domain`, `cluster` | minimal compatibility hosts: there is no debugger agent or multi-process cluster in a worker |
 
 Compatibility with **frameworks** is therefore bounded by three things, in order
 of impact: native addons (SWC/lightningcss/oxide, Turbopack), raw sockets, and
@@ -543,37 +545,47 @@ byte-for-byte Node:
   `buffer.atob/btoa`, `module.createRequire`/`builtinModules`/`isBuiltin`,
   `url.fileURLToPath`/`pathToFileURL`, `path.posix`/`win32`, `vm.Script`,
   `perf_hooks.PerformanceObserver` are implemented;
-- `child_process` runs through separate workers (8 processes), `net` covers
-  loopback TCP, `http`/`https` speak the same virtual loopback (see below);
+- `child_process` runs through separate workers (8 processes), including both
+  async (`spawn`, `exec`, `execFile`, `fork`) and synchronous (`spawnSync`,
+  `execSync`, `execFileSync` via cross-worker `SharedArrayBuffer` +
+  `Atomics.wait` under cross-origin isolation, falling back cleanly to
+  `ERR_NOT_SUPPORTED` when COI is unavailable); `net` covers loopback TCP,
+  `http`/`https` speak the same virtual loopback (see below);
 - `crypto` includes a from-scratch AES core (CBC, ECB, CTR, CFB, OFB and GCM
   with AAD and auth-tag verification), `Hash`/`Hmac` classes with `copy()`,
   `crypto.hash`, `hkdf`, Miller-Rabin `checkPrime`/`generatePrime`, the eight
   RFC modp Diffie-Hellman groups, `KeyObject`/`createSecretKey`,
-  `generateKey('aes'|'hmac')` and `getCipherInfo`, plus **RSA** implemented on
+  `generateKey('aes'|'hmac')` and `getCipherInfo`, `X509Certificate` and
+  `Certificate` (SPKAC), plus **RSA** implemented on
   BigInt: PEM/DER/JWK key parsing, PKCS#1 v1.5 signatures, PKCS#1 v1.5 and OAEP
   encryption, all byte-identical to OpenSSL and asserted in
   `test/crypto.test.mjs` (ciphers) and `test/crypto-asymmetric.test.mjs` (keys,
-  signatures, encryption);
+  signatures, encryption, X.509/SPKAC);
 - `dns` and `dns/promises` resolve over DNS-over-HTTPS, because a browser cannot
   open a UDP socket: `resolve4/6`, `resolveMx/Txt/Caa/Srv/Soa/Tlsa/Naptr/Ns/Ptr`,
   `resolveAny`, `reverse`, `lookupService`, `lookup` and `Resolver.setServers`
   all return Node-shaped records (`test/dns.test.mjs`);
-- no native addons and no spawning a second worker from inside the runtime
-  worker (`new Worker()` throws `Nested Node worker_threads are unsupported`);
-  `dgram` is a virtual UDP bus that delivers to sockets bound in the same runtime
-  and answers `ENOTSUP` for anything leaving the browser;
-- no `node:test` reporter runner (the `test` module surface exists and `describe`/
-  `it`/`assert` drive the shell's own test command).
+- `worker_threads` runs real sibling Web Workers orchestrated by `frame-kernel`
+  (up to `16` concurrent threads under cross-origin isolation with SPSC
+  `SharedArrayBuffer` ring mailboxes, `MessageChannel`/`MessagePort` transfer,
+  `BroadcastChannel`, `getEnvironmentData`/`setEnvironmentData`, `SHARE_ENV`,
+  and `postMessageToThread`, falling back to `postMessage` when `SharedArrayBuffer`
+  is unavailable); `dgram` is a virtual UDP bus that delivers to sockets bound
+  in the same runtime and answers `ENOTSUP` for anything leaving the browser;
+- no native addons and no `node:test` reporter runner (the `test` module
+  surface exists and `describe`/`it`/`assert` drive the shell's own test
+  command).
 
 Anything unsupported throws an explicit `Error` with a stable `code` instead of
-failing silently. `crypto.scrypt`/`scryptSync` (RFC 7914 Salsa20/8 + BlockMix) and
+failing silently. `crypto.scrypt`/`scryptSync` (RFC 7914 Salsa20/8 + BlockMix),
 `crypto.createECDH` (P-256, P-384, P-521, with compressed/hybrid point codecs and
-`ECDH.convertKey`) are implemented in-house and byte-compared with OpenSSL. The
-asymmetrical gaps that remain are key **generation** (`generateKeyPairSync` /
-`generateKeyPair`), non-RSA algorithms (ECDSA, Ed25519), RSA-PSS padding, X.509
-certificate parsing and encrypted PEM keys; Brotli and Zstd need the platform's
-`CompressionStream` (browsers ship gzip/deflate only), so on a real browser they
-fail with the reason instead of a wrong result.
+`ECDH.convertKey`), `crypto.X509Certificate`, and `crypto.Certificate` are
+implemented in-house and compared with OpenSSL. The asymmetrical gaps that
+remain are key **generation** (`generateKeyPairSync` / `generateKeyPair`),
+non-RSA algorithms (ECDSA, Ed25519 signing/verification), RSA-PSS padding, and
+encrypted PEM keys; Brotli and Zstd need the platform's `CompressionStream`
+(browsers ship gzip/deflate only), so on a real browser they fail with the
+reason instead of a wrong result.
 
 ## The release artifact
 

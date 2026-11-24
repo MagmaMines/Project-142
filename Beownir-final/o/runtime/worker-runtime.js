@@ -10,6 +10,11 @@ let FS = Object.create(null);          // path -> {c:string|Uint8Array, d:bool}
 FS['/'] = { d: true, m: Date.now() };  // the virtual root always exists, like a real filesystem
 let CWD = '/project';
 const te = new TextEncoder(), td = new TextDecoder();
+const isSharedBuffer = buf => typeof SharedArrayBuffer !== 'undefined' && Boolean(buf && (buf instanceof SharedArrayBuffer || Object.prototype.toString.call(buf) === '[object SharedArrayBuffer]'));
+const unsharedView = bytes => (bytes && ArrayBuffer.isView(bytes) && isSharedBuffer(bytes.buffer)
+  ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength).slice()
+  : bytes);
+const decodeBytes = (bytes, decoder = td) => decoder.decode(unsharedView(bytes));
 const bridgePost = self.postMessage.bind(self);
 const post = (m) => self.postMessage(m);
 let holdSync = 0, syncTimer = null;
@@ -108,7 +113,7 @@ const NODE_QS_INTERNAL_SOURCE = "'use strict';\n\nconst {\n  Array,\n  Int8Array
 const NODE_QS_SOURCE = "// Copyright Joyent, Inc. and other Node contributors.\n//\n// Permission is hereby granted, free of charge, to any person obtaining a\n// copy of this software and associated documentation files (the\n// \"Software\"), to deal in the Software without restriction, including\n// without limitation the rights to use, copy, modify, merge, publish,\n// distribute, sublicense, and/or sell copies of the Software, and to permit\n// persons to whom the Software is furnished to do so, subject to the\n// following conditions:\n//\n// The above copyright notice and this permission notice shall be included\n// in all copies or substantial portions of the Software.\n//\n// THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS\n// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN\n// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,\n// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR\n// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE\n// USE OR OTHER DEALINGS IN THE SOFTWARE.\n\n// Query String Utilities\n\n'use strict';\n\nconst {\n  Array,\n  ArrayIsArray,\n  Int8Array,\n  MathAbs,\n  NumberIsFinite,\n  ObjectKeys,\n  String,\n  StringPrototypeCharCodeAt,\n  StringPrototypeSlice,\n  decodeURIComponent,\n} = primordials;\n\nconst { Buffer } = require('buffer');\nconst {\n  encodeStr,\n  hexTable,\n  isHexTable,\n} = require('internal/querystring');\nconst QueryString = module.exports = {\n  unescapeBuffer,\n  // `unescape()` is a JS global, so we need to use a different local name\n  unescape: qsUnescape,\n\n  // `escape()` is a JS global, so we need to use a different local name\n  escape: qsEscape,\n\n  stringify,\n  encode: stringify,\n\n  parse,\n  decode: parse,\n};\n\nconst unhexTable = new Int8Array([\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0 - 15\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 16 - 31\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 32 - 47\n  +0, +1, +2, +3, +4, +5, +6, +7, +8, +9, -1, -1, -1, -1, -1, -1, // 48 - 63\n  -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 64 - 79\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 80 - 95\n  -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 96 - 111\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 112 - 127\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 128 ...\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  // ... 255\n]);\n/**\n * A safe fast alternative to decodeURIComponent\n * @param {string} s\n * @param {boolean} decodeSpaces\n * @returns {string}\n */\nfunction unescapeBuffer(s, decodeSpaces) {\n  const out = Buffer.allocUnsafe(s.length);\n  let index = 0;\n  let outIndex = 0;\n  let currentChar;\n  let nextChar;\n  let hexHigh;\n  let hexLow;\n  const maxLength = s.length - 2;\n  // Flag to know if some hex chars have been decoded\n  let hasHex = false;\n  while (index < s.length) {\n    currentChar = StringPrototypeCharCodeAt(s, index);\n    if (currentChar === 43 /* '+' */ && decodeSpaces) {\n      out[outIndex++] = 32; // ' '\n      index++;\n      continue;\n    }\n    if (currentChar === 37 /* '%' */ && index < maxLength) {\n      currentChar = StringPrototypeCharCodeAt(s, ++index);\n      hexHigh = unhexTable[currentChar];\n      if (!(hexHigh >= 0)) {\n        out[outIndex++] = 37; // '%'\n        continue;\n      } else {\n        nextChar = StringPrototypeCharCodeAt(s, ++index);\n        hexLow = unhexTable[nextChar];\n        if (!(hexLow >= 0)) {\n          out[outIndex++] = 37; // '%'\n          index--;\n        } else {\n          hasHex = true;\n          currentChar = hexHigh * 16 + hexLow;\n        }\n      }\n    }\n    out[outIndex++] = currentChar;\n    index++;\n  }\n  return hasHex ? out.slice(0, outIndex) : out;\n}\n\n/**\n * @param {string} s\n * @param {boolean} decodeSpaces\n * @returns {string}\n */\nfunction qsUnescape(s, decodeSpaces) {\n  try {\n    return decodeURIComponent(s);\n  } catch {\n    return QueryString.unescapeBuffer(s, decodeSpaces).toString();\n  }\n}\n\n\n// These characters do not need escaping when generating query strings:\n// ! - . _ ~\n// ' ( ) *\n// digits\n// alpha (uppercase)\n// alpha (lowercase)\nconst noEscape = new Int8Array([\n  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15\n  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31\n  0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 32 - 47\n  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63\n  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64 - 79\n  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 80 - 95\n  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96 - 111\n  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0,  // 112 - 127\n]);\n\n/**\n * QueryString.escape() replaces encodeURIComponent()\n * @see https://www.ecma-international.org/ecma-262/5.1/#sec-15.1.3.4\n * @param {any} str\n * @returns {string}\n */\nfunction qsEscape(str) {\n  if (typeof str !== 'string') {\n    if (typeof str === 'object')\n      str = String(str);\n    else\n      str += '';\n  }\n\n  return encodeStr(str, noEscape, hexTable);\n}\n\n/**\n * @param {string | number | bigint | boolean | symbol | undefined | null} v\n * @returns {string}\n */\nfunction stringifyPrimitive(v) {\n  if (typeof v === 'string')\n    return v;\n  if (typeof v === 'number' && NumberIsFinite(v))\n    return '' + v;\n  if (typeof v === 'bigint')\n    return '' + v;\n  if (typeof v === 'boolean')\n    return v ? 'true' : 'false';\n  return '';\n}\n\n/**\n * @param {string | number | bigint | boolean} v\n * @param {(v: string) => string} encode\n * @returns {string}\n */\nfunction encodeStringified(v, encode) {\n  if (typeof v === 'string')\n    return (v.length ? encode(v) : '');\n  if (typeof v === 'number' && NumberIsFinite(v)) {\n    // Values >= 1e21 automatically switch to scientific notation which requires\n    // escaping due to the inclusion of a '+' in the output\n    return (MathAbs(v) < 1e21 ? '' + v : encode('' + v));\n  }\n  if (typeof v === 'bigint')\n    return '' + v;\n  if (typeof v === 'boolean')\n    return v ? 'true' : 'false';\n  return '';\n}\n\n/**\n * @param {string | number | boolean | null} v\n * @param {(v: string) => string} encode\n * @returns {string}\n */\nfunction encodeStringifiedCustom(v, encode) {\n  return encode(stringifyPrimitive(v));\n}\n\n/**\n * @param {Record<string, string | number | boolean\n * | ReadonlyArray<string | number | boolean> | null>} obj\n * @param {string} [sep]\n * @param {string} [eq]\n * @param {{ encodeURIComponent?: (v: string) => string }} [options]\n * @returns {string}\n */\nfunction stringify(obj, sep, eq, options) {\n  sep ||= '&';\n  eq ||= '=';\n\n  let encode = QueryString.escape;\n  if (options && typeof options.encodeURIComponent === 'function') {\n    encode = options.encodeURIComponent;\n  }\n  const convert =\n    (encode === qsEscape ? encodeStringified : encodeStringifiedCustom);\n\n  if (obj !== null && typeof obj === 'object') {\n    const keys = ObjectKeys(obj);\n    const len = keys.length;\n    let fields = '';\n    for (let i = 0; i < len; ++i) {\n      const k = keys[i];\n      const v = obj[k];\n      let ks = convert(k, encode);\n      ks += eq;\n\n      if (ArrayIsArray(v)) {\n        const vlen = v.length;\n        if (vlen === 0) continue;\n        if (fields)\n          fields += sep;\n        for (let j = 0; j < vlen; ++j) {\n          if (j)\n            fields += sep;\n          fields += ks;\n          fields += convert(v[j], encode);\n        }\n      } else {\n        if (fields)\n          fields += sep;\n        fields += ks;\n        fields += convert(v, encode);\n      }\n    }\n    return fields;\n  }\n  return '';\n}\n\n/**\n * @param {string} str\n * @returns {number[]}\n */\nfunction charCodes(str) {\n  if (str.length === 0) return [];\n  if (str.length === 1) return [StringPrototypeCharCodeAt(str, 0)];\n  const ret = new Array(str.length);\n  for (let i = 0; i < str.length; ++i)\n    ret[i] = StringPrototypeCharCodeAt(str, i);\n  return ret;\n}\nconst defSepCodes = [38]; // &\nconst defEqCodes = [61]; // =\n\nfunction addKeyVal(obj, key, value, keyEncoded, valEncoded, decode) {\n  if (key.length > 0 && keyEncoded)\n    key = decodeStr(key, decode);\n  if (value.length > 0 && valEncoded)\n    value = decodeStr(value, decode);\n\n  if (obj[key] === undefined) {\n    obj[key] = value;\n  } else {\n    const curValue = obj[key];\n    // A simple Array-specific property check is enough here to\n    // distinguish from a string value and is faster and still safe\n    // since we are generating all of the values being assigned.\n    if (curValue.pop)\n      curValue[curValue.length] = value;\n    else\n      obj[key] = [curValue, value];\n  }\n}\n\n/**\n * Parse a key/val string.\n * @param {string} qs\n * @param {string} sep\n * @param {string} eq\n * @param {{\n *   maxKeys?: number;\n *   decodeURIComponent?(v: string): string;\n *   }} [options]\n * @returns {Record<string, string | string[]>}\n */\nfunction parse(qs, sep, eq, options) {\n  const obj = { __proto__: null };\n\n  if (typeof qs !== 'string' || qs.length === 0) {\n    return obj;\n  }\n\n  const sepCodes = (!sep ? defSepCodes : charCodes(String(sep)));\n  const eqCodes = (!eq ? defEqCodes : charCodes(String(eq)));\n  const sepLen = sepCodes.length;\n  const eqLen = eqCodes.length;\n\n  let pairs = 1000;\n  if (options && typeof options.maxKeys === 'number') {\n    // -1 is used in place of a value like Infinity for meaning\n    // \"unlimited pairs\" because of additional checks V8 (at least as of v5.4)\n    // has to do when using variables that contain values like Infinity. Since\n    // `pairs` is always decremented and checked explicitly for 0, -1 works\n    // effectively the same as Infinity, while providing a significant\n    // performance boost.\n    pairs = (options.maxKeys > 0 ? options.maxKeys : -1);\n  }\n\n  let decode = QueryString.unescape;\n  if (options && typeof options.decodeURIComponent === 'function') {\n    decode = options.decodeURIComponent;\n  }\n  const customDecode = (decode !== qsUnescape);\n\n  let lastPos = 0;\n  let sepIdx = 0;\n  let eqIdx = 0;\n  let key = '';\n  let value = '';\n  let keyEncoded = customDecode;\n  let valEncoded = customDecode;\n  const plusChar = (customDecode ? '%20' : ' ');\n  let encodeCheck = 0;\n  for (let i = 0; i < qs.length; ++i) {\n    const code = StringPrototypeCharCodeAt(qs, i);\n\n    // Try matching key/value pair separator (e.g. '&')\n    if (code === sepCodes[sepIdx]) {\n      if (++sepIdx === sepLen) {\n        // Key/value pair separator match!\n        const end = i - sepIdx + 1;\n        if (eqIdx < eqLen) {\n          // We didn't find the (entire) key/value separator\n          if (lastPos < end) {\n            // Treat the substring as part of the key instead of the value\n            key += StringPrototypeSlice(qs, lastPos, end);\n          } else if (key.length === 0) {\n            // We saw an empty substring between separators\n            if (--pairs === 0)\n              return obj;\n            lastPos = i + 1;\n            sepIdx = eqIdx = 0;\n            continue;\n          }\n        } else if (lastPos < end) {\n          value += StringPrototypeSlice(qs, lastPos, end);\n        }\n\n        addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);\n\n        if (--pairs === 0)\n          return obj;\n        keyEncoded = valEncoded = customDecode;\n        key = value = '';\n        encodeCheck = 0;\n        lastPos = i + 1;\n        sepIdx = eqIdx = 0;\n      }\n    } else {\n      sepIdx = 0;\n      // Try matching key/value separator (e.g. '=') if we haven't already\n      if (eqIdx < eqLen) {\n        if (code === eqCodes[eqIdx]) {\n          if (++eqIdx === eqLen) {\n            // Key/value separator match!\n            const end = i - eqIdx + 1;\n            if (lastPos < end)\n              key += StringPrototypeSlice(qs, lastPos, end);\n            encodeCheck = 0;\n            lastPos = i + 1;\n          }\n          continue;\n        } else {\n          eqIdx = 0;\n          if (!keyEncoded) {\n            // Try to match an (valid) encoded byte once to minimize unnecessary\n            // calls to string decoding functions\n            if (code === 37/* % */) {\n              encodeCheck = 1;\n              continue;\n            } else if (encodeCheck > 0) {\n              if (isHexTable[code] === 1) {\n                if (++encodeCheck === 3)\n                  keyEncoded = true;\n                continue;\n              } else {\n                encodeCheck = 0;\n              }\n            }\n          }\n        }\n        if (code === 43/* + */) {\n          if (lastPos < i)\n            key += StringPrototypeSlice(qs, lastPos, i);\n          key += plusChar;\n          lastPos = i + 1;\n          continue;\n        }\n      }\n      if (code === 43/* + */) {\n        if (lastPos < i)\n          value += StringPrototypeSlice(qs, lastPos, i);\n        value += plusChar;\n        lastPos = i + 1;\n      } else if (!valEncoded) {\n        // Try to match an (valid) encoded byte (once) to minimize unnecessary\n        // calls to string decoding functions\n        if (code === 37/* % */) {\n          encodeCheck = 1;\n        } else if (encodeCheck > 0) {\n          if (isHexTable[code] === 1) {\n            if (++encodeCheck === 3)\n              valEncoded = true;\n          } else {\n            encodeCheck = 0;\n          }\n        }\n      }\n    }\n  }\n\n  // Deal with any leftover key or value data\n  if (lastPos < qs.length) {\n    if (eqIdx < eqLen)\n      key += StringPrototypeSlice(qs, lastPos);\n    else if (sepIdx < sepLen)\n      value += StringPrototypeSlice(qs, lastPos);\n  } else if (eqIdx === 0 && key.length === 0) {\n    // We ended on an empty substring\n    return obj;\n  }\n\n  addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);\n\n  return obj;\n}\n\n\n/**\n * V8 does not optimize functions with try-catch blocks, so we isolate them here\n * to minimize the damage (Note: no longer true as of V8 5.4 -- but still will\n * not be inlined).\n * @param {string} s\n * @param {(v: string) => string} decoder\n * @returns {string}\n */\nfunction decodeStr(s, decoder) {\n  try {\n    return decoder(s);\n  } catch {\n    return QueryString.unescape(s, true);\n  }\n}\n";
 /* END generated: node-querystring */
 /* BEGIN generated: wasi (tools/gen-wasi.mjs - do not edit) */
-const NODE_WASI_SOURCE = "'use strict';\n// Beownir WASI host: the WASI class from Node's `wasi` module (preview1), implemented on the\n// runtime's own file system. Every system call is plain JavaScript, so each one can be tested.\n// Calls that have no meaning in the browser return ENOSYS, and the program sees that errno.\nconst { Buffer } = require('buffer');\nconst process = require('process');\nconst fs = require('fs');\nconst nodePath = require('path');\nconst crypto = require('crypto');\n\nconst ERRNO = { SUCCESS: 0, BADF: 8, EXIST: 20, INVAL: 28, IO: 29, ISDIR: 31, NOENT: 44, NOSYS: 52, NOTDIR: 54, NOTEMPTY: 55, NOTCAPABLE: 76 };\nconst FILETYPE = { UNKNOWN: 0, DIRECTORY: 3, REGULAR_FILE: 4 };\nconst OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 };\nconst WHENCE = { SET: 0, CUR: 1, END: 2 };\nconst ALL_RIGHTS = (1n << 64n) - 1n;\nconst ERRNO_BY_CODE = { ENOENT: ERRNO.NOENT, EEXIST: ERRNO.EXIST, EISDIR: ERRNO.ISDIR, ENOTDIR: ERRNO.NOTDIR, ENOTEMPTY: ERRNO.NOTEMPTY, EBADF: ERRNO.BADF, EINVAL: ERRNO.INVAL, ENOTCAPABLE: ERRNO.NOTCAPABLE };\nconst UNSUPPORTED = ['fd_filestat_set_times', 'path_link', 'path_readlink', 'path_symlink', 'path_filestat_set_times', 'poll_oneoff', 'proc_raise', 'sock_accept', 'sock_recv', 'sock_send', 'sock_shutdown', 'fd_readdir_cookie'];\n\n// Errors have the same codes and messages as Node's WASI class, so code that handles them works unchanged.\nfunction nodeError(code, message) {\n  const error = new TypeError(message);\n  error.code = code;\n  return error;\n}\nfunction describe(value) {\n  if (value === undefined) return 'undefined';\n  if (value === null) return 'null';\n  return typeof value === 'string' ? `'${value}'` : String(value);\n}\nfunction invalidType(name, type, value) {\n  return nodeError('ERR_INVALID_ARG_TYPE', `The \"${name}\" property must be of type ${type}. Received ${describe(value)}`);\n}\n\n// Thrown by proc_exit. start() turns it into an exit code instead of unwinding the host.\nclass WASIExit extends Error {\n  constructor(code) { super('WASI process exited with code ' + code); this.name = 'WASIExit'; this.code = code; }\n}\n\nfunction errnoFor(error) {\n  if (error instanceof WASIExit) throw error;\n  return ERRNO_BY_CODE[error && error.code] || ERRNO.IO;\n}\n\nclass WASI {\n  constructor(options) {\n    if (options === undefined || options === null || typeof options !== 'object') {\n      throw nodeError('ERR_INVALID_ARG_TYPE', `The \"options\" argument must be of type object. Received ${describe(options)}`);\n    }\n    if (typeof options.version !== 'string') throw invalidType('options.version', 'string', options.version);\n    if (options.version !== 'preview1' && options.version !== 'unstable') {\n      throw nodeError('ERR_INVALID_ARG_VALUE', `The property 'options.version' unsupported WASI version. Received '${options.version}'`);\n    }\n    this._moduleName = options.version === 'unstable' ? 'wasi_unstable' : 'wasi_snapshot_preview1';\n    this._args = (options.args || []).map(String);\n    this._env = Object.entries(options.env || {}).map(([key, value]) => key + '=' + value);\n    this._stdout = typeof options.stdout === 'function' ? options.stdout : null;\n    this._stderr = typeof options.stderr === 'function' ? options.stderr : null;\n    this._memory = null;\n    this._fds = new Map([\n      [0, { kind: 'stdin' }],\n      [1, { kind: 'stdout' }],\n      [2, { kind: 'stderr' }],\n    ]);\n    this._nextFd = 3;\n    for (const [guest, host] of Object.entries(options.preopens || {})) {\n      this._fds.set(this._nextFd++, { kind: 'dir', host: nodePath.resolve(host), preopen: guest });\n    }\n    this._imports = this._buildImports();\n  }\n\n  getImportObject() {\n    return { [this._moduleName]: this._imports };\n  }\n\n  // Runs a command module: calls _start and returns its exit code. Node requires _start here.\n  start(instance) {\n    this._memory = this._checkInstance(instance);\n    if (typeof instance.exports._start !== 'function') throw invalidType('instance.exports._start', 'function', instance.exports._start);\n    if (instance.exports._initialize !== undefined) throw invalidType('instance.exports._initialize', 'undefined', instance.exports._initialize);\n    try {\n      instance.exports._start();\n      return 0;\n    } catch (error) {\n      if (error instanceof WASIExit) return error.code;\n      throw error;\n    }\n  }\n\n  // Prepares a reactor module: calls _initialize if it exists. Node forbids _start here.\n  initialize(instance) {\n    this._memory = this._checkInstance(instance);\n    if (instance.exports._start !== undefined) throw invalidType('instance.exports._start', 'undefined', instance.exports._start);\n    if (typeof instance.exports._initialize === 'function') instance.exports._initialize();\n  }\n\n  // Execute one WASI command module as a child of the current runtime. This is\n  // an in-runtime WebAssembly task, not an operating-system process. The new\n  // WASI instance has independent descriptors and returns proc_exit to parent.\n  static async runChild(source, options = {}) {\n    if (!(source instanceof WebAssembly.Module) && !(source instanceof ArrayBuffer) && !ArrayBuffer.isView(source)) {\n      throw invalidType('source', 'WebAssembly.Module, ArrayBuffer, or typed array', source);\n    }\n    const maxOutputBytes = options.maxOutputBytes === undefined ? 1024 * 1024 : Number(options.maxOutputBytes);\n    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0 || maxOutputBytes > 32 * 1024 * 1024) {\n      throw nodeError('ERR_OUT_OF_RANGE', 'maxOutputBytes must be between 0 and 33554432');\n    }\n    const output = { stdout: [], stderr: [], bytes: 0, truncated: false };\n    const capture = stream => text => {\n      const value = String(text);\n      const bytes = Buffer.from(value);\n      const room = Math.max(0, maxOutputBytes - output.bytes);\n      const kept = bytes.subarray(0, room);\n      if (kept.length) output[stream].push(kept.toString('utf8'));\n      output.bytes += kept.length;\n      if (kept.length < bytes.length) output.truncated = true;\n    };\n    const wasi = new WASI({...options, stdout:capture('stdout'), stderr:capture('stderr')});\n    const module = source instanceof WebAssembly.Module ? source : await WebAssembly.compile(source);\n    const instance = await WebAssembly.instantiate(module, wasi.getImportObject());\n    const status = wasi.start(instance);\n    return {status, stdout:output.stdout.join(''), stderr:output.stderr.join(''), outputLimitExceeded:output.truncated};\n  }\n\n  _checkInstance(instance) {\n    const exports = instance && instance.exports;\n    if (typeof exports !== 'object' || exports === null) throw invalidType('instance.exports', 'object', exports);\n    if (!(exports.memory instanceof WebAssembly.Memory)) {\n      throw nodeError('ERR_INVALID_ARG_TYPE', `\"instance.exports.memory\" property must be a WebAssembly.Memory object. Received ${describe(exports.memory)}`);\n    }\n    return exports.memory;\n  }\n\n  // Memory is read through the buffer each time, because a memory that grows replaces its buffer.\n  _bytes(ptr, len) { return new Uint8Array(this._memory.buffer, ptr, len); }\n  _view() { return new DataView(this._memory.buffer); }\n  _text(ptr, len) { return new TextDecoder().decode(this._bytes(ptr, len)); }\n\n  _entry(fd, kind) {\n    const entry = this._fds.get(fd);\n    if (!entry) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n    if (kind && entry.kind !== kind) throw Object.assign(new Error('wrong kind of fd'), { code: entry.kind === 'dir' ? 'EISDIR' : 'EBADF' });\n    return entry;\n  }\n\n  // Path calls read the disk, so every open file with unsaved changes is written first.\n  _flushAll() {\n    for (const entry of this._fds.values()) this._flush(entry);\n  }\n\n  _resolve(dirfd, relative) {\n    this._flushAll();\n    const dir = this._entry(dirfd, 'dir');\n    const host = nodePath.resolve(dir.host, relative);\n    const prefix = dir.host.endsWith('/') ? dir.host : dir.host + '/';\n    if (host !== dir.host && !host.startsWith(prefix)) throw Object.assign(new Error('path escapes the preopened directory'), { code: 'ENOTCAPABLE' });\n    return host;\n  }\n\n  // Reads from entry.data at `position` into the iovecs. Returns the byte count.\n  _readInto(entry, iovs, iovsLen, position) {\n    let total = 0, at = position;\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      const count = Math.max(0, Math.min(len, entry.data.length - at));\n      this._bytes(ptr, count).set(entry.data.subarray(at, at + count));\n      at += count;\n      total += count;\n      if (count < len) break;\n    }\n    return total;\n  }\n\n  // Gathers the iovecs into one buffer.\n  _gather(iovs, iovsLen) {\n    const chunks = [];\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      chunks.push(Buffer.from(this._bytes(ptr, len)));\n    }\n    return Buffer.concat(chunks);\n  }\n\n  // Writes data into a file's buffer at `position`, growing the file with zeros if needed.\n  _writeAt(entry, data, position) {\n    const end = position + data.length;\n    const grown = Buffer.alloc(Math.max(entry.data.length, end));\n    entry.data.copy(grown, 0);\n    data.copy(grown, position);\n    entry.data = grown;\n    entry.dirty = true;\n  }\n\n  _allocFd(entry) {\n    const fd = this._nextFd++;\n    this._fds.set(fd, entry);\n    return fd;\n  }\n\n  _flush(entry) {\n    if (entry.kind === 'file' && entry.dirty) {\n      fs.writeFileSync(entry.host, entry.data);\n      entry.dirty = false;\n    }\n  }\n\n  _writeFilestat(ptr, type, size, mtimeMs) {\n    const view = this._view();\n    view.setBigUint64(ptr, 0n, true);\n    view.setBigUint64(ptr + 8, 0n, true);\n    view.setUint8(ptr + 16, type);\n    view.setBigUint64(ptr + 24, 1n, true);\n    view.setBigUint64(ptr + 32, BigInt(size), true);\n    const time = BigInt(Math.round(mtimeMs)) * 1000000n;\n    view.setBigUint64(ptr + 40, time, true);\n    view.setBigUint64(ptr + 48, time, true);\n    view.setBigUint64(ptr + 56, time, true);\n  }\n\n  _buildImports() {\n    const self = this;\n    const guard = fn => function (...args) {\n      try { return fn.apply(self, args); } catch (error) { return errnoFor(error); }\n    };\n    const calls = {\n      args_sizes_get(countPtr, sizePtr) {\n        const size = this._args.reduce((total, arg) => total + Buffer.byteLength(arg) + 1, 0);\n        this._view().setUint32(countPtr, this._args.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      args_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._args, argvPtr, bufPtr);\n      },\n      environ_sizes_get(countPtr, sizePtr) {\n        const size = this._env.reduce((total, item) => total + Buffer.byteLength(item) + 1, 0);\n        this._view().setUint32(countPtr, this._env.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      environ_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._env, argvPtr, bufPtr);\n      },\n      clock_res_get(id, outPtr) {\n        this._view().setBigUint64(outPtr, 1000000n, true);\n        return ERRNO.SUCCESS;\n      },\n      clock_time_get(id, precision, outPtr) {\n        this._view().setBigUint64(outPtr, BigInt(Date.now()) * 1000000n, true);\n        return ERRNO.SUCCESS;\n      },\n      random_get(ptr, len) {\n        this._bytes(ptr, len).set(crypto.randomBytes(len));\n        return ERRNO.SUCCESS;\n      },\n      sched_yield() { return ERRNO.SUCCESS; },\n      proc_exit(code) { throw new WASIExit(code); },\n      fd_write(fd, iovs, iovsLen, writtenPtr) {\n        const entry = this._entry(fd);\n        const data = this._gather(iovs, iovsLen);\n        if (entry.kind === 'stdout') (this._stdout || (text => process.stdout.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'stderr') (this._stderr || (text => process.stderr.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'file') {\n          this._writeAt(entry, data, entry.pos);\n          entry.pos += data.length;\n        } else throw Object.assign(new Error('fd is not writable'), { code: entry.kind === 'dir' ? 'EISDIR' : 'EBADF' });\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_read(fd, iovs, iovsLen, readPtr) {\n        const entry = this._entry(fd);\n        let total = 0;\n        if (entry.kind === 'file') {\n          total = this._readInto(entry, iovs, iovsLen, entry.pos);\n          entry.pos += total;\n        } else if (entry.kind === 'dir') throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        else if (entry.kind !== 'stdin') throw Object.assign(new Error('fd is not readable'), { code: 'EBADF' });\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_seek(fd, offset, whence, newPtr) {\n        const entry = this._entry(fd, 'file');\n        const base = whence === WHENCE.SET ? 0 : whence === WHENCE.CUR ? entry.pos : whence === WHENCE.END ? entry.data.length : -1;\n        if (base < 0) return ERRNO.INVAL;\n        const position = base + Number(offset);\n        if (position < 0) return ERRNO.INVAL;\n        entry.pos = position;\n        this._view().setBigUint64(newPtr, BigInt(position), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pread(fd, iovs, iovsLen, offset, readPtr) {\n        const entry = this._entry(fd, 'file');\n        const total = this._readInto(entry, iovs, iovsLen, Number(offset));\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pwrite(fd, iovs, iovsLen, offset, writtenPtr) {\n        const entry = this._entry(fd, 'file');\n        const data = this._gather(iovs, iovsLen);\n        this._writeAt(entry, data, Number(offset));\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_set_size(fd, size) {\n        const entry = this._entry(fd, 'file');\n        const length = Number(size);\n        const resized = Buffer.alloc(length);\n        entry.data.copy(resized, 0, 0, Math.min(length, entry.data.length));\n        entry.data = resized;\n        entry.dirty = true;\n        return ERRNO.SUCCESS;\n      },\n      fd_allocate(fd, offset, length) {\n        const entry = this._entry(fd, 'file');\n        const end = Number(offset) + Number(length);\n        if (end > entry.data.length) {\n          const grown = Buffer.alloc(end);\n          entry.data.copy(grown, 0);\n          entry.data = grown;\n          entry.dirty = true;\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_advise() { return ERRNO.SUCCESS; },\n      fd_renumber(from, to) {\n        const entry = this._entry(from);\n        if (from < 3 || to < 0) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n        if (this._fds.has(to)) this._flush(this._fds.get(to));\n        this._fds.delete(from);\n        this._fds.set(to, entry);\n        return ERRNO.SUCCESS;\n      },\n      fd_tell(fd, outPtr) {\n        this._view().setBigUint64(outPtr, BigInt(this._entry(fd, 'file').pos), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_close(fd) {\n        if (fd < 3) throw Object.assign(new Error('standard streams stay open'), { code: 'EBADF' });\n        const entry = this._entry(fd);\n        this._flush(entry);\n        this._fds.delete(fd);\n        return ERRNO.SUCCESS;\n      },\n      fd_sync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_datasync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        const type = entry.kind === 'dir' ? FILETYPE.DIRECTORY : entry.kind === 'file' ? FILETYPE.REGULAR_FILE : FILETYPE.UNKNOWN;\n        const view = this._view();\n        view.setUint8(statPtr, type);\n        view.setUint16(statPtr + 2, 0, true);\n        view.setBigUint64(statPtr + 8, ALL_RIGHTS, true);\n        view.setBigUint64(statPtr + 16, ALL_RIGHTS, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_set_flags() { return ERRNO.SUCCESS; },\n      fd_filestat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        if (entry.kind === 'file') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.REGULAR_FILE, entry.data.length, st.mtimeMs);\n        } else if (entry.kind === 'dir') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.DIRECTORY, 0, st.mtimeMs);\n        } else {\n          this._writeFilestat(statPtr, FILETYPE.UNKNOWN, 0, Date.now());\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_get(fd, ptr) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._view().setUint8(ptr, 0);\n        this._view().setUint32(ptr + 4, Buffer.byteLength(entry.preopen), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_dir_name(fd, pathPtr, pathLen) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._bytes(pathPtr, pathLen).set(Buffer.from(entry.preopen).subarray(0, pathLen));\n        return ERRNO.SUCCESS;\n      },\n      fd_readdir(fd, bufPtr, bufLen, cookie, usedPtr) {\n        const entry = this._entry(fd, 'dir');\n        const names = fs.readdirSync(entry.host);\n        let used = 0;\n        for (let index = Number(cookie); index < names.length; index++) {\n          const name = Buffer.from(names[index]);\n          const child = fs.statSync(nodePath.join(entry.host, names[index]));\n          const header = Buffer.alloc(24);\n          header.writeBigUInt64LE(BigInt(index + 1), 0);\n          header.writeBigUInt64LE(0n, 8);\n          header.writeUInt32LE(name.length, 16);\n          header.writeUInt8(child.isDirectory() ? FILETYPE.DIRECTORY : FILETYPE.REGULAR_FILE, 20);\n          const record = Buffer.concat([header, name]);\n          const room = Math.max(0, Number(bufLen) - used);\n          this._bytes(bufPtr + used, Math.min(room, record.length)).set(record.subarray(0, Math.min(room, record.length)));\n          used += Math.min(room, record.length);\n          if (room < record.length) break;\n        }\n        this._view().setUint32(usedPtr, used, true);\n        return ERRNO.SUCCESS;\n      },\n      path_open(dirfd, dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, fdflags, fdPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const exists = fs.existsSync(host);\n        if (exists && (oflags & OFLAGS.EXCL)) throw Object.assign(new Error('file exists'), { code: 'EEXIST' });\n        if (!exists) {\n          if (!(oflags & OFLAGS.CREAT)) throw Object.assign(new Error('no such file'), { code: 'ENOENT' });\n          fs.writeFileSync(host, '');\n        }\n        const st = fs.statSync(host);\n        let fd;\n        if (st.isDirectory()) {\n          fd = this._allocFd({ kind: 'dir', host });\n        } else {\n          if (oflags & OFLAGS.DIRECTORY) throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });\n          const truncate = (oflags & OFLAGS.TRUNC) !== 0;\n          const data = truncate ? Buffer.alloc(0) : Buffer.from(fs.readFileSync(host));\n          fd = this._allocFd({ kind: 'file', host, data, pos: 0, dirty: truncate });\n        }\n        this._view().setUint32(fdPtr, fd, true);\n        return ERRNO.SUCCESS;\n      },\n      path_filestat_get(dirfd, flags, pathPtr, pathLen, statPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const st = fs.statSync(host);\n        this._writeFilestat(statPtr, st.isDirectory() ? FILETYPE.DIRECTORY : FILETYPE.REGULAR_FILE, st.size, st.mtimeMs);\n        return ERRNO.SUCCESS;\n      },\n      path_create_directory(dirfd, pathPtr, pathLen) {\n        fs.mkdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_remove_directory(dirfd, pathPtr, pathLen) {\n        fs.rmdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_unlink_file(dirfd, pathPtr, pathLen) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        if (fs.statSync(host).isDirectory()) throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        fs.unlinkSync(host);\n        return ERRNO.SUCCESS;\n      },\n      path_rename(oldDirfd, oldPtr, oldLen, newDirfd, newPtr, newLen) {\n        fs.renameSync(this._resolve(oldDirfd, this._text(oldPtr, oldLen)), this._resolve(newDirfd, this._text(newPtr, newLen)));\n        return ERRNO.SUCCESS;\n      },\n    };\n    const imports = {};\n    for (const [name, fn] of Object.entries(calls)) imports[name] = guard(fn).bind(this);\n    for (const name of UNSUPPORTED) imports[name] = () => ERRNO.NOSYS;\n    return imports;\n  }\n\n  _writeStrings(items, listPtr, bufPtr) {\n    let offset = bufPtr;\n    items.forEach((item, index) => {\n      this._view().setUint32(listPtr + index * 4, offset, true);\n      const encoded = Buffer.from(item + '\\0');\n      this._bytes(offset, encoded.length).set(encoded);\n      offset += encoded.length;\n    });\n    return ERRNO.SUCCESS;\n  }\n}\n\nmodule.exports = { WASI, WASIExit, ERRNO };\n";
+const NODE_WASI_SOURCE = "'use strict';\n// Beownir WASI host: the WASI class from Node's `wasi` module (preview1), implemented on the\n// runtime's own file system. Every system call is plain JavaScript, so each one can be tested.\n// Calls that have no meaning in the browser return ENOSYS, and the program sees that errno.\nconst { Buffer } = require('buffer');\nconst process = require('process');\nconst fs = require('fs');\nconst nodePath = require('path');\nconst crypto = require('crypto');\n\nconst ERRNO = { SUCCESS: 0, BADF: 8, EXIST: 20, INVAL: 28, IO: 29, ISDIR: 31, NOENT: 44, NOSYS: 52, NOTDIR: 54, NOTEMPTY: 55, NOTCAPABLE: 76 };\nconst FILETYPE = { UNKNOWN: 0, DIRECTORY: 3, REGULAR_FILE: 4 };\nconst OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 };\nconst WHENCE = { SET: 0, CUR: 1, END: 2 };\nconst ALL_RIGHTS = (1n << 64n) - 1n;\nconst ERRNO_BY_CODE = { ENOENT: ERRNO.NOENT, EEXIST: ERRNO.EXIST, EISDIR: ERRNO.ISDIR, ENOTDIR: ERRNO.NOTDIR, ENOTEMPTY: ERRNO.NOTEMPTY, EBADF: ERRNO.BADF, EINVAL: ERRNO.INVAL, ENOTCAPABLE: ERRNO.NOTCAPABLE };\nconst UNSUPPORTED = ['fd_filestat_set_times', 'path_link', 'path_readlink', 'path_symlink', 'path_filestat_set_times', 'proc_raise', 'sock_accept', 'sock_recv', 'sock_send', 'sock_shutdown', 'fd_readdir_cookie'];\n\n// Errors have the same codes and messages as Node's WASI class, so code that handles them works unchanged.\nfunction nodeError(code, message) {\n  const error = new TypeError(message);\n  error.code = code;\n  return error;\n}\nfunction describe(value) {\n  if (value === undefined) return 'undefined';\n  if (value === null) return 'null';\n  return typeof value === 'string' ? `'${value}'` : String(value);\n}\nfunction invalidType(name, type, value) {\n  return nodeError('ERR_INVALID_ARG_TYPE', `The \"${name}\" property must be of type ${type}. Received ${describe(value)}`);\n}\n\n// Thrown by proc_exit. start() turns it into an exit code instead of unwinding the host.\nclass WASIExit extends Error {\n  constructor(code) { super('WASI process exited with code ' + code); this.name = 'WASIExit'; this.code = code; }\n}\n\nfunction errnoFor(error) {\n  if (error instanceof WASIExit) throw error;\n  return ERRNO_BY_CODE[error && error.code] || ERRNO.IO;\n}\n\nclass WASI {\n  constructor(options) {\n    if (options === undefined || options === null || typeof options !== 'object') {\n      throw nodeError('ERR_INVALID_ARG_TYPE', `The \"options\" argument must be of type object. Received ${describe(options)}`);\n    }\n    if (typeof options.version !== 'string') throw invalidType('options.version', 'string', options.version);\n    if (options.version !== 'preview1' && options.version !== 'unstable') {\n      throw nodeError('ERR_INVALID_ARG_VALUE', `The property 'options.version' unsupported WASI version. Received '${options.version}'`);\n    }\n    this._moduleName = options.version === 'unstable' ? 'wasi_unstable' : 'wasi_snapshot_preview1';\n    this._args = (options.args || []).map(String);\n    this._env = Object.entries(options.env || {}).map(([key, value]) => key + '=' + value);\n    this._stdout = typeof options.stdout === 'function' ? options.stdout : null;\n    this._stderr = typeof options.stderr === 'function' ? options.stderr : null;\n    this._memory = typeof WebAssembly !== 'undefined' && options.memory instanceof WebAssembly.Memory ? options.memory : null;\n    this._fds = new Map([\n      [0, { kind: 'stdin' }],\n      [1, { kind: 'stdout' }],\n      [2, { kind: 'stderr' }],\n    ]);\n    this._nextFd = 3;\n    for (const [guest, host] of Object.entries(options.preopens || {})) {\n      this._fds.set(this._nextFd++, { kind: 'dir', host: nodePath.resolve(host), preopen: guest });\n    }\n    this._imports = this._buildImports();\n    this.wasiImport = this._imports;\n  }\n\n  getImportObject() {\n    return { [this._moduleName]: this._imports };\n  }\n\n  // Runs a command module: calls _start and returns its exit code. Node requires _start here.\n  start(instance) {\n    this._memory = this._checkInstance(instance);\n    if (typeof instance.exports._start !== 'function') throw invalidType('instance.exports._start', 'function', instance.exports._start);\n    if (instance.exports._initialize !== undefined) throw invalidType('instance.exports._initialize', 'undefined', instance.exports._initialize);\n    try {\n      instance.exports._start();\n      return 0;\n    } catch (error) {\n      if (error instanceof WASIExit) return error.code;\n      throw error;\n    }\n  }\n\n  // Prepares a reactor module: calls _initialize if it exists. Node forbids _start here.\n  initialize(instance) {\n    this._memory = this._checkInstance(instance);\n    if (instance.exports._start !== undefined) throw invalidType('instance.exports._start', 'undefined', instance.exports._start);\n    if (typeof instance.exports._initialize === 'function') instance.exports._initialize();\n  }\n\n  // Execute one WASI command module as a child of the current runtime. This is\n  // an in-runtime WebAssembly task, not an operating-system process. The new\n  // WASI instance has independent descriptors and returns proc_exit to parent.\n  static async runChild(source, options = {}) {\n    if (!(source instanceof WebAssembly.Module) && !(source instanceof ArrayBuffer) && !ArrayBuffer.isView(source)) {\n      throw invalidType('source', 'WebAssembly.Module, ArrayBuffer, or typed array', source);\n    }\n    const maxOutputBytes = options.maxOutputBytes === undefined ? 1024 * 1024 : Number(options.maxOutputBytes);\n    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0 || maxOutputBytes > 32 * 1024 * 1024) {\n      throw nodeError('ERR_OUT_OF_RANGE', 'maxOutputBytes must be between 0 and 33554432');\n    }\n    const output = { stdout: [], stderr: [], bytes: 0, truncated: false };\n    const capture = stream => text => {\n      const value = String(text);\n      const bytes = Buffer.from(value);\n      const room = Math.max(0, maxOutputBytes - output.bytes);\n      const kept = bytes.subarray(0, room);\n      if (kept.length) output[stream].push(kept.toString('utf8'));\n      output.bytes += kept.length;\n      if (kept.length < bytes.length) output.truncated = true;\n    };\n    const wasi = new WASI({...options, stdout:capture('stdout'), stderr:capture('stderr')});\n    const module = source instanceof WebAssembly.Module ? source : await WebAssembly.compile(source);\n    const instance = await WebAssembly.instantiate(module, wasi.getImportObject());\n    const status = wasi.start(instance);\n    return {status, stdout:output.stdout.join(''), stderr:output.stderr.join(''), outputLimitExceeded:output.truncated};\n  }\n\n  _checkInstance(instance) {\n    const exports = instance && instance.exports;\n    if (typeof exports !== 'object' || exports === null) throw invalidType('instance.exports', 'object', exports);\n    if (exports.memory instanceof WebAssembly.Memory) return exports.memory;\n    if (this._memory instanceof WebAssembly.Memory) return this._memory;\n    throw nodeError('ERR_INVALID_ARG_TYPE', `\"instance.exports.memory\" property must be a WebAssembly.Memory object. Received ${describe(exports.memory)}`);\n  }\n\n  // Memory is read through the buffer each time, because a memory that grows replaces its buffer.\n  _bytes(ptr, len) { return new Uint8Array(this._memory.buffer, ptr, len); }\n  _view() { return new DataView(this._memory.buffer); }\n  _text(ptr, len) {\n    const view = this._bytes(ptr, len);\n    return new TextDecoder().decode(typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer ? view.slice() : view);\n  }\n\n  _entry(fd, kind) {\n    const entry = this._fds.get(fd);\n    if (!entry) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n    if (kind && entry.kind !== kind) throw Object.assign(new Error('wrong kind of fd'), { code: entry.kind === 'dir' ? 'EISDIR' : 'EBADF' });\n    return entry;\n  }\n\n  // Path calls read the disk, so every open file with unsaved changes is written first.\n  _flushAll() {\n    for (const entry of this._fds.values()) this._flush(entry);\n  }\n\n  _resolve(dirfd, relative) {\n    this._flushAll();\n    const dir = this._entry(dirfd, 'dir');\n    const host = nodePath.resolve(dir.host, relative);\n    const prefix = dir.host.endsWith('/') ? dir.host : dir.host + '/';\n    if (host !== dir.host && !host.startsWith(prefix)) throw Object.assign(new Error('path escapes the preopened directory'), { code: 'ENOTCAPABLE' });\n    return host;\n  }\n\n  // Reads from entry.data at `position` into the iovecs. Returns the byte count.\n  _readInto(entry, iovs, iovsLen, position) {\n    let total = 0, at = position;\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      const count = Math.max(0, Math.min(len, entry.data.length - at));\n      this._bytes(ptr, count).set(entry.data.subarray(at, at + count));\n      at += count;\n      total += count;\n      if (count < len) break;\n    }\n    return total;\n  }\n\n  // Gathers the iovecs into one buffer.\n  _gather(iovs, iovsLen) {\n    const chunks = [];\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      chunks.push(Buffer.from(this._bytes(ptr, len)));\n    }\n    return Buffer.concat(chunks);\n  }\n\n  // Writes data into a file's buffer at `position`, growing the file with zeros if needed.\n  _writeAt(entry, data, position) {\n    const end = position + data.length;\n    const grown = Buffer.alloc(Math.max(entry.data.length, end));\n    entry.data.copy(grown, 0);\n    data.copy(grown, position);\n    entry.data = grown;\n    entry.dirty = true;\n  }\n\n  _allocFd(entry) {\n    const fd = this._nextFd++;\n    this._fds.set(fd, entry);\n    return fd;\n  }\n\n  _flush(entry) {\n    if (entry.kind === 'file' && entry.dirty) {\n      fs.writeFileSync(entry.host, entry.data);\n      entry.dirty = false;\n    }\n  }\n\n  _writeFilestat(ptr, type, size, mtimeMs) {\n    const view = this._view();\n    view.setBigUint64(ptr, 0n, true);\n    view.setBigUint64(ptr + 8, 0n, true);\n    view.setUint8(ptr + 16, type);\n    view.setBigUint64(ptr + 24, 1n, true);\n    view.setBigUint64(ptr + 32, BigInt(size), true);\n    const time = BigInt(Math.round(mtimeMs)) * 1000000n;\n    view.setBigUint64(ptr + 40, time, true);\n    view.setBigUint64(ptr + 48, time, true);\n    view.setBigUint64(ptr + 56, time, true);\n  }\n\n  _buildImports() {\n    const self = this;\n    const guard = fn => function (...args) {\n      try { return fn.apply(self, args); } catch (error) { return errnoFor(error); }\n    };\n    const calls = {\n      args_sizes_get(countPtr, sizePtr) {\n        const size = this._args.reduce((total, arg) => total + Buffer.byteLength(arg) + 1, 0);\n        this._view().setUint32(countPtr, this._args.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      args_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._args, argvPtr, bufPtr);\n      },\n      environ_sizes_get(countPtr, sizePtr) {\n        const size = this._env.reduce((total, item) => total + Buffer.byteLength(item) + 1, 0);\n        this._view().setUint32(countPtr, this._env.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      environ_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._env, argvPtr, bufPtr);\n      },\n      clock_res_get(id, outPtr) {\n        this._view().setBigUint64(outPtr, 1000000n, true);\n        return ERRNO.SUCCESS;\n      },\n      clock_time_get(id, precision, outPtr) {\n        this._view().setBigUint64(outPtr, BigInt(Date.now()) * 1000000n, true);\n        return ERRNO.SUCCESS;\n      },\n      random_get(ptr, len) {\n        this._bytes(ptr, len).set(crypto.randomBytes(len));\n        return ERRNO.SUCCESS;\n      },\n      sched_yield() { return ERRNO.SUCCESS; },\n      poll_oneoff(inPtr, outPtr, nsubscriptions, neventsPtr) {\n        const count = Number(nsubscriptions);\n        if (!Number.isInteger(count) || count <= 0) return ERRNO.INVAL;\n        const view = this._view();\n        const ready = [];\n        const clocks = [];\n        const nowMs = Date.now();\n        for (let i = 0; i < count; i++) {\n          const base = inPtr + i * 48;\n          const userdata = view.getBigUint64(base, true);\n          const type = view.getUint8(base + 8);\n          if (type === 0) {\n            const timeoutNs = view.getBigUint64(base + 24, true);\n            const flags = view.getUint16(base + 40, true);\n            const delayMs = (flags & 1) ? Math.max(0, Number(timeoutNs) / 1e6 - nowMs) : Math.max(0, Number(timeoutNs) / 1e6);\n            clocks.push({ userdata, type, delayMs });\n          } else if (type === 1 || type === 2) {\n            const fd = view.getInt32(base + 16, true);\n            const entry = this._fds.get(fd);\n            if (!entry) {\n              ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n });\n            } else if (type === 1) {\n              if (entry.kind === 'file') {\n                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(Math.max(0, entry.data.length - entry.pos)) });\n              } else if (entry.kind === 'stdin') {\n                if (count === 1) ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 0n });\n              } else {\n                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n });\n              }\n            } else {\n              if (entry.kind === 'file' || entry.kind === 'stdout' || entry.kind === 'stderr') {\n                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 65536n });\n              } else {\n                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n });\n              }\n            }\n          } else {\n            return ERRNO.INVAL;\n          }\n        }\n        if (!ready.length && clocks.length) {\n          let minDelay = Infinity;\n          for (const c of clocks) if (c.delayMs < minDelay) minDelay = c.delayMs;\n          const waitMs = Math.max(0, Math.min(30000, Math.ceil(minDelay)));\n          if (waitMs > 0) {\n            let slept = false;\n            if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {\n              try {\n                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);\n                slept = true;\n              } catch {}\n            }\n            if (!slept) {\n              const until = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + waitMs;\n              while ((typeof performance !== 'undefined' ? performance.now() : Date.now()) < until) {}\n            }\n          }\n          for (const c of clocks) {\n            if (c.delayMs <= minDelay + 1) ready.push({ userdata: c.userdata, type: 0, error: ERRNO.SUCCESS, nbytes: 0n });\n          }\n        }\n        const outView = this._view();\n        for (let i = 0; i < ready.length; i++) {\n          const ev = ready[i];\n          const ptr = outPtr + i * 32;\n          this._bytes(ptr, 32).fill(0);\n          outView.setBigUint64(ptr, ev.userdata, true);\n          outView.setUint16(ptr + 8, ev.error, true);\n          outView.setUint8(ptr + 10, ev.type);\n          if (ev.type === 1 || ev.type === 2) outView.setBigUint64(ptr + 16, ev.nbytes, true);\n        }\n        outView.setUint32(neventsPtr, ready.length, true);\n        return ERRNO.SUCCESS;\n      },\n      proc_exit(code) { throw new WASIExit(code); },\n      fd_write(fd, iovs, iovsLen, writtenPtr) {\n        const entry = this._entry(fd);\n        const data = this._gather(iovs, iovsLen);\n        if (entry.kind === 'stdout') (this._stdout || (text => process.stdout.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'stderr') (this._stderr || (text => process.stderr.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'file') {\n          this._writeAt(entry, data, entry.pos);\n          entry.pos += data.length;\n        } else throw Object.assign(new Error('fd is not writable'), { code: entry.kind === 'dir' ? 'EISDIR' : 'EBADF' });\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_read(fd, iovs, iovsLen, readPtr) {\n        const entry = this._entry(fd);\n        let total = 0;\n        if (entry.kind === 'file') {\n          total = this._readInto(entry, iovs, iovsLen, entry.pos);\n          entry.pos += total;\n        } else if (entry.kind === 'dir') throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        else if (entry.kind !== 'stdin') throw Object.assign(new Error('fd is not readable'), { code: 'EBADF' });\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_seek(fd, offset, whence, newPtr) {\n        const entry = this._entry(fd, 'file');\n        const base = whence === WHENCE.SET ? 0 : whence === WHENCE.CUR ? entry.pos : whence === WHENCE.END ? entry.data.length : -1;\n        if (base < 0) return ERRNO.INVAL;\n        const position = base + Number(offset);\n        if (position < 0) return ERRNO.INVAL;\n        entry.pos = position;\n        this._view().setBigUint64(newPtr, BigInt(position), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pread(fd, iovs, iovsLen, offset, readPtr) {\n        const entry = this._entry(fd, 'file');\n        const total = this._readInto(entry, iovs, iovsLen, Number(offset));\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pwrite(fd, iovs, iovsLen, offset, writtenPtr) {\n        const entry = this._entry(fd, 'file');\n        const data = this._gather(iovs, iovsLen);\n        this._writeAt(entry, data, Number(offset));\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_set_size(fd, size) {\n        const entry = this._entry(fd, 'file');\n        const length = Number(size);\n        const resized = Buffer.alloc(length);\n        entry.data.copy(resized, 0, 0, Math.min(length, entry.data.length));\n        entry.data = resized;\n        entry.dirty = true;\n        return ERRNO.SUCCESS;\n      },\n      fd_allocate(fd, offset, length) {\n        const entry = this._entry(fd, 'file');\n        const end = Number(offset) + Number(length);\n        if (end > entry.data.length) {\n          const grown = Buffer.alloc(end);\n          entry.data.copy(grown, 0);\n          entry.data = grown;\n          entry.dirty = true;\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_advise() { return ERRNO.SUCCESS; },\n      fd_renumber(from, to) {\n        const entry = this._entry(from);\n        if (from < 3 || to < 0) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n        if (this._fds.has(to)) this._flush(this._fds.get(to));\n        this._fds.delete(from);\n        this._fds.set(to, entry);\n        return ERRNO.SUCCESS;\n      },\n      fd_tell(fd, outPtr) {\n        this._view().setBigUint64(outPtr, BigInt(this._entry(fd, 'file').pos), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_close(fd) {\n        if (fd < 3) throw Object.assign(new Error('standard streams stay open'), { code: 'EBADF' });\n        const entry = this._entry(fd);\n        this._flush(entry);\n        this._fds.delete(fd);\n        return ERRNO.SUCCESS;\n      },\n      fd_sync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_datasync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        const type = entry.kind === 'dir' ? FILETYPE.DIRECTORY : entry.kind === 'file' ? FILETYPE.REGULAR_FILE : FILETYPE.UNKNOWN;\n        const view = this._view();\n        view.setUint8(statPtr, type);\n        view.setUint16(statPtr + 2, 0, true);\n        view.setBigUint64(statPtr + 8, ALL_RIGHTS, true);\n        view.setBigUint64(statPtr + 16, ALL_RIGHTS, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_set_flags() { return ERRNO.SUCCESS; },\n      fd_filestat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        if (entry.kind === 'file') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.REGULAR_FILE, entry.data.length, st.mtimeMs);\n        } else if (entry.kind === 'dir') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.DIRECTORY, 0, st.mtimeMs);\n        } else {\n          this._writeFilestat(statPtr, FILETYPE.UNKNOWN, 0, Date.now());\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_get(fd, ptr) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._view().setUint8(ptr, 0);\n        this._view().setUint32(ptr + 4, Buffer.byteLength(entry.preopen), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_dir_name(fd, pathPtr, pathLen) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._bytes(pathPtr, pathLen).set(Buffer.from(entry.preopen).subarray(0, pathLen));\n        return ERRNO.SUCCESS;\n      },\n      fd_readdir(fd, bufPtr, bufLen, cookie, usedPtr) {\n        const entry = this._entry(fd, 'dir');\n        const names = fs.readdirSync(entry.host);\n        let used = 0;\n        for (let index = Number(cookie); index < names.length; index++) {\n          const name = Buffer.from(names[index]);\n          const child = fs.statSync(nodePath.join(entry.host, names[index]));\n          const header = Buffer.alloc(24);\n          header.writeBigUInt64LE(BigInt(index + 1), 0);\n          header.writeBigUInt64LE(0n, 8);\n          header.writeUInt32LE(name.length, 16);\n          header.writeUInt8(child.isDirectory() ? FILETYPE.DIRECTORY : FILETYPE.REGULAR_FILE, 20);\n          const record = Buffer.concat([header, name]);\n          const room = Math.max(0, Number(bufLen) - used);\n          this._bytes(bufPtr + used, Math.min(room, record.length)).set(record.subarray(0, Math.min(room, record.length)));\n          used += Math.min(room, record.length);\n          if (room < record.length) break;\n        }\n        this._view().setUint32(usedPtr, used, true);\n        return ERRNO.SUCCESS;\n      },\n      path_open(dirfd, dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, fdflags, fdPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const exists = fs.existsSync(host);\n        if (exists && (oflags & OFLAGS.EXCL)) throw Object.assign(new Error('file exists'), { code: 'EEXIST' });\n        if (!exists) {\n          if (!(oflags & OFLAGS.CREAT)) throw Object.assign(new Error('no such file'), { code: 'ENOENT' });\n          fs.writeFileSync(host, '');\n        }\n        const st = fs.statSync(host);\n        let fd;\n        if (st.isDirectory()) {\n          fd = this._allocFd({ kind: 'dir', host });\n        } else {\n          if (oflags & OFLAGS.DIRECTORY) throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });\n          const truncate = (oflags & OFLAGS.TRUNC) !== 0;\n          const data = truncate ? Buffer.alloc(0) : Buffer.from(fs.readFileSync(host));\n          fd = this._allocFd({ kind: 'file', host, data, pos: 0, dirty: truncate });\n        }\n        this._view().setUint32(fdPtr, fd, true);\n        return ERRNO.SUCCESS;\n      },\n      path_filestat_get(dirfd, flags, pathPtr, pathLen, statPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const st = fs.statSync(host);\n        this._writeFilestat(statPtr, st.isDirectory() ? FILETYPE.DIRECTORY : FILETYPE.REGULAR_FILE, st.size, st.mtimeMs);\n        return ERRNO.SUCCESS;\n      },\n      path_create_directory(dirfd, pathPtr, pathLen) {\n        fs.mkdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_remove_directory(dirfd, pathPtr, pathLen) {\n        fs.rmdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_unlink_file(dirfd, pathPtr, pathLen) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        if (fs.statSync(host).isDirectory()) throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        fs.unlinkSync(host);\n        return ERRNO.SUCCESS;\n      },\n      path_rename(oldDirfd, oldPtr, oldLen, newDirfd, newPtr, newLen) {\n        fs.renameSync(this._resolve(oldDirfd, this._text(oldPtr, oldLen)), this._resolve(newDirfd, this._text(newPtr, newLen)));\n        return ERRNO.SUCCESS;\n      },\n    };\n    const imports = {};\n    for (const [name, fn] of Object.entries(calls)) imports[name] = guard(fn).bind(this);\n    for (const name of UNSUPPORTED) imports[name] = () => ERRNO.NOSYS;\n    return imports;\n  }\n\n  _writeStrings(items, listPtr, bufPtr) {\n    let offset = bufPtr;\n    items.forEach((item, index) => {\n      this._view().setUint32(listPtr + index * 4, offset, true);\n      const encoded = Buffer.from(item + '\\0');\n      this._bytes(offset, encoded.length).set(encoded);\n      offset += encoded.length;\n    });\n    return ERRNO.SUCCESS;\n  }\n}\n\nmodule.exports = { WASI, WASIExit, ERRNO };\n";
 /* END generated: wasi */
 // The path module is Node 22's own lib/path.js (see the node-path region), so path.posix and
 // path.win32 behave exactly like Node's. Internal helpers below keep the fast virtual-FS paths.
@@ -212,7 +217,7 @@ class Buffer extends Uint8Array {
     if(e==='base64'||e==='base64url'){let bin='';for(let i=0;i<sub.length;i+=0x8000)bin+=String.fromCharCode(...sub.subarray(i,Math.min(i+0x8000,sub.length)));let x=btoa(bin);return e==='base64url'?x.split('+').join('-').split('/').join('_').replace(/=+$/,''):x;}
     if(e==='ascii'||e==='latin1'||e==='binary')return [...sub].map(x=>String.fromCharCode(e==='ascii'?x&127:x)).join('');
     if(['ucs2','ucs-2','utf16le','utf-16le'].includes(e)){let out='';for(let i=0;i+1<sub.length;i+=2)out+=String.fromCharCode(sub[i]|sub[i+1]<<8);return out;}
-    return td.decode(sub);
+    return decodeBytes(sub);
   }
   copy(target,targetStart=0,sourceStart=0,sourceEnd=this.length){
     const view=ArrayBuffer.isView(target)?new Uint8Array(target.buffer,target.byteOffset,target.byteLength):Buffer.from(target);
@@ -795,7 +800,8 @@ const STREAMMOD = Object.assign(Stream, STREAM, {default:Stream});
 
 /* ---------- fs ---------- */
 const dirty = new Set(),fsWatchers=new Set(),fsWatchFile=new Map(),FS_FDS=new Map();let nextFd=3;
-function mark(p){dirty.add(p);if(!holdSync&&!syncTimer)syncTimer=runtimeNativeSetTimeout(()=>{syncTimer=null;syncBack();},150);notifyFilesystem(p);}
+let nodeModulesDirtyVersion = 0, nodeModulesSyncedVersion = -1, cachedDepsArchive = null, cachedDepsVersion = -1;
+function mark(p){dirty.add(p);if(p==='/project/node_modules'||p.startsWith('/project/node_modules/'))nodeModulesDirtyVersion++;if(!holdSync&&!syncTimer)syncTimer=runtimeNativeSetTimeout(()=>{syncTimer=null;syncBack();},150);notifyFilesystem(p);}
 function notifyFilesystem(p){for(const w of fsWatchers){const rel=p===w.path?'.':p.startsWith(w.path==='/'?'/':w.path+'/')?p.slice(w.path.length+1):null;if(rel!==null&&(rel==='.'||!rel.includes('/')||w.recursive)){const name=rel==='.'?basename(p):rel;queueMicrotask(()=>{if(!w.closed){w.emit('change',w.type==='rename'?'rename':'change',name);w.callback&&w.callback(w.type==='rename'?'rename':'change',name);}});}}for(const [file,watchers] of fsWatchFile){if(file===p){let curr;try{curr=statOf(file);}catch(e){curr={size:0,mtimeMs:0};}for(const x of watchers){const prev=x.prev;x.prev=curr;queueMicrotask(()=>x.listener(curr,prev));}}}
 }
 function openSync(p,flags='r'){p=resolve(p);const f=typeof flags==='number'?flags:null;const text=typeof flags==='string'?flags:'';const isCreate=f!==null?!!(f&64):(text.includes('w')||text.includes('a'));const isExcl=f!==null?!!(f&128):text.includes('x');const isTrunc=f!==null?!!(f&512):text.includes('w');const isAppend=f!==null?!!(f&1024):text.includes('a');const isWrite=f!==null?!!(f&(1|2)):(text.includes('w')||text.includes('a')||text.includes('+'));if(FS[p]&&isCreate&&isExcl)throw fsError('EEXIST','open',p);if(!FS[p]&&!isCreate)throw fsError('ENOENT','open',p);if(FS[p]?.d){if(isWrite||isTrunc)throw fsError('EISDIR','open',p);}else{if(f!==null&&(f&65536))throw fsError('ENOTDIR','open',p);if(!FS[p]||isTrunc)writeFileSync(p,'');}const fd=nextFd++;FS_FDS.set(fd,{path:p,pos:(!FS[p]?.d&&isAppend)?readFileSync(p).length:0,flags:f!==null?f:text,dir:!!FS[p]?.d});return fd;}
@@ -1102,11 +1108,34 @@ const processObj = {
  * silently kept the raw value, so `process.env.FLAG === 'true'` and
  * `Number(process.env.PORT)` style checks disagreed with Node. */
 const envStore = Object.assign(Object.create(null), { NODE_ENV: 'development', HOME: '/', PATH: '/usr/bin', PWD: CWD });
+let shareEnvActive = false, applyingRemoteShareEnv = false;
 const envProxy = new Proxy(envStore, {
   get(target, key) { return typeof key === 'symbol' ? undefined : (Object.prototype.hasOwnProperty.call(target, key) ? target[key] : undefined); },
-  set(target, key, value) { if (typeof key === 'symbol') return false; target[key] = String(value); return true; },
-  defineProperty(target, key, descriptor) { if (typeof key === 'symbol') return false; target[key] = String(descriptor.value); return true; },
-  deleteProperty(target, key) { delete target[key]; return true; },
+  set(target, key, value) {
+    if (typeof key === 'symbol') return false;
+    const str = String(value);
+    target[key] = str;
+    if (shareEnvActive && !applyingRemoteShareEnv && kernelInfo && kernelInfo.threads) {
+      post({ type: 'thread-share-env', key: String(key), value: str, deleted: false });
+    }
+    return true;
+  },
+  defineProperty(target, key, descriptor) {
+    if (typeof key === 'symbol') return false;
+    const str = String(descriptor.value);
+    target[key] = str;
+    if (shareEnvActive && !applyingRemoteShareEnv && kernelInfo && kernelInfo.threads) {
+      post({ type: 'thread-share-env', key: String(key), value: str, deleted: false });
+    }
+    return true;
+  },
+  deleteProperty(target, key) {
+    delete target[key];
+    if (typeof key === 'string' && shareEnvActive && !applyingRemoteShareEnv && kernelInfo && kernelInfo.threads) {
+      post({ type: 'thread-share-env', key, deleted: true });
+    }
+    return true;
+  },
   has(target, key) { return Object.prototype.hasOwnProperty.call(target, String(key)); },
   getOwnPropertyDescriptor(target, key) {
     const descriptor = Object.getOwnPropertyDescriptor(target, key);
@@ -1927,7 +1956,13 @@ function assertionMatches(err,expected){
   if(!expected)return true;
   if(typeof expected==='string')return String(err&&err.message).includes(expected);
   if(expected instanceof RegExp)return expected.test(String(err&&err.message));
-  if(typeof expected==='function')return err instanceof expected;
+  if(typeof expected==='function'){
+    if(expected.prototype!==undefined){
+      if(err instanceof expected)return true;
+      if(expected===Error||expected.prototype instanceof Error||/^\s*class\b/.test(String(expected)))return false;
+    }
+    return Boolean(expected(err));
+  }
   if(typeof expected==='object')return Object.keys(expected).every(k=>k==='message'?assertionMatches(err,expected[k]):deepSame(err&&err[k],expected[k],true));
   return false;
 }
@@ -2049,92 +2084,825 @@ const TLS={connect:()=>{const s=new NetSocket();queueMicrotask(()=>s.emit('error
 const CHILD_PROCESS = {};
 function shellQuote(value){return "'"+String(value).split("'").join("'\\''")+"'";}
 
-/* worker_threads.Worker, virtualized in-process. The runtime is one JS thread,
- * so real parallel workers are impossible; but the common fork pattern
- * (SvelteKit's postbuild analyse/adapt) only needs a fresh module evaluation
- * plus message passing with the parent, and that can run on the same thread:
- * module load is queued behind a promise chain, parentPort is swapped around
- * it, and postMessage hops through a macrotask so neither side re-enters the
- * other synchronously. Workers that genuinely need parallel memory
- * (rolldown's WASI thread pool coordinating through SharedArrayBuffer) remain
- * out of reach and fail with their own clear error. */
+/* worker_threads subsystem:
+ * - When kernelInfo.threads is true (cross-origin isolated virtual OS), Worker
+ *   spawns a real sibling Web Worker owned by frame-kernel.js with parallel
+ *   SharedArrayBuffer memory, Atomics.wait/notify, SPSC+MessagePort channels,
+ *   BroadcastChannel, shared EnvironmentData, and postMessageToThread.
+ * - When kernelInfo.threads is false (degraded HTTP or Node VM tests),
+ *   VirtualNodeWorker runs an isolated module scope in the same worker with
+ *   eval/URL/stdio/online/exit/terminate/MessageChannel/receiveMessageOnPort
+ *   parity, while SharedArrayBuffer remains unavailable or single-threaded.
+ */
 let __virtualWorkerSeq = 0;
 let __virtualWorkerBusy = false;
 const __virtualWorkerQueue = [];
-class VirtualNodeWorker {
-  constructor(filename, options = {}) {
-    this._handlers = {};
-    this.onmessage = null;
-    this.threadId = ++__virtualWorkerSeq;
-    this._loaded = false;
-    const task = async () => {
-      let file = String(filename);
-      if (file.startsWith('file://')) { try { file = decodeURIComponent(new URL(file).pathname); } catch { file = file.slice('file://'.length); } }
-      const worker = this;
-      const port = {
-        _handlers: {},
-        on(type, fn) { if (type === 'message') (this._handlers.message = this._handlers.message || []).push(fn); return this; },
-        once(type, fn) { const wrapped = data => { fn(data); this.off('message', wrapped); }; return this.on('message', wrapped); },
-        off(type, fn) { const list = this._handlers[type] || []; const at = list.indexOf(fn); if (at >= 0) list.splice(at, 1); return this; },
-        addEventListener(type, fn) { return this.on(type, fn); },
-        removeEventListener(type, fn) { return this.off(type, fn); },
-        /* child -> parent */
-        postMessage(data) { setTimeout(() => worker._emit('message', data), 0); },
-        close() {}, ref() {}, unref() {},
-      };
-      this._port = port;
-      const savedParentPort = CORE.worker_threads.parentPort;
-      const savedWorkerData = CORE.worker_threads.workerData;
-      const savedThreadId = CORE.worker_threads.threadId;
-      CORE.worker_threads.parentPort = port;
-      CORE.worker_threads.workerData = options && Object.prototype.hasOwnProperty.call(options, 'workerData') ? options.workerData : null;
-      CORE.worker_threads.threadId = worker.threadId;
-      const savedChildCache = CHILD_MODULE_CACHE;
-      CHILD_MODULE_CACHE = Object.create(null);
-      const envBackup = {};
-      try {
-        for (const [key, value] of Object.entries((options && options.env) || {})) { envBackup[key] = processObj.env[key]; processObj.env[key] = String(value); }
-        await importEsmAsync(file, '/project/index.js');
-      } catch (error) {
-        CHILD_MODULE_CACHE = savedChildCache;
-        CORE.worker_threads.parentPort = savedParentPort;
-        CORE.worker_threads.workerData = savedWorkerData;
-        CORE.worker_threads.threadId = savedThreadId;
-        for (const [key, value] of Object.entries(envBackup)) { if (value === undefined) delete processObj.env[key]; else processObj.env[key] = value; }
-        setTimeout(() => { worker._emit('error', error); worker._emit('exit', 1); }, 0);
+const KERNEL_THREADS = new Map();
+const VIRTUAL_THREADS = new Map();
+const ACTIVE_MESSAGE_PORTS = new Set();
+const ENV_DATA = new Map();
+const UNCLONEABLE_OBJECTS = new WeakSet();
+const UNTRANSFERABLE_OBJECTS = new WeakSet();
+const DEFAULT_RESOURCE_LIMITS = Object.freeze({ maxYoungGenerationSizeMb: -1, maxOldGenerationSizeMb: -1, codeRangeSizeMb: -1, stackSizeMb: 4 });
+const SHARE_ENV_SYMBOL = Symbol.for('nodejs.worker_threads.SHARE_ENV');
+
+function dataCloneError(message) {
+  const err = typeof DOMException === 'function'
+    ? new DOMException(String(message || 'Object could not be cloned.'), 'DataCloneError')
+    : Object.assign(new Error(String(message || 'Object could not be cloned.')), { name: 'DataCloneError' });
+  try { if (err.code === undefined) err.code = 25; } catch {}
+  return err;
+}
+function activeWorkerThreads() {
+  return (CHILD_MODULE_CACHE && CHILD_MODULE_CACHE.__beownirWorkerThreads) || CORE.worker_threads;
+}
+
+/* SPSC SharedArrayBuffer circular ring ([0]=writePos, [1]=readPos, [2]=nextSeq, [3]=consumedSeq). */
+const SAB_RING_HDR = 32;
+function createSabRing(byteLength = 65536) {
+  if (typeof SharedArrayBuffer !== 'function') return null;
+  const sab = new SharedArrayBuffer(byteLength);
+  return sab;
+}
+function ringCanJson(value, seen) {
+  if (value === null || value === undefined) return true;
+  const t = typeof value;
+  if (t === 'boolean' || t === 'string') return true;
+  if (t === 'number') return Number.isFinite(value) && !Object.is(value, -0);
+  if (t !== 'object') return false;
+  if (seen.has(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  if (Array.isArray(value)) {
+    seen.add(value);
+    for (let i = 0; i < value.length; i++) {
+      if (!(i in value) || value[i] === undefined || !ringCanJson(value[i], seen)) return false;
+    }
+    seen.delete(value);
+    return true;
+  }
+  if (proto !== Object.prototype && proto !== null) return false;
+  seen.add(value);
+  for (const key of Object.keys(value)) {
+    if (value[key] === undefined || !ringCanJson(value[key], seen)) return false;
+  }
+  seen.delete(value);
+  return true;
+}
+function ringEncode(value) {
+  if (value === undefined) return new Uint8Array([0]);
+  if (!ringCanJson(value, new Set())) return null;
+  let json;
+  try { json = JSON.stringify(value); } catch { return null; }
+  if (typeof json !== 'string') return null;
+  const encoded = te.encode(json);
+  const out = new Uint8Array(1 + encoded.length);
+  out[0] = 1;
+  out.set(encoded, 1);
+  return out;
+}
+function ringDecode(bytes) {
+  if (!bytes || !bytes.length) return undefined;
+  if (bytes[0] === 0) return undefined;
+  return JSON.parse(decodeBytes(bytes.subarray(1)));
+}
+function ringWriteBytes(u8, cap, pos, src) {
+  const start = (pos >>> 0) % cap;
+  const first = Math.min(src.length, cap - start);
+  u8.set(src.subarray(0, first), SAB_RING_HDR + start);
+  if (first < src.length) u8.set(src.subarray(first), SAB_RING_HDR);
+}
+function ringReadBytes(u8, cap, pos, len) {
+  const out = new Uint8Array(len);
+  const start = (pos >>> 0) % cap;
+  const first = Math.min(len, cap - start);
+  out.set(u8.subarray(SAB_RING_HDR + start, SAB_RING_HDR + start + first), 0);
+  if (first < len) out.set(u8.subarray(SAB_RING_HDR, SAB_RING_HDR + (len - first)), first);
+  return out;
+}
+function ringTryPush(sab, value) {
+  if (!sab) return 0;
+  const payload = ringEncode(value);
+  if (!payload) return 0;
+  const i32 = new Int32Array(sab, 0, 8), u8 = new Uint8Array(sab), cap = sab.byteLength - SAB_RING_HDR;
+  const recLen = 8 + payload.length;
+  const w = Atomics.load(i32, 0), r = Atomics.load(i32, 1), used = (w - r) >>> 0;
+  if (recLen > cap - used) return 0;
+  let seq = ((Atomics.add(i32, 2, 1) + 1) >>> 0);
+  if (seq === 0) seq = ((Atomics.add(i32, 2, 1) + 1) >>> 0) || 1;
+  const hdr = new Uint8Array(8), dv = new DataView(hdr.buffer);
+  dv.setUint32(0, payload.length, true);
+  dv.setUint32(4, seq, true);
+  ringWriteBytes(u8, cap, w, hdr);
+  ringWriteBytes(u8, cap, (w + 8) | 0, payload);
+  Atomics.store(i32, 0, (w + recLen) | 0);
+  Atomics.notify(i32, 0);
+  return seq;
+}
+function ringTryPop(sab) {
+  if (!sab) return null;
+  const i32 = new Int32Array(sab, 0, 8), u8 = new Uint8Array(sab), cap = sab.byteLength - SAB_RING_HDR;
+  while (((Atomics.load(i32, 0) - Atomics.load(i32, 1)) >>> 0) >= 8) {
+    const r = Atomics.load(i32, 1);
+    const used = (Atomics.load(i32, 0) - r) >>> 0;
+    const hdr = ringReadBytes(u8, cap, r, 8), dv = new DataView(hdr.buffer);
+    const len = dv.getUint32(0, true), seq = dv.getUint32(4, true), recLen = 8 + len;
+    if (used < recLen) return null;
+    const payload = ringReadBytes(u8, cap, (r + 8) | 0, len);
+    Atomics.store(i32, 1, (r + recLen) | 0);
+    const consumed = Atomics.load(i32, 3) >>> 0;
+    if (seq <= consumed) continue;
+    Atomics.store(i32, 3, seq | 0);
+    return { message: ringDecode(payload) };
+  }
+  return null;
+}
+function ringAckSeq(sab, seq) {
+  if (!sab) return true;
+  const i32 = new Int32Array(sab, 0, 8), u8 = new Uint8Array(sab), cap = sab.byteLength - SAB_RING_HDR;
+  const target = seq >>> 0, consumed = Atomics.load(i32, 3) >>> 0;
+  if (target <= consumed) return false;
+  Atomics.store(i32, 3, target | 0);
+  while (((Atomics.load(i32, 0) - Atomics.load(i32, 1)) >>> 0) >= 8) {
+    const r = Atomics.load(i32, 1);
+    const used = (Atomics.load(i32, 0) - r) >>> 0;
+    const hdr = ringReadBytes(u8, cap, r, 8), dv = new DataView(hdr.buffer);
+    const len = dv.getUint32(0, true), recSeq = dv.getUint32(4, true), recLen = 8 + len;
+    if (used < recLen || recSeq > target) break;
+    Atomics.store(i32, 1, (r + recLen) | 0);
+  }
+  return true;
+}
+
+const cloneTagOf = value => Object.prototype.toString.call(value);
+const isCloneMap = value => value instanceof Map || cloneTagOf(value) === '[object Map]';
+const isCloneSet = value => value instanceof Set || cloneTagOf(value) === '[object Set]';
+const isCloneDate = value => value instanceof Date || cloneTagOf(value) === '[object Date]';
+const isCloneRegExp = value => value instanceof RegExp || cloneTagOf(value) === '[object RegExp]';
+const isCloneArrayBuffer = value => value instanceof ArrayBuffer || cloneTagOf(value) === '[object ArrayBuffer]';
+const isCloneError = value => value instanceof Error || cloneTagOf(value) === '[object Error]';
+const isCloneMessagePort = value => typeof MessagePort !== 'undefined' && (value instanceof MessagePort || cloneTagOf(value) === '[object MessagePort]');
+
+function validateCloneAndCollectPorts(value, allowedPorts, seen, portWrappers) {
+  if (value === null || value === undefined) return;
+  const t = typeof value;
+  if (t === 'boolean' || t === 'number' || t === 'string' || t === 'bigint') return;
+  if (t === 'function' || t === 'symbol') throw dataCloneError((t === 'function' ? String(value) : 'Symbol') + ' could not be cloned.');
+  if (UNCLONEABLE_OBJECTS.has(value)) throw dataCloneError('Object marked as uncloneable could not be cloned.');
+  if (value instanceof NodeMessagePort) {
+    if (!allowedPorts.has(value)) throw dataCloneError('MessagePort in payload could not be cloned unless transferred.');
+    portWrappers.add(value);
+    return;
+  }
+  if (isCloneMessagePort(value)) {
+    if (!allowedPorts.has(value)) throw dataCloneError('MessagePort could not be cloned.');
+    return;
+  }
+  if (isSharedBuffer(value) || isCloneArrayBuffer(value) || ArrayBuffer.isView(value) || isCloneDate(value) || isCloneRegExp(value)) return;
+  if (seen.has(value)) return;
+  seen.add(value);
+  if (isCloneMap(value)) { for (const [k, v] of value.entries()) { validateCloneAndCollectPorts(k, allowedPorts, seen, portWrappers); validateCloneAndCollectPorts(v, allowedPorts, seen, portWrappers); } return; }
+  if (isCloneSet(value)) { for (const v of value.values()) validateCloneAndCollectPorts(v, allowedPorts, seen, portWrappers); return; }
+  if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) if (i in value) validateCloneAndCollectPorts(value[i], allowedPorts, seen, portWrappers); return; }
+  if (isCloneError(value)) {
+    if (value.cause !== undefined) validateCloneAndCollectPorts(value.cause, allowedPorts, seen, portWrappers);
+    return;
+  }
+  for (const key of Object.keys(value)) validateCloneAndCollectPorts(value[key], allowedPorts, seen, portWrappers);
+}
+function replaceNodePortsForPost(value, seen, map) {
+  if (value === null || typeof value !== 'object') return value;
+  if (value instanceof NodeMessagePort) return { __beownirPort: true, native: value._native, txSab: value._txSab, rxSab: value._rxSab };
+  if (isSharedBuffer(value) || isCloneArrayBuffer(value) || ArrayBuffer.isView(value) || isCloneDate(value) || isCloneRegExp(value) || isCloneError(value) || isCloneMessagePort(value)) return value;
+  if (map.has(value)) return map.get(value);
+  if (isCloneMap(value)) {
+    const out = new Map(); map.set(value, out);
+    for (const [k, v] of value.entries()) out.set(replaceNodePortsForPost(k, seen, map), replaceNodePortsForPost(v, seen, map));
+    return out;
+  }
+  if (isCloneSet(value)) {
+    const out = new Set(); map.set(value, out);
+    for (const v of value.values()) out.add(replaceNodePortsForPost(v, seen, map));
+    return out;
+  }
+  if (Array.isArray(value)) {
+    const out = new Array(value.length); map.set(value, out);
+    for (let i = 0; i < value.length; i++) if (i in value) out[i] = replaceNodePortsForPost(value[i], seen, map);
+    return out;
+  }
+  const out = {}; map.set(value, out);
+  for (const key of Object.keys(value)) out[key] = replaceNodePortsForPost(value[key], seen, map);
+  return out;
+}
+function reviveNodePortsFromPost(value, map = new WeakMap()) {
+  if (value === null || typeof value !== 'object') return value;
+  if (value.__beownirPort === true) {
+    return new NodeMessagePort(value.native || null, { txSab: value.txSab || null, rxSab: value.rxSab || null });
+  }
+  if (isSharedBuffer(value) || ArrayBuffer.isView(value) || isCloneMessagePort(value)) return value;
+  if (isCloneArrayBuffer(value)) return value instanceof ArrayBuffer ? value : value.slice(0);
+  if (isCloneDate(value)) return value instanceof Date ? value : new Date(value.getTime());
+  if (isCloneRegExp(value)) return value instanceof RegExp ? value : new RegExp(value.source, value.flags);
+  if (isCloneError(value)) return value;
+  if (map.has(value)) return map.get(value);
+  if (isCloneMap(value)) {
+    const out = new Map(); map.set(value, out);
+    for (const [k, v] of value.entries()) out.set(reviveNodePortsFromPost(k, map), reviveNodePortsFromPost(v, map));
+    return out;
+  }
+  if (isCloneSet(value)) {
+    const out = new Set(); map.set(value, out);
+    for (const v of value.values()) out.add(reviveNodePortsFromPost(v, map));
+    return out;
+  }
+  if (Array.isArray(value)) {
+    const out = new Array(value.length); map.set(value, out);
+    for (let i = 0; i < value.length; i++) if (i in value) out[i] = reviveNodePortsFromPost(value[i], map);
+    return out;
+  }
+  const out = {}; map.set(value, out);
+  for (const key of Object.keys(value)) out[key] = reviveNodePortsFromPost(value[key], map);
+  return out;
+}
+function prepareTransferPayload(value, transferList) {
+  const allowedPorts = new Set();
+  const nativeTransfers = [];
+  const pushTransfer = obj => { if (obj && nativeTransfers.indexOf(obj) < 0) nativeTransfers.push(obj); };
+  if (transferList !== undefined && transferList !== null) {
+    if (typeof transferList !== 'object' || typeof transferList[Symbol.iterator] !== 'function') {
+      throw Object.assign(new TypeError('transferList must be an array or iterable'), { code: 'ERR_INVALID_ARG_TYPE' });
+    }
+    for (const item of transferList) {
+      if (!item || typeof item !== 'object') throw dataCloneError('Found invalid value in transferList');
+      if (UNTRANSFERABLE_OBJECTS.has(item)) throw dataCloneError('Cannot transfer object marked as untransferable');
+      if (isSharedBuffer(item)) throw dataCloneError('Found invalid value in transferList');
+      if (item instanceof NodeMessagePort) {
+        if (item._transferred || item._closed) throw dataCloneError('MessagePort is already neutered or closed');
+        allowedPorts.add(item);
+        pushTransfer(item._native);
+      } else if (item instanceof ArrayBuffer || (typeof MessagePort !== 'undefined' && item instanceof MessagePort) || (typeof ImageBitmap !== 'undefined' && item instanceof ImageBitmap)) {
+        if (typeof MessagePort !== 'undefined' && item instanceof MessagePort) allowedPorts.add(item);
+        pushTransfer(item);
+      } else {
+        throw dataCloneError('Found invalid value in transferList');
+      }
+    }
+  }
+  const portWrappers = new Set();
+  validateCloneAndCollectPorts(value, allowedPorts, new Set(), portWrappers);
+  for (const port of allowedPorts) {
+    if (port instanceof NodeMessagePort) {
+      port._transferred = true;
+      port._closed = true;
+      port._queue.length = 0;
+      ACTIVE_MESSAGE_PORTS.delete(port);
+      if (port._native) port._native.onmessage = null;
+    }
+  }
+  const encodedValue = portWrappers.size ? replaceNodePortsForPost(value, new Set(), new Map()) : value;
+  return { value: encodedValue, nativeTransfers, hasPorts: portWrappers.size > 0 };
+}
+function cloneSameRealmValue(value, transferList, map = new WeakMap()) {
+  const allowedPorts = new Set();
+  if (transferList !== undefined && transferList !== null) {
+    if (typeof transferList !== 'object' || typeof transferList[Symbol.iterator] !== 'function') {
+      throw Object.assign(new TypeError('transferList must be an array or iterable'), { code: 'ERR_INVALID_ARG_TYPE' });
+    }
+    for (const item of transferList) {
+      if (!item || typeof item !== 'object' || UNTRANSFERABLE_OBJECTS.has(item) || isSharedBuffer(item)) throw dataCloneError('Found invalid value in transferList');
+      if (item instanceof NodeMessagePort) allowedPorts.add(item);
+      else if (!isCloneArrayBuffer(item)) throw dataCloneError('Found invalid value in transferList');
+    }
+  }
+  validateCloneAndCollectPorts(value, allowedPorts, new Set(), new Set());
+  const clone = v => {
+    if (v === null || typeof v !== 'object') return v;
+    if (isSharedBuffer(v) || v instanceof NodeMessagePort) return v;
+    if (isCloneArrayBuffer(v)) return v.slice(0);
+    if (ArrayBuffer.isView(v)) {
+      if (isSharedBuffer(v.buffer)) return new v.constructor(v.buffer, v.byteOffset, v.length || Math.floor(v.byteLength / (v.BYTES_PER_ELEMENT || 1)));
+      const copy = new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice();
+      return v.constructor === Uint8Array ? copy : new v.constructor(copy.buffer);
+    }
+    if (isCloneDate(v)) return new Date(v.getTime());
+    if (isCloneRegExp(v)) return new RegExp(v.source, v.flags);
+    if (isCloneError(v)) { const e = new (typeof v.constructor === 'function' ? v.constructor : Error)(v.message); e.name = v.name; if (v.code !== undefined) e.code = v.code; return e; }
+    if (map.has(v)) return map.get(v);
+    if (isCloneMap(v)) { const o = new Map(); map.set(v, o); for (const [k, x] of v.entries()) o.set(clone(k), clone(x)); return o; }
+    if (isCloneSet(v)) { const o = new Set(); map.set(v, o); for (const x of v.values()) o.add(clone(x)); return o; }
+    if (Array.isArray(v)) { const o = new Array(v.length); map.set(v, o); for (let i = 0; i < v.length; i++) if (i in v) o[i] = clone(v[i]); return o; }
+    const o = {}; map.set(v, o);
+    for (const k of Object.keys(v)) o[k] = clone(v[k]);
+    return o;
+  };
+  return clone(value);
+}
+
+class NodeMessagePort extends EventEmitter {
+  constructor(nativePort = null, opts = {}) {
+    super();
+    this._native = nativePort || null;
+    this._txSab = opts.txSab || null;
+    this._rxSab = opts.rxSab || null;
+    this._peer = null;
+    this._queue = [];
+    this._started = false;
+    this._closed = false;
+    this._transferred = false;
+    this._referenced = true;
+    this._localSeq = 0;
+    this._flushScheduled = false;
+    this._onmessage = null;
+    if (this._native) {
+      this._native.onmessage = ev => this._onNativeMessage(ev?.data);
+      this._native.onmessageerror = () => {};
+    }
+  }
+  on(n, f) {
+    super.on(n, f);
+    if (n === 'message') this.start();
+    return this;
+  }
+  prependListener(n, f) {
+    super.prependListener(n, f);
+    if (n === 'message') this.start();
+    return this;
+  }
+  off(n, f) {
+    super.off(n, f);
+    if (n === 'message') kernelMaybeIdle();
+    return this;
+  }
+  removeAllListeners(n) {
+    super.removeAllListeners(n);
+    if (n === undefined || n === 'message') kernelMaybeIdle();
+    return this;
+  }
+  get onmessage() { return this._onmessage; }
+  set onmessage(fn) {
+    this._onmessage = typeof fn === 'function' ? fn : null;
+    if (this._onmessage) this.start();
+  }
+  _onNativeMessage(raw) {
+    if (this._closed || this._transferred) return;
+    let data = raw;
+    if (raw && typeof raw === 'object' && Object.prototype.hasOwnProperty.call(raw, '__beownirSeq')) {
+      if (this._rxSab && !ringAckSeq(this._rxSab, raw.__beownirSeq)) return;
+      data = raw.payload;
+    } else if (raw && typeof raw === 'object' && Object.prototype.hasOwnProperty.call(raw, '__beownirRaw')) {
+      data = raw.payload;
+    }
+    const revived = reviveNodePortsFromPost(data);
+    if (!this._started) {
+      this._queue.push({ data: revived, fromNative: true });
+      return;
+    }
+    this._deliver(revived);
+  }
+  _deliver(value) {
+    if (this._closed) return;
+    if (typeof this._onmessage === 'function') {
+      try { this._onmessage({ data: value, target: this }); } catch (e) { kernelUnhandled(e); }
+    }
+    try { this.emit('message', value); } catch (e) { kernelUnhandled(e); }
+  }
+  _scheduleFlush() {
+    if (this._flushScheduled || !this._started || this._closed) return;
+    this._flushScheduled = true;
+    queueMicrotask(() => {
+      this._flushScheduled = false;
+      while (this._started && !this._closed && this._queue.length) {
+        const item = this._queue.shift();
+        if (item.seq && this._rxSab && !ringAckSeq(this._rxSab, item.seq)) continue;
+        this._deliver(item.data);
+      }
+    });
+  }
+  start() {
+    if (this._closed || this._started) return;
+    this._started = true;
+    ACTIVE_MESSAGE_PORTS.add(this);
+    if (this._native && typeof this._native.start === 'function') { try { this._native.start(); } catch {} }
+    if (this._queue.length) this._scheduleFlush();
+  }
+  postMessage(value, transferList) {
+    if (this._closed || this._transferred) return;
+    if (this._native) {
+      const prepared = prepareTransferPayload(value, transferList);
+      if (this._peer && !this._peer._closed && !this._peer._transferred && !prepared.hasPorts && !prepared.nativeTransfers.length) {
+        const cloned = cloneSameRealmValue(value, transferList);
+        this._peer._queue.push({ data: cloned, local: true });
+        if (this._peer._started) this._peer._scheduleFlush();
         return;
       }
-      CORE.worker_threads.parentPort = savedParentPort;
-      CORE.worker_threads.workerData = savedWorkerData;
-      CORE.worker_threads.threadId = savedThreadId;
+      let seq = 0;
+      if (!prepared.hasPorts && !prepared.nativeTransfers.length && this._txSab) {
+        seq = ringTryPush(this._txSab, value);
+      }
+      if (seq > 0) this._native.postMessage({ __beownirSeq: seq, payload: prepared.value }, prepared.nativeTransfers);
+      else this._native.postMessage({ __beownirRaw: true, payload: prepared.value }, prepared.nativeTransfers);
+      return;
+    }
+    if (!this._peer || this._peer._closed || this._peer._transferred) return;
+    const cloned = cloneSameRealmValue(value, transferList);
+    this._peer._queue.push({ data: cloned, local: true });
+    if (this._peer._started) this._peer._scheduleFlush();
+  }
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._queue.length = 0;
+    ACTIVE_MESSAGE_PORTS.delete(this);
+    if (this._native && typeof this._native.close === 'function') { try { this._native.close(); } catch {} }
+    if (!this._transferred) queueMicrotask(() => { try { this.emit('close'); } catch {} kernelMaybeIdle(); });
+  }
+  ref() { this._referenced = true; return this; }
+  unref() { this._referenced = false; kernelMaybeIdle(); return this; }
+  hasRef() { return this._referenced && !this._closed; }
+  addEventListener(type, fn) { return this.on(type, ev => fn(type === 'message' ? { data: ev } : ev)); }
+  removeEventListener(type, fn) { return this.off(type, fn); }
+}
+
+class NodeMessageChannel {
+  constructor() {
+    const sabAtoB = createSabRing(65536);
+    const sabBtoA = createSabRing(65536);
+    if (typeof globalThis.MessageChannel === 'function') {
+      const mc = new globalThis.MessageChannel();
+      this.port1 = new NodeMessagePort(mc.port1, { txSab: sabAtoB, rxSab: sabBtoA });
+      this.port2 = new NodeMessagePort(mc.port2, { txSab: sabBtoA, rxSab: sabAtoB });
+    } else {
+      this.port1 = new NodeMessagePort(null, { txSab: sabAtoB, rxSab: sabBtoA });
+      this.port2 = new NodeMessagePort(null, { txSab: sabBtoA, rxSab: sabAtoB });
+    }
+    this.port1._peer = this.port2;
+    this.port2._peer = this.port1;
+  }
+}
+
+function receiveMessageOnPort(port) {
+  if (!port || typeof port !== 'object') return undefined;
+  if (port instanceof NodeMessagePort) {
+    if (port._closed || port._transferred) return undefined;
+    if (port._queue.length) {
+      const item = port._queue.shift();
+      if (item.seq && port._rxSab) ringAckSeq(port._rxSab, item.seq);
+      return { message: item.data };
+    }
+    if (port._rxSab) {
+      const popped = ringTryPop(port._rxSab);
+      if (popped) return popped;
+    }
+    return undefined;
+  }
+  if (Array.isArray(port._queue) && port._queue.length) return { message: port._queue.shift() };
+  return undefined;
+}
+
+function getEnvironmentData(key) { return ENV_DATA.get(key); }
+function setEnvironmentData(key, value) {
+  if (value === undefined) ENV_DATA.delete(key);
+  else ENV_DATA.set(key, value);
+  if (kernelInfo && kernelInfo.threads) {
+    post({ type: 'thread-env', key, value: value === undefined ? undefined : value, deleted: value === undefined });
+  }
+}
+
+function normalizeWorkerFilename(filename, options = {}) {
+  const isEval = Boolean(options && options.eval);
+  if (isEval) {
+    if (typeof filename !== 'string') throw Object.assign(new TypeError('The "filename" argument must be of type string when options.eval is true'), { code: 'ERR_INVALID_ARG_TYPE' });
+    return { isEval: true, spec: filename, rawSpec: filename };
+  }
+  if (typeof URL === 'function' && filename instanceof URL) {
+    if (filename.protocol !== 'file:') throw Object.assign(new TypeError('The URL must be of scheme file'), { code: 'ERR_INVALID_URL_SCHEME' });
+    const decoded = decodeURIComponent(filename.pathname);
+    return { isEval: false, spec: decoded, rawSpec: decoded };
+  }
+  if (typeof filename !== 'string') {
+    throw Object.assign(new TypeError('The "filename" argument must be of type string or an instance of URL'), { code: 'ERR_INVALID_ARG_TYPE' });
+  }
+  let spec = filename;
+  if (spec.startsWith('file://')) {
+    try { spec = decodeURIComponent(new URL(spec).pathname); }
+    catch { spec = decodeURIComponent(spec.slice('file://'.length)); }
+  }
+  return { isEval: false, spec, rawSpec: filename };
+}
+function mergeResourceLimits(limits) {
+  const out = { ...DEFAULT_RESOURCE_LIMITS };
+  if (limits && typeof limits === 'object') {
+    for (const k of ['maxYoungGenerationSizeMb', 'maxOldGenerationSizeMb', 'codeRangeSizeMb', 'stackSizeMb']) {
+      if (typeof limits[k] === 'number' && Number.isFinite(limits[k])) out[k] = limits[k];
+    }
+  }
+  return out;
+}
+
+class KernelThreadWorker extends EventEmitter {
+  constructor(filename, options = {}) {
+    super();
+    const norm = normalizeWorkerFilename(filename, options);
+    const hasData = options && Object.prototype.hasOwnProperty.call(options, 'workerData');
+    const prepared = prepareTransferPayload(hasData ? options.workerData : null, options?.transferList);
+    const ctrlI32 = kernelInfo.ctrlSab ? new Int32Array(kernelInfo.ctrlSab, 0, 8) : null;
+    this.threadId = ctrlI32 ? (Atomics.add(ctrlI32, 0, 1) + 1) : ((kernelInfo.pid || 1) * 1000 + (++__virtualWorkerSeq));
+    this.resourceLimits = mergeResourceLimits(options?.resourceLimits);
+    this.stdout = options?.stdout ? new Readable() : null;
+    this.stderr = options?.stderr ? new Readable() : null;
+    this.stdin = options?.stdin ? new Writable({ write: (_c, _e, d) => d?.() }) : null;
+    this.onmessage = null;
+    this._referenced = true;
+    this._exited = false;
+    this._exitCode = null;
+    this._flushed = false;
+    this._exitPending = null;
+    this._exitFlushTimer = null;
+    this._terminateWaiters = [];
+    const ch = new NodeMessageChannel();
+    this._port = ch.port1;
+    ch.port2._transferred = true;
+    ch.port2._closed = true;
+    ACTIVE_MESSAGE_PORTS.delete(ch.port2);
+    if (ch.port2._native) ch.port2._native.onmessage = null;
+    this._port.start();
+    this._port.on('message', msg => {
+      if (msg && typeof msg === 'object' && msg.__beownirThreadFlush === true) {
+        this._flushed = true;
+        this._completePendingExit();
+        return;
+      }
+      if (typeof this.onmessage === 'function') { try { this.onmessage({ data: msg }); } catch (e) { kernelUnhandled(e); } }
+      this.emit('message', msg);
+    });
+    const shareEnv = options?.env === SHARE_ENV_SYMBOL;
+    if (shareEnv) shareEnvActive = true;
+    const rawEnv = shareEnv ? processObj.env : (options?.env && typeof options.env === 'object' ? options.env : processObj.env);
+    const env = Object.create(null);
+    for (const [k, v] of Object.entries(rawEnv)) if (v !== undefined) env[k] = String(v);
+    syncBack();
+    let depsBuf;
+    if (FS['/project/node_modules'] && nodeModulesSyncedVersion !== nodeModulesDirtyVersion) {
+      const packed = packDependenciesCached();
+      if (packed) {
+        depsBuf = packed.buffer.slice(packed.byteOffset, packed.byteOffset + packed.byteLength);
+        nodeModulesSyncedVersion = nodeModulesDirtyVersion;
+      }
+    }
+    KERNEL_THREADS.set(this.threadId, this);
+    const transfer = [ch.port2._native, ...prepared.nativeTransfers];
+    if (depsBuf) transfer.push(depsBuf);
+    self.postMessage({
+      type: 'thread-spawn',
+      threadId: this.threadId,
+      cwd: CWD,
+      filename: norm.isEval ? norm.spec : resolve(norm.spec),
+      isEval: norm.isEval,
+      workerData: prepared.value,
+      transferredPorts: prepared.nativeTransfers,
+      port: ch.port2._native,
+      mailboxes: { toWorker: ch.port1._txSab, toMain: ch.port1._rxSab },
+      env,
+      shareEnv,
+      name: options?.name ? String(options.name) : '',
+      stdoutPipe: !!options?.stdout,
+      stderrPipe: !!options?.stderr,
+      resourceLimits: this.resourceLimits,
+      execArgv: Array.isArray(options?.execArgv) ? options.execArgv.map(String) : [],
+      argv: Array.isArray(options?.argv) ? options.argv.map(String) : [],
+      prepared: [...preparedModules],
+      deps: depsBuf,
+    }, transfer.filter(Boolean));
+  }
+  _handleKernelEvent(message) {
+    if (message.event === 'online') { this.emit('online'); return; }
+    if (message.event === 'stdout') { this.stdout?.push(typeof message.data === 'string' ? Buffer.from(message.data) : Buffer.from(message.data)); return; }
+    if (message.event === 'stderr') { this.stderr?.push(typeof message.data === 'string' ? Buffer.from(message.data) : Buffer.from(message.data)); return; }
+    if (message.event === 'error') {
+      const e = virtualError(message.error?.code || 'ERR_WORKER', message.error?.message || 'Worker error');
+      if (message.error?.name) e.name = message.error.name;
+      this.emit('error', e);
+      return;
+    }
+    if (message.event === 'exit') {
+      if (this._exited) return;
+      this._exitPending = { code: Number(message.code) || 0, error: message.error || null };
+      if (this._flushed || message.error || this._terminating) { this._completePendingExit(); return; }
+      this._exitFlushTimer = runtimeNativeSetTimeout(() => this._completePendingExit(), 25);
+    }
+  }
+  _completePendingExit() {
+    if (this._exited || !this._exitPending) return;
+    runtimeNativeClearTimeout(this._exitFlushTimer);
+    const { code, error } = this._exitPending;
+    this._exited = true;
+    this._exitCode = code;
+    KERNEL_THREADS.delete(this.threadId);
+    this.stdout?.push(null);
+    this.stderr?.push(null);
+    this._port.close();
+    if (error) {
+      const err = virtualError(error.code || 'ERR_WORKER', error.message || 'Worker exited with error');
+      if (error.name) err.name = error.name;
+      try { this.emit('error', err); } catch (e) { kernelUnhandled(e); }
+    }
+    this.emit('exit', code);
+    const waiters = this._terminateWaiters.splice(0);
+    for (const resolve of waiters) resolve(code);
+    kernelMaybeIdle();
+  }
+  postMessage(value, transferList) {
+    if (this._exited) return;
+    this._port.postMessage(value, transferList);
+  }
+  terminate() {
+    if (this._exited) return Promise.resolve(this._exitCode ?? 0);
+    this._terminating = true;
+    return new Promise(resolve => {
+      this._terminateWaiters.push(resolve);
+      post({ type: 'thread-terminate', threadId: this.threadId });
+    });
+  }
+  unref() { this._referenced = false; kernelMaybeIdle(); }
+  ref() { this._referenced = true; }
+  getHeapCodeStatistics() { return {}; }
+  get performance() { return { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) }; }
+}
+
+class VirtualNodeWorker extends EventEmitter {
+  constructor(filename, options = {}) {
+    super();
+    const norm = normalizeWorkerFilename(filename, options);
+    const hasData = options && Object.prototype.hasOwnProperty.call(options, 'workerData');
+    const clonedData = cloneSameRealmValue(hasData ? options.workerData : null, options?.transferList);
+    this.threadId = ++__virtualWorkerSeq;
+    this.resourceLimits = mergeResourceLimits(options?.resourceLimits);
+    this.stdout = options?.stdout ? new Readable() : null;
+    this.stderr = options?.stderr ? new Readable() : null;
+    this.stdin = options?.stdin ? new Writable({ write: (_c, _e, d) => d?.() }) : null;
+    this.onmessage = null;
+    this._loaded = false;
+    this._exited = false;
+    this._referenced = true;
+    this._exitCode = null;
+    this._terminateWaiters = [];
+    this._timers = new Set();
+    const ch = new NodeMessageChannel();
+    this._port = ch.port1;
+    const childPort = ch.port2;
+    this._port.start();
+    this._port.on('message', msg => {
+      if (typeof this.onmessage === 'function') { try { this.onmessage({ data: msg }); } catch (e) { this.emit('error', e); } }
+      this.emit('message', msg);
+    });
+    const worker = this;
+    VIRTUAL_THREADS.set(this.threadId, this);
+    const finalizeExit = code => {
+      if (worker._exited) return;
+      worker._exited = true;
+      worker._exitCode = Number(code) || 0;
+      clearTimeout(worker._settleTimer);
+      for (const timer of worker._timers) { clearTimeout(timer); clearInterval(timer); }
+      worker._timers.clear();
+      VIRTUAL_THREADS.delete(worker.threadId);
+      worker.stdout?.push(null);
+      worker.stderr?.push(null);
+      worker._port.close();
+      childPort.close();
+      worker.emit('exit', worker._exitCode);
+      for (const resolve of worker._terminateWaiters.splice(0)) resolve(worker._exitCode);
+      kernelMaybeIdle();
+    };
+    this._finalizeExit = finalizeExit;
+    const task = async () => {
+      if (worker._exited) return;
+      const childCache = Object.create(null);
+      const trackTimeout = (fn, ms, ...args) => {
+        const t = setTimeout((...a) => { worker._timers.delete(t); if (!worker._exited) fn(...a); }, ms, ...args);
+        worker._timers.add(t);
+        return t;
+      };
+      const trackInterval = (fn, ms, ...args) => {
+        const t = setInterval((...a) => { if (!worker._exited) fn(...a); }, ms, ...args);
+        worker._timers.add(t);
+        return t;
+      };
+      const clearTracked = t => { worker._timers.delete(t); clearTimeout(t); clearInterval(t); };
+      const workerThreadsScope = {
+        ...CORE.worker_threads,
+        isMainThread: false,
+        parentPort: childPort,
+        workerData: clonedData,
+        threadId: worker.threadId,
+        threadName: options?.name ? String(options.name) : '',
+        resourceLimits: worker.resourceLimits,
+      };
+      childCache.__beownirWorkerThreads = workerThreadsScope;
+      const savedChildCache = CHILD_MODULE_CACHE;
+      CHILD_MODULE_CACHE = childCache;
+      const envBackup = {};
+      const shareEnv = options?.env === SHARE_ENV_SYMBOL;
+      if (!shareEnv && options?.env && typeof options.env === 'object') {
+        for (const [k, v] of Object.entries(options.env)) { envBackup[k] = processObj.env[k]; processObj.env[k] = String(v); }
+      }
+      queueMicrotask(() => { if (!worker._exited) worker.emit('online'); });
+      try {
+        if (norm.isEval) {
+          const fn = (0, eval)('(async function(require, __filename, __dirname, setTimeout, setInterval, clearTimeout, clearInterval){' + norm.spec + '\n})');
+          await fn(makeRequire('/project/__worker_eval__.js', childCache), '/project/__worker_eval__.js', '/project', trackTimeout, trackInterval, clearTracked, clearTracked);
+        } else {
+          const resolved = resolve(CWD, norm.spec);
+          const file = tryFiles(resolved);
+          if (!file) {
+            const err = Object.assign(new Error("Cannot find module '" + resolved + "'"), { code: 'MODULE_NOT_FOUND' });
+            throw err;
+          }
+          await importEsmAsync(file, '/project/index.js', childCache);
+        }
+      } catch (error) {
+        if (error && error.__exit !== undefined && !(error instanceof Error)) {
+          CHILD_MODULE_CACHE = savedChildCache;
+          for (const [k, v] of Object.entries(envBackup)) { if (v === undefined) delete processObj.env[k]; else processObj.env[k] = v; }
+          finalizeExit(Number(error.__exit) || 0);
+          return;
+        }
+        CHILD_MODULE_CACHE = savedChildCache;
+        for (const [k, v] of Object.entries(envBackup)) { if (v === undefined) delete processObj.env[k]; else processObj.env[k] = v; }
+        setTimeout(() => { try { worker.emit('error', error); } finally { finalizeExit(1); } }, 0);
+        return;
+      }
       CHILD_MODULE_CACHE = savedChildCache;
-      for (const [key, value] of Object.entries(envBackup)) { if (value === undefined) delete processObj.env[key]; else processObj.env[key] = value; }
+      for (const [k, v] of Object.entries(envBackup)) { if (v === undefined) delete processObj.env[k]; else processObj.env[k] = v; }
       this._loaded = true;
+      // Stay alive while worker timers or childPort message listeners are active until clear/close/terminate
+      const scheduleSettle = delay => {
+        if (worker._exited) return;
+        worker._settleTimer = setTimeout(settle, delay);
+        if (!worker._referenced && typeof worker._settleTimer?.unref === 'function') worker._settleTimer.unref();
+      };
+      const settle = () => {
+        if (worker._exited) return;
+        const keepOpen = worker._timers.size > 0 || (childPort._referenced && !childPort._closed && (childPort.listenerCount('message') > 0 || typeof childPort._onmessage === 'function'));
+        if (keepOpen) { scheduleSettle(15); return; }
+        finalizeExit(0);
+      };
+      scheduleSettle(0);
     };
     __virtualWorkerQueue.push(task);
     if (!__virtualWorkerBusy) {
       __virtualWorkerBusy = true;
-      (async () => {
-        while (__virtualWorkerQueue.length) { const next = __virtualWorkerQueue.shift(); try { await next(); } catch (e) {} }
+      queueMicrotask(async () => {
+        while (__virtualWorkerQueue.length) { const next = __virtualWorkerQueue.shift(); try { await next(); } catch {} }
         __virtualWorkerBusy = false;
-      })();
+      });
     }
   }
-  _emit(type, payload) {
-    if (type === 'message' && typeof this.onmessage === 'function') { try { this.onmessage(payload); } catch (e) { this._emit('error', e); } }
-    for (const handler of this._handlers[type] || []) { try { handler(payload); } catch (e) { try { this._emit('error', e); } catch (e2) {} } }
+  postMessage(value, transferList) { if (!this._exited) this._port.postMessage(value, transferList); }
+  terminate() {
+    if (this._exited) return Promise.resolve(this._exitCode ?? 1);
+    clearTimeout(this._settleTimer);
+    return new Promise(resolve => {
+      this._terminateWaiters.push(resolve);
+      setTimeout(() => this._finalizeExit(1), 0);
+    });
   }
-  _emitPort(data) { setTimeout(() => { const handlers = this._port && this._port._handlers.message || []; for (const handler of handlers) { try { handler(data); } catch (e) { this._emit('error', e); } } }, 0); }
-  on(type, fn) { (this._handlers[type] = this._handlers[type] || []).push(fn); return this; }
-  once(type, fn) { const wrapped = payload => { fn(payload); this.off(type, wrapped); }; return this.on(type, wrapped); }
-  off(type, fn) { const list = this._handlers[type] || []; const at = list.indexOf(fn); if (at >= 0) list.splice(at, 1); return this; }
-  addEventListener(type, fn) { return this.on(type, fn); }
-  removeEventListener(type, fn) { return this.off(type, fn); }
-  /* parent -> child */
-  postMessage(data) { this._emitPort(data); }
-  terminate() { this._emit('exit', 0); }
-  unref() {} ref() {}
+  unref() {
+    this._referenced = false;
+    if (typeof this._settleTimer?.unref === 'function') this._settleTimer.unref();
+    kernelMaybeIdle();
+  }
+  ref() {
+    this._referenced = true;
+    if (typeof this._settleTimer?.ref === 'function') this._settleTimer.ref();
+  }
   getHeapCodeStatistics() { return {}; }
+  get performance() { return { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) }; }
+}
+
+function NodeWorker(filename, options = {}) {
+  if (!(this instanceof NodeWorker)) return new NodeWorker(filename, options);
+  return (kernelInfo && kernelInfo.threads)
+    ? new KernelThreadWorker(filename, options)
+    : new VirtualNodeWorker(filename, options);
+}
+NodeWorker.prototype = EventEmitter.prototype;
+
+async function postMessageToThread(threadId, value, transferList) {
+  const targetId = Number(threadId);
+  if (!Number.isInteger(targetId) || targetId < 0) {
+    throw Object.assign(new TypeError('The "threadId" argument must be an integer'), { code: 'ERR_INVALID_ARG_TYPE' });
+  }
+  const myId = activeWorkerThreads().threadId || 0;
+  if (targetId === myId) {
+    throw Object.assign(new Error('Cannot send a message to the same thread'), { code: 'ERR_WORKER_MESSAGING_SAME_THREAD' });
+  }
+  if (kernelInfo && kernelInfo.threads) {
+    const prepared = prepareTransferPayload(value, transferList);
+    return kernelCall('thread-message', { targetThreadId: targetId, value: prepared.value, transferredPorts: prepared.nativeTransfers }, prepared.nativeTransfers);
+  }
+  const cloned = cloneSameRealmValue(value, transferList);
+  const exists = targetId === 0 || VIRTUAL_THREADS.has(targetId);
+  if (!exists) throw Object.assign(new Error('Cannot send message to thread ' + targetId), { code: 'ERR_WORKER_MESSAGING_FAILED' });
+  queueMicrotask(() => { processEvents.emit('workerMessage', cloned, myId); });
 }
 
 const CORE = {
@@ -2148,7 +2916,28 @@ const CORE = {
   timers:{setTimeout,setInterval,clearTimeout,clearInterval,setImmediate:(f,...a)=>setTimeout(f,0,...a)},
   'timers/promises':{ setTimeout:(ms,v)=>new Promise(r=>setTimeout(()=>r(v),ms)) },
   child_process:CHILD_PROCESS,
-  worker_threads:{isMainThread:true,parentPort:null,workerData:null,threadId:0,Worker:VirtualNodeWorker,markAsUntransferable:()=>{},moveMessagePortToContext:()=>{throw new Error('moveMessagePortToContext is not available in the virtual runtime.');},transferListIsEmpty:()=>true,isMarkedAsUntransferable:()=>false},
+  worker_threads:{
+    isMainThread:true,
+    parentPort:null,
+    workerData:null,
+    threadId:0,
+    threadName:'',
+    resourceLimits:{},
+    SHARE_ENV:SHARE_ENV_SYMBOL,
+    Worker:NodeWorker,
+    MessageChannel:NodeMessageChannel,
+    MessagePort:NodeMessagePort,
+    receiveMessageOnPort,
+    getEnvironmentData,
+    setEnvironmentData,
+    postMessageToThread,
+    markAsUncloneable:v=>{if(v&&typeof v==='object')UNCLONEABLE_OBJECTS.add(v);},
+    isMarkedAsUncloneable:v=>Boolean(v&&typeof v==='object'&&UNCLONEABLE_OBJECTS.has(v)),
+    markAsUntransferable:v=>{if(v&&typeof v==='object')UNTRANSFERABLE_OBJECTS.add(v);},
+    isMarkedAsUntransferable:v=>Boolean(v&&typeof v==='object'&&UNTRANSFERABLE_OBJECTS.has(v)),
+    isInternalThread:()=>false,
+    moveMessagePortToContext:port=>port,
+  },
   cluster:{isMaster:true,isPrimary:true,fork:()=>{throw new Error('cluster requires native Node processes.');},on(){}},
   readline:{ createInterface:()=>{ const e=new EventEmitter(); e.question=(q,cb)=>{pendingQuestion=cb;post({type:'question',data:String(q)});}; e.close=()=>{}; e.prompt=()=>{}; return e; } },
   perf_hooks:{ performance }, v8:{ getHeapStatistics:()=>({}) }, vm:{ runInNewContext:(c,ctx)=>Function('with(this){return eval('+JSON.stringify(c)+')}').call(ctx||{}) },
@@ -2921,10 +3710,14 @@ let pendingQuestion = null;
   CORE.module.registerHooks = CORE.module.registerHooks || (() => {});
   CORE.module.register = CORE.module.register || (() => {});
 
-  // worker_threads: BroadcastChannel is a browser primitive.
-  if (typeof BroadcastChannel === 'function') CORE.worker_threads.BroadcastChannel = CORE.worker_threads.BroadcastChannel || BroadcastChannel;
+  // worker_threads: BroadcastChannel is a browser primitive wrapped with .ref()/.unref().
+  if (typeof BroadcastChannel === 'function') {
+    CORE.worker_threads.BroadcastChannel = CORE.worker_threads.BroadcastChannel || class NodeBroadcastChannel extends BroadcastChannel {
+      ref() { return this; }
+      unref() { return this; }
+    };
+  }
   CORE.worker_threads.threadName = CORE.worker_threads.threadName || '';
-  CORE.worker_threads.postMessageToThread = CORE.worker_threads.postMessageToThread || (() => { throw Object.assign(new Error('postMessageToThread needs native worker threads.'), { code: 'ERR_WORKER_NOT_RUNNING' }); });
 
   // test: assertion and snapshot helpers.
   CORE.test.assert = CORE.test.assert || CORE.assert;
@@ -3343,23 +4136,16 @@ let pendingQuestion = null;
   tls.DEFAULT_MAX_VERSION = tls.DEFAULT_MAX_VERSION || 'TLSv1.3';
 
   const workerThreads = CORE.worker_threads;
-  workerThreads.MessageChannel = workerThreads.MessageChannel || class MessageChannel {
-    constructor() {
-      const make = () => { const port = new EventEmitter(); port.postMessage = value => queueMicrotask(() => (port === this.port1 ? this.port2 : this.port1).emit('message', value)); port.start = () => {}; port.close = () => {}; port.onmessage = null; return port; };
-      this.port1 = make(); this.port2 = make();
-    }
-  };
-  workerThreads.MessagePort = workerThreads.MessagePort || class MessagePort extends EventEmitter { postMessage() {} start() {} close() {} };
-  workerThreads.isInternalThread = () => false;
-  workerThreads.markAsUncloneable = () => {};
-  workerThreads.markAsUntransferable = () => {};
   // The browser worker ships BroadcastChannel natively. Without one (older
   // sandboxes, the Node test harness) a same-realm registry keeps the documented
   // postMessage/onmessage/close/ref/unref/name contract working.
   if (workerThreads.BroadcastChannel !== undefined) {
     // already provided by the platform
   } else if (typeof globalThis.BroadcastChannel === 'function') {
-    workerThreads.BroadcastChannel = globalThis.BroadcastChannel;
+    workerThreads.BroadcastChannel = class NodeBroadcastChannel extends globalThis.BroadcastChannel {
+      ref() { return this; }
+      unref() { return this; }
+    };
   } else {
     const registry = new Map();
     workerThreads.BroadcastChannel = class BroadcastChannel extends EventEmitter {
@@ -3384,11 +4170,6 @@ let pendingQuestion = null;
       unref() { return this; }
     };
   }
-  workerThreads.isMarkedAsUncloneable = () => false;
-  workerThreads.isMarkedAsUntransferable = () => false;
-  workerThreads.getEnvironmentData = () => undefined;
-  workerThreads.setEnvironmentData = () => {};
-  workerThreads.setEnvironmentData(undefined);
 
   /* Node's cluster export *is* an EventEmitter (it has _events and friends), so
    * code that inspects or extends it keeps working. */
@@ -3515,7 +4296,7 @@ let pendingQuestion = null;
   define(bufferModule, 'kMaxLength', 0x7fffffff);
   define(bufferModule, 'kStringMaxLength', 0x1fffffe8);
   define(bufferModule, 'byteLength', (value, encoding) => Buffer.byteLength(value, encoding));
-  define(bufferModule, 'isUtf8', input => { try { new TextDecoder('utf-8', { fatal: true }).decode(input); return true; } catch { return false; } });
+  define(bufferModule, 'isUtf8', input => { try { decodeBytes(input, new TextDecoder('utf-8', { fatal: true })); return true; } catch { return false; } });
   define(bufferModule, 'isAscii', input => Buffer.from(input).every(byte => byte < 128));
   define(bufferModule, 'Blob', typeof Blob === 'function' ? Blob : undefined);
   bufferModule.constants = { MAX_LENGTH: 0x7fffffff, MAX_STRING_LENGTH: 0x1fffffe8, ...(bufferModule.constants || {}) };
@@ -4675,22 +5456,37 @@ let pendingQuestion = null;
       this._handle = handle;
     }
     get symmetricKeySize() { return this.type === 'secret' ? this._handle.length : undefined; }
-    get asymmetricKeyType() { return this.type === 'secret' ? undefined : 'rsa'; }
+    get asymmetricKeyType() { return this.type === 'secret' ? undefined : (this._handle?.keyType || 'rsa'); }
     get asymmetricKeyDetails() {
       if (this.type === 'secret') return undefined;
+      if (this._handle?.spki && !isRsaHandle(this._handle)) {
+        return this._handle.namedCurve ? { namedCurve: this._handle.namedCurve } : {};
+      }
       const modulusLength = this._handle.n.toString(2).length;
       const details = { modulusLength, publicExponent: Number(this._handle.e), hashAlgorithm: null, mgf1HashAlgorithm: null, saltLength: 0, namedCurve: undefined };
       return details;
     }
     export(options = {}) {
       if (typeof options === 'string') options = { type: options };
-      if (this.type !== 'secret') return exportRsa(this, options);
+      if (this.type !== 'secret') {
+        if (this._handle?.spki && !isRsaHandle(this._handle)) {
+          const format = options.format || 'pem';
+          if (format === 'der') return Buffer.from(this._handle.spki);
+          if (format === 'pem') {
+            const body = Buffer.from(this._handle.spki).toString('base64').replace(/(.{64})/g, '$1\n').trimEnd();
+            return '-----BEGIN PUBLIC KEY-----\n' + body + '\n-----END PUBLIC KEY-----\n';
+          }
+          throw rsaKeyError('Unsupported export format "' + format + '"', 'ERR_CRYPTO_INVALID_KEYTYPE');
+        }
+        return exportRsa(this, options);
+      }
       if (options.format === 'jwk') return { kty: 'oct', k: Buffer.from(this._handle).toString('base64url') };
       return Buffer.from(this._handle);
     }
     equals(other) {
       if (!(other instanceof KeyObject) || this.type !== other.type) return false;
       if (isRsaHandle(this._handle)) return isRsaHandle(other._handle) && this._handle.n === other._handle.n && this._handle.e === other._handle.e && (this._handle.d || 0n) === (other._handle.d || 0n);
+      if (this._handle?.spki && other._handle?.spki) return Buffer.from(this._handle.spki).equals(Buffer.from(other._handle.spki));
       return Buffer.from(this._handle).equals(Buffer.from(other._handle));
     }
     toString() { return '[KeyObject]'; }
@@ -5308,7 +6104,7 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
         for (let index = 0; index < count; index++) length = length * 256 + bytes[at++];
       }
       if (at + length > bytes.length) throw new Error('DER: truncated body');
-      return { tag, start: at, end: at + length };
+      return { tag, offset, start: at, end: at + length };
     },
     children(bytes, node) {
       const out = [];
@@ -5316,6 +6112,18 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       return out;
     },
     integer(bytes, node) { return bytesToBigInt(bytes.subarray(node.start, node.end)); },
+    oid(bytes, node) {
+      if (node.start >= node.end) return '';
+      const first = bytes[node.start];
+      const parts = [Math.floor(first / 40), first % 40];
+      let value = 0;
+      for (let index = node.start + 1; index < node.end; index++) {
+        const byte = bytes[index];
+        value = value * 128 + (byte & 0x7f);
+        if ((byte & 0x80) === 0) { parts.push(value); value = 0; }
+      }
+      return parts.join('.');
+    },
   };
   function bytesToBigInt(bytes) {
     const view = Buffer.from(bytes);
@@ -5390,6 +6198,7 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       return keyObjectFrom(input.key);
     }
     if (input && typeof input === 'object' && !Buffer.isBuffer(input) && !ArrayBuffer.isView(input) && input.kty === 'RSA') return rsaFromJwk(input);
+    if (input && typeof input === 'object' && !Buffer.isBuffer(input) && !ArrayBuffer.isView(input) && typeof input.publicKey === 'object' && input instanceof X509Certificate) return input.publicKey;
     const text = typeof input === 'string' ? input : Buffer.from(input).toString('latin1');
     if (text.trim().startsWith('{')) { try { const parsed = JSON.parse(text); if (parsed && parsed.kty === 'RSA') return rsaFromJwk(parsed); } catch {} }
     const pem = pemDecode(input);
@@ -5397,7 +6206,7 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
     if (/^ENCRYPTED /.test(pem.label)) throw rsaKeyError('Encrypted PEM keys are not supported by this runtime', 'ERR_OSSL_UNSUPPORTED');
     if (pem.label === 'PRIVATE KEY' || pem.label === 'RSA PRIVATE KEY') return new KeyObject('private', readRsaPrivate(pem.der));
     if (pem.label === 'PUBLIC KEY' || pem.label === 'RSA PUBLIC KEY') return new KeyObject('public', readRsaPublic(pem.der));
-    if (pem.label === 'CERTIFICATE') throw rsaKeyError('X.509 certificates are not parsed by this runtime; pass a PEM public key instead', 'ERR_OSSL_UNSUPPORTED');
+    if (pem.label === 'CERTIFICATE') return new X509Certificate(pem.der).publicKey;
     throw rsaKeyError('Unsupported PEM label "' + pem.label + '"', 'ERR_OSSL_UNSUPPORTED');
   }
   const b64urlBigInt = value => bigIntToBytes(value).toString('base64url');
@@ -5693,6 +6502,465 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
     return encoded.subarray(at + 1);
   };
 
+  /* --- X509Certificate & Certificate (SPKAC) --- */
+  const X509_OID_NAMES = Object.freeze({
+    '2.5.4.3': 'CN',
+    '2.5.4.5': 'serialNumber',
+    '2.5.4.6': 'C',
+    '2.5.4.7': 'L',
+    '2.5.4.8': 'ST',
+    '2.5.4.9': 'street',
+    '2.5.4.10': 'O',
+    '2.5.4.11': 'OU',
+    '1.2.840.113549.1.9.1': 'emailAddress',
+    '0.9.2342.19200300.100.1.25': 'DC',
+  });
+  const X509_SIG_HASHES = Object.freeze({
+    '1.2.840.113549.1.1.4': 'md5',
+    '1.2.840.113549.1.1.5': 'sha1',
+    '1.2.840.113549.1.1.11': 'sha256',
+    '1.2.840.113549.1.1.12': 'sha384',
+    '1.2.840.113549.1.1.13': 'sha512',
+    '1.2.840.113549.1.1.14': 'sha224',
+  });
+  const X509_EC_CURVES = Object.freeze({
+    '1.2.840.10045.3.1.7': 'prime256v1',
+    '1.3.132.0.34': 'secp384r1',
+    '1.3.132.0.35': 'secp521r1',
+  });
+  const X509_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function decodeAsn1String(bytes, node) {
+    const raw = bytes.subarray(node.start, node.end);
+    if (node.tag === 0x1e) {
+      let text = '';
+      for (let i = 0; i + 1 < raw.length; i += 2) text += String.fromCharCode((raw[i] << 8) | raw[i + 1]);
+      return text;
+    }
+    if (node.tag === 0x13 || node.tag === 0x16 || node.tag === 0x14) return Buffer.from(raw).toString('latin1');
+    return Buffer.from(raw).toString('utf8');
+  }
+  function parseX509Name(bytes, node) {
+    const lines = [];
+    const obj = Object.create(null);
+    const cnList = [];
+    const emailList = [];
+    for (const rdn of DER.children(bytes, node)) {
+      for (const atv of DER.children(bytes, rdn)) {
+        const parts = DER.children(bytes, atv);
+        if (parts.length < 2) continue;
+        const oid = DER.oid(bytes, parts[0]);
+        const key = X509_OID_NAMES[oid] || oid;
+        const val = decodeAsn1String(bytes, parts[1]);
+        lines.push(key + '=' + val);
+        if (key === 'CN') cnList.push(val);
+        if (key === 'emailAddress') emailList.push(val);
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+          obj[key] = Array.isArray(obj[key]) ? [...obj[key], val] : [obj[key], val];
+        } else {
+          obj[key] = val;
+        }
+      }
+    }
+    return { text: lines.join('\n'), obj, cnList, emailList };
+  }
+  function parseX509Time(bytes, node) {
+    const text = Buffer.from(bytes.subarray(node.start, node.end)).toString('ascii');
+    let year, rest;
+    if (node.tag === 0x17) {
+      const yy = Number(text.slice(0, 2));
+      year = yy >= 50 ? 1900 + yy : 2000 + yy;
+      rest = text.slice(2);
+    } else if (node.tag === 0x18) {
+      year = Number(text.slice(0, 4));
+      rest = text.slice(4);
+    } else {
+      throw rsaKeyError('Unsupported X.509 time tag 0x' + node.tag.toString(16), 'ERR_CRYPTO_INVALID_CERT');
+    }
+    const month = Number(rest.slice(0, 2));
+    const day = Number(rest.slice(2, 4));
+    const hour = Number(rest.slice(4, 6));
+    const min = Number(rest.slice(6, 8));
+    const sec = Number(rest.slice(8, 10));
+    const date = new Date(Date.UTC(year, month - 1, day, hour, min, sec));
+    const p2 = n => String(n).padStart(2, '0');
+    const formatted = X509_MONTHS[month - 1] + ' ' + String(day).padStart(2, ' ') + ' ' + p2(hour) + ':' + p2(min) + ':' + p2(sec) + ' ' + year + ' GMT';
+    return { date, formatted };
+  }
+  function formatColonHex(bytes) {
+    const out = [];
+    for (let i = 0; i < bytes.length; i++) out.push(bytes[i].toString(16).padStart(2, '0').toUpperCase());
+    return out.join(':');
+  }
+  function formatIpBytes(raw) {
+    if (raw.length === 4) return raw[0] + '.' + raw[1] + '.' + raw[2] + '.' + raw[3];
+    if (raw.length === 16) {
+      const parts = [];
+      for (let i = 0; i < 16; i += 2) parts.push(((raw[i] << 8) | raw[i + 1]).toString(16));
+      return parts.join(':');
+    }
+    return Buffer.from(raw).toString('hex');
+  }
+  function canonicalizeIp(ip) {
+    const str = String(ip).trim();
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(str)) {
+      const nums = str.split('.').map(Number);
+      if (nums.some(n => n < 0 || n > 255)) return null;
+      return nums.join('.');
+    }
+    if (!str.includes(':')) return null;
+    const halves = str.toLowerCase().split('::');
+    if (halves.length > 2) return null;
+    const left = halves[0] ? halves[0].split(':') : [];
+    const right = halves[1] ? halves[1].split(':') : [];
+    const fill = halves.length === 2 ? 8 - (left.length + right.length) : 0;
+    if (fill < 0 || (halves.length === 1 && left.length !== 8)) return null;
+    const full = [...left, ...Array(fill).fill('0'), ...right];
+    if (full.length !== 8 || full.some(g => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+    return full.map(g => parseInt(g, 16).toString(16)).join(':');
+  }
+  function matchX509Host(pattern, hostname, allowWildcard = true) {
+    const p = String(pattern).toLowerCase();
+    const h = String(hostname).toLowerCase().replace(/\.$/, '');
+    if (p === h) return true;
+    if (!allowWildcard || !p.startsWith('*.')) return false;
+    const suffix = p.slice(1); // '.example.com'
+    if (suffix.indexOf('.', 1) < 0) return false; // reject '*.com'
+    if (!h.endsWith(suffix)) return false;
+    const prefix = h.slice(0, h.length - suffix.length);
+    return prefix.length > 0 && !prefix.includes('.');
+  }
+  function parseX509PublicKey(spkiBytes) {
+    const root = DER.read(spkiBytes, 0);
+    const parts = DER.children(spkiBytes, root);
+    if (parts.length < 2 || parts[0].tag !== 0x30 || parts[1].tag !== 0x03) {
+      throw rsaKeyError('Unsupported SubjectPublicKeyInfo in X.509 certificate', 'ERR_OSSL_UNSUPPORTED');
+    }
+    const algChildren = DER.children(spkiBytes, parts[0]);
+    const algOid = algChildren.length ? DER.oid(spkiBytes, algChildren[0]) : '';
+    if (algOid === '1.2.840.113549.1.1.1') return new KeyObject('public', readRsaPublic(spkiBytes));
+    if (algOid === '1.2.840.10045.2.1') {
+      const curveOid = algChildren[1]?.tag === 0x06 ? DER.oid(spkiBytes, algChildren[1]) : '';
+      return new KeyObject('public', { spki: Buffer.from(spkiBytes), keyType: 'ec', namedCurve: X509_EC_CURVES[curveOid] || curveOid || undefined });
+    }
+    if (algOid === '1.3.101.112') return new KeyObject('public', { spki: Buffer.from(spkiBytes), keyType: 'ed25519' });
+    return new KeyObject('public', { spki: Buffer.from(spkiBytes), keyType: 'rsa' });
+  }
+  class X509Certificate {
+    constructor(buffer) {
+      let der;
+      if (typeof buffer === 'string') {
+        const pem = pemDecode(buffer);
+        if (!pem || pem.label !== 'CERTIFICATE') throw rsaKeyError('Cannot parse PEM certificate', 'ERR_OSSL_UNSUPPORTED');
+        der = pem.der;
+      } else if (Buffer.isBuffer(buffer) || ArrayBuffer.isView(buffer) || isArrayBufferLike(buffer)) {
+        const bytes = Buffer.from(buffer);
+        const text = bytes.toString('latin1');
+        if (text.includes('-----BEGIN CERTIFICATE-----')) {
+          const pem = pemDecode(text);
+          if (!pem) throw rsaKeyError('Cannot parse PEM certificate', 'ERR_OSSL_UNSUPPORTED');
+          der = pem.der;
+        } else {
+          der = bytes;
+        }
+      } else {
+        throw Object.assign(new TypeError('The "buffer" argument must be of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer'), { code: 'ERR_INVALID_ARG_TYPE' });
+      }
+      if (!der || !der.length) throw rsaKeyError('Empty X.509 certificate', 'ERR_OSSL_UNSUPPORTED');
+      let root, top;
+      try {
+        root = DER.read(der, 0);
+        top = DER.children(der, root);
+      } catch (e) {
+        throw rsaKeyError('Invalid X.509 certificate DER: ' + e.message, 'ERR_OSSL_UNSUPPORTED');
+      }
+      if (root.tag !== 0x30 || top.length < 3) throw rsaKeyError('Malformed X.509 certificate structure', 'ERR_OSSL_UNSUPPORTED');
+      const [tbsNode, sigAlgNode, sigValNode] = top;
+      const tbsChildren = DER.children(der, tbsNode);
+      let idx = 0;
+      if (tbsChildren[idx]?.tag === 0xa0) idx++; // optional [0] EXPLICIT version
+      if (idx + 5 >= tbsChildren.length) throw rsaKeyError('Truncated X.509 TBSCertificate', 'ERR_OSSL_UNSUPPORTED');
+      const serialNode = tbsChildren[idx++];
+      idx++; // tbs signature algorithm
+      const issuerNode = tbsChildren[idx++];
+      const validityNode = tbsChildren[idx++];
+      const subjectNode = tbsChildren[idx++];
+      const spkiNode = tbsChildren[idx++];
+      let serialBytes = der.subarray(serialNode.start, serialNode.end);
+      while (serialBytes.length > 1 && serialBytes[0] === 0x00 && (serialBytes[1] & 0x80)) serialBytes = serialBytes.subarray(1);
+      const serialHex = Buffer.from(serialBytes).toString('hex').toUpperCase();
+      const issuerParsed = parseX509Name(der, issuerNode);
+      const subjectParsed = parseX509Name(der, subjectNode);
+      const valChildren = DER.children(der, validityNode);
+      const notBefore = parseX509Time(der, valChildren[0]);
+      const notAfter = parseX509Time(der, valChildren[1]);
+      const spkiBytes = Buffer.from(der.subarray(spkiNode.offset, spkiNode.end));
+      const publicKey = parseX509PublicKey(spkiBytes);
+      let ca = false;
+      let keyUsage;
+      let subjectAltName;
+      let infoAccess;
+      const sanDns = [];
+      const sanEmails = [];
+      const sanIps = [];
+      for (; idx < tbsChildren.length; idx++) {
+        if (tbsChildren[idx].tag !== 0xa3) continue;
+        const extSeqs = DER.children(der, tbsChildren[idx]);
+        if (!extSeqs.length) continue;
+        for (const extNode of DER.children(der, extSeqs[0])) {
+          const extParts = DER.children(der, extNode);
+          if (extParts.length < 2) continue;
+          const oid = DER.oid(der, extParts[0]);
+          const valOctet = extParts[extParts.length - 1];
+          if (valOctet.tag !== 0x04) continue;
+          const extBytes = der.subarray(valOctet.start, valOctet.end);
+          if (oid === '2.5.29.19') {
+            const bcRoot = DER.read(extBytes, 0);
+            const bcParts = DER.children(extBytes, bcRoot);
+            if (bcParts.length && bcParts[0].tag === 0x01) ca = extBytes[bcParts[0].start] !== 0;
+          } else if (oid === '2.5.29.17') {
+            const sanRoot = DER.read(extBytes, 0);
+            const sanEntries = [];
+            for (const gn of DER.children(extBytes, sanRoot)) {
+              const body = extBytes.subarray(gn.start, gn.end);
+              if (gn.tag === 0x81) {
+                const email = Buffer.from(body).toString('utf8');
+                sanEmails.push(email);
+                sanEntries.push('email:' + email);
+              } else if (gn.tag === 0x82) {
+                const dns = Buffer.from(body).toString('utf8');
+                sanDns.push(dns);
+                sanEntries.push('DNS:' + dns);
+              } else if (gn.tag === 0x86) {
+                sanEntries.push('URI:' + Buffer.from(body).toString('utf8'));
+              } else if (gn.tag === 0x87) {
+                const ipStr = formatIpBytes(body);
+                sanIps.push(ipStr);
+                sanEntries.push('IP Address:' + ipStr);
+              }
+            }
+            if (sanEntries.length) subjectAltName = sanEntries.join(', ');
+          } else if (oid === '2.5.29.37') {
+            const ekuRoot = DER.read(extBytes, 0);
+            const usages = DER.children(extBytes, ekuRoot).map(n => DER.oid(extBytes, n)).filter(Boolean);
+            if (usages.length) keyUsage = usages;
+          } else if (oid === '1.3.6.1.5.5.7.1.1') {
+            const aiaRoot = DER.read(extBytes, 0);
+            const lines = [];
+            for (const ad of DER.children(extBytes, aiaRoot)) {
+              const adParts = DER.children(extBytes, ad);
+              if (adParts.length < 2) continue;
+              const methodOid = DER.oid(extBytes, adParts[0]);
+              const methodLabel = methodOid === '1.3.6.1.5.5.7.48.1' ? 'OCSP' : methodOid === '1.3.6.1.5.5.7.48.2' ? 'CA Issuers' : methodOid;
+              const loc = adParts[1];
+              const locBody = Buffer.from(extBytes.subarray(loc.start, loc.end)).toString('utf8');
+              const locStr = loc.tag === 0x86 ? 'URI:' + locBody : locBody;
+              lines.push(methodLabel + ' - ' + locStr);
+            }
+            if (lines.length) infoAccess = lines.join('\n');
+          }
+        }
+      }
+      const sigAlgParts = DER.children(der, sigAlgNode);
+      const sigAlgOid = sigAlgParts.length ? DER.oid(der, sigAlgParts[0]) : '';
+      const rawBuf = Buffer.from(der);
+      const fp1 = formatColonHex(CRYPTO.createHash('sha1').update(rawBuf).digest());
+      const fp256 = formatColonHex(CRYPTO.createHash('sha256').update(rawBuf).digest());
+      const fp512 = formatColonHex(CRYPTO.createHash('sha512').update(rawBuf).digest());
+      Object.defineProperty(this, '_x509', {
+        value: {
+          raw: rawBuf,
+          spkiBytes,
+          tbsBytes: Buffer.from(der.subarray(tbsNode.offset, tbsNode.end)),
+          sigAlgOid,
+          sigBytes: sigValNode.tag === 0x03 ? Buffer.from(der.subarray(sigValNode.start + 1, sigValNode.end)) : Buffer.alloc(0),
+          subject: subjectParsed.text,
+          subjectObj: subjectParsed.obj,
+          subjectCNs: subjectParsed.cnList,
+          subjectEmails: subjectParsed.emailList,
+          issuer: issuerParsed.text,
+          issuerObj: issuerParsed.obj,
+          subjectAltName,
+          infoAccess,
+          validFrom: notBefore.formatted,
+          validTo: notAfter.formatted,
+          validFromDate: notBefore.date,
+          validToDate: notAfter.date,
+          fingerprint: fp1,
+          fingerprint256: fp256,
+          fingerprint512: fp512,
+          keyUsage,
+          serialNumber: serialHex,
+          publicKey,
+          ca,
+          sanDns,
+          sanEmails,
+          sanIps,
+        },
+      });
+    }
+    get subject() { return this._x509.subject; }
+    get subjectAltName() { return this._x509.subjectAltName; }
+    get issuer() { return this._x509.issuer; }
+    get issuerCertificate() { return undefined; }
+    get infoAccess() { return this._x509.infoAccess; }
+    get validFrom() { return this._x509.validFrom; }
+    get validTo() { return this._x509.validTo; }
+    get validFromDate() { return new Date(this._x509.validFromDate.getTime()); }
+    get validToDate() { return new Date(this._x509.validToDate.getTime()); }
+    get fingerprint() { return this._x509.fingerprint; }
+    get fingerprint256() { return this._x509.fingerprint256; }
+    get fingerprint512() { return this._x509.fingerprint512; }
+    get keyUsage() { return this._x509.keyUsage ? [...this._x509.keyUsage] : undefined; }
+    get serialNumber() { return this._x509.serialNumber; }
+    get raw() { return Buffer.from(this._x509.raw); }
+    get publicKey() { return this._x509.publicKey; }
+    get ca() { return this._x509.ca; }
+    toString() {
+      const body = this._x509.raw.toString('base64').replace(/(.{64})/g, '$1\n').trimEnd();
+      return '-----BEGIN CERTIFICATE-----\n' + body + '\n-----END CERTIFICATE-----\n';
+    }
+    toJSON() { return this.toString(); }
+    checkHost(name, options = {}) {
+      if (typeof name !== 'string') throw Object.assign(new TypeError('The "name" argument must be of type string'), { code: 'ERR_INVALID_ARG_TYPE' });
+      const subjectMode = (options && options.subject) || 'default';
+      const allowWildcards = !options || options.wildcards !== false;
+      const allowMulti = !options || options.multiLabelWildcards !== true ? false : true;
+      void allowMulti;
+      for (const dns of this._x509.sanDns) {
+        if (matchX509Host(dns, name, allowWildcards)) return dns;
+      }
+      const hasSanDns = this._x509.sanDns.length > 0;
+      if (subjectMode === 'always' || (subjectMode !== 'never' && !hasSanDns)) {
+        for (const cn of this._x509.subjectCNs) {
+          if (matchX509Host(cn, name, allowWildcards)) return cn;
+        }
+      }
+      return undefined;
+    }
+    checkEmail(email, options = {}) {
+      if (typeof email !== 'string') throw Object.assign(new TypeError('The "email" argument must be of type string'), { code: 'ERR_INVALID_ARG_TYPE' });
+      const target = email.toLowerCase();
+      for (const candidate of this._x509.sanEmails) {
+        if (candidate.toLowerCase() === target) return candidate;
+      }
+      const subjectMode = (options && options.subject) || 'default';
+      if (subjectMode === 'always' || (subjectMode !== 'never' && !this._x509.sanEmails.length)) {
+        for (const candidate of this._x509.subjectEmails) {
+          if (candidate.toLowerCase() === target) return candidate;
+        }
+      }
+      return undefined;
+    }
+    checkIP(ip) {
+      if (typeof ip !== 'string') throw Object.assign(new TypeError('The "ip" argument must be of type string'), { code: 'ERR_INVALID_ARG_TYPE' });
+      const norm = canonicalizeIp(ip);
+      if (!norm) return undefined;
+      for (const candidate of this._x509.sanIps) {
+        if (canonicalizeIp(candidate) === norm) return candidate;
+      }
+      return undefined;
+    }
+    checkIssued(otherCert) {
+      if (!(otherCert instanceof X509Certificate)) throw Object.assign(new TypeError('The "otherCert" argument must be an instance of X509Certificate'), { code: 'ERR_INVALID_ARG_TYPE' });
+      return this.issuer === otherCert.subject;
+    }
+    checkPrivateKey(privateKey) {
+      const keyObj = keyObjectFrom(privateKey);
+      if (keyObj.type !== 'private') throw rsaKeyError('A private key is required', 'ERR_CRYPTO_INVALID_KEYTYPE');
+      return CRYPTO.createPublicKey(keyObj).equals(this.publicKey);
+    }
+    verify(publicKey) {
+      const hash = X509_SIG_HASHES[this._x509.sigAlgOid];
+      if (!hash) throw notImplemented('X509Certificate.verify does not support signature OID ' + this._x509.sigAlgOid, 'ERR_CRYPTO_OPERATION_FAILED');
+      return verifyWithKey(publicKey, hash, this._x509.tbsBytes, this._x509.sigBytes, { padding: 1 });
+    }
+    toLegacyObject() {
+      const d = this._x509;
+      const legacy = {
+        subject: Object.assign(Object.create(null), d.subjectObj),
+        issuer: Object.assign(Object.create(null), d.issuerObj),
+        ...(d.subjectAltName ? { subjectaltname: d.subjectAltName } : {}),
+        ...(d.infoAccess ? { infoAccess: d.infoAccess } : {}),
+        ca: d.ca,
+        ...(isRsaHandle(d.publicKey._handle) ? {
+          modulus: d.publicKey._handle.n.toString(16).toUpperCase().replace(/^(.(..)*)$/, '0$1'),
+          bits: d.publicKey._handle.n.toString(2).length,
+          exponent: '0x' + d.publicKey._handle.e.toString(16),
+          pubkey: Buffer.from(d.spkiBytes),
+        } : { pubkey: Buffer.from(d.spkiBytes) }),
+        ...(d.keyUsage ? { ext_key_usage: [...d.keyUsage] } : {}),
+        valid_from: d.validFrom,
+        valid_to: d.validTo,
+        fingerprint: d.fingerprint,
+        fingerprint256: d.fingerprint256,
+        fingerprint512: d.fingerprint512,
+        serialNumber: d.serialNumber,
+        raw: Buffer.from(d.raw),
+      };
+      return legacy;
+    }
+  }
+  function parseSpkac(spkac, encoding) {
+    try {
+      let b64;
+      if (typeof spkac === 'string') b64 = Buffer.from(spkac, encoding || 'utf8').toString('utf8');
+      else if (Buffer.isBuffer(spkac) || ArrayBuffer.isView(spkac) || isArrayBufferLike(spkac)) b64 = Buffer.from(spkac).toString('utf8');
+      else return null;
+      const clean = b64.replace(/\s+/g, '');
+      if (!clean) return null;
+      const der = Buffer.from(clean, 'base64');
+      if (!der.length) return null;
+      const root = DER.read(der, 0);
+      if (root.tag !== 0x30) return null;
+      const top = DER.children(der, root);
+      if (top.length < 3) return null;
+      const [pkacNode, sigAlgNode, sigValNode] = top;
+      if (pkacNode.tag !== 0x30 || sigAlgNode.tag !== 0x30 || sigValNode.tag !== 0x03) return null;
+      const pkacParts = DER.children(der, pkacNode);
+      if (pkacParts.length < 2 || pkacParts[0].tag !== 0x30 || pkacParts[1].tag !== 0x16) return null;
+      const spkiBytes = Buffer.from(der.subarray(pkacParts[0].offset, pkacParts[0].end));
+      const challengeBytes = Buffer.from(der.subarray(pkacParts[1].start, pkacParts[1].end));
+      const pkacBytes = Buffer.from(der.subarray(pkacNode.offset, pkacNode.end));
+      const sigAlgParts = DER.children(der, sigAlgNode);
+      const sigAlgOid = sigAlgParts.length ? DER.oid(der, sigAlgParts[0]) : '';
+      const sigBytes = Buffer.from(der.subarray(sigValNode.start + 1, sigValNode.end));
+      return { spkiBytes, challengeBytes, pkacBytes, sigAlgOid, sigBytes };
+    } catch {
+      return null;
+    }
+  }
+  function Certificate() {
+    if (!(this instanceof Certificate)) return new Certificate();
+  }
+  Certificate.verifySpkac = (spkac, encoding) => {
+    const parsed = parseSpkac(spkac, encoding);
+    if (!parsed) return false;
+    const hash = X509_SIG_HASHES[parsed.sigAlgOid];
+    if (!hash) return false;
+    try {
+      const pub = parseX509PublicKey(parsed.spkiBytes);
+      return verifyWithKey(pub, hash, parsed.pkacBytes, parsed.sigBytes, { padding: 1 });
+    } catch {
+      return false;
+    }
+  };
+  Certificate.exportPublicKey = (spkac, encoding) => {
+    const parsed = parseSpkac(spkac, encoding);
+    if (!parsed) return '';
+    const body = parsed.spkiBytes.toString('base64').replace(/(.{64})/g, '$1\n').trimEnd();
+    return Buffer.from('-----BEGIN PUBLIC KEY-----\n' + body + '\n-----END PUBLIC KEY-----\n');
+  };
+  Certificate.exportChallenge = (spkac, encoding) => {
+    const parsed = parseSpkac(spkac, encoding);
+    if (!parsed) return '';
+    return Buffer.from(parsed.challengeBytes);
+  };
+  Certificate.prototype.verifySpkac = Certificate.verifySpkac;
+  Certificate.prototype.exportPublicKey = Certificate.exportPublicKey;
+  Certificate.prototype.exportChallenge = Certificate.exportChallenge;
+  define(CRYPTO, 'X509Certificate', X509Certificate);
+  define(CRYPTO, 'Certificate', Certificate);
+
   // Everything else asymmetric still needs OpenSSL; those stay explicit.
   for (const name of ['generateKeyPairSync', 'generateKeyPair']) {
     define(CRYPTO, name, () => { throw notImplemented('crypto.' + name + ' (asynchronous WebCrypto ciphers are not synchronous in this runtime; use crypto.subtle)', 'ERR_CRYPTO_OPERATION_FAILED'); });
@@ -5791,13 +7059,9 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
     });
   }
 
-  /* --- worker_threads: keep the honest error, add the constants tooling reads --- */
+  /* --- worker_threads: fallback constants only if undefined --- */
   if (CORE.worker_threads) {
-    define(CORE.worker_threads, 'markAsUntransferable', () => {});
-    define(CORE.worker_threads, 'receiveMessageOnPort', () => undefined);
     define(CORE.worker_threads, 'moveMessagePortToContext', port => port);
-    define(CORE.worker_threads, 'getEnvironmentData', () => ({}));
-    define(CORE.worker_threads, 'setEnvironmentData', () => {});
   }
 })();
 
@@ -6111,10 +7375,10 @@ function installEsbuildGoFs() {
           ? (typeof rest[0] === 'number' ? buf.subarray(rest[0], typeof rest[1] === 'number' ? rest[0] + rest[1] : undefined) : buf)
           : new Uint8Array(buf));
       const byteLength = typeof slice === 'string' ? Buffer.byteLength(slice) : slice.length;
-      if (fd === 2) { console.error((typeof slice === 'string' ? slice : new TextDecoder().decode(slice)).replace(/\n$/, '')); return byteLength; }
+      if (fd === 2) { console.error((typeof slice === 'string' ? slice : decodeBytes(slice, new TextDecoder())).replace(/\n$/, '')); return byteLength; }
       if (fd === 1 && priorWriteSync) { priorWriteSync(fd, typeof slice === 'string' ? new TextEncoder().encode(slice) : slice); return byteLength; }
       if (fullFs && originals.writeSync) return originals.writeSync.call(globalThis.fs, fd, buf, ...rest);
-      console.log((typeof slice === 'string' ? slice : new TextDecoder().decode(slice)).replace(/\n$/, ''));
+      console.log((typeof slice === 'string' ? slice : decodeBytes(slice, new TextDecoder())).replace(/\n$/, ''));
       return byteLength;
     } catch (e) {}
     return typeof buf === 'string' ? Buffer.byteLength(buf) : buf.length;
@@ -6322,11 +7586,18 @@ function resolveRequest(spec, fromFile) {
   }
   return resolveModule(spec, fromFile);
 }
-function makeRequire(fromFile){
+function makeRequire(fromFile, ownerCache = activeModuleCache()){
+  const cacheToUse = ownerCache || activeModuleCache();
   const req = (spec)=>{
     const r = resolveRequest(spec, fromFile);
-    if (r.core) return CORE[r.core];
-    return loadFile(r.file, activeModuleCache()[fromFile] || null);
+    if (r.core) {
+      if (r.core === 'worker_threads' && cacheToUse.__beownirWorkerThreads) return cacheToUse.__beownirWorkerThreads;
+      return CORE[r.core];
+    }
+    const prev = CHILD_MODULE_CACHE;
+    if (cacheToUse !== cache) CHILD_MODULE_CACHE = cacheToUse;
+    try { return loadFile(r.file, cacheToUse[fromFile] || null); }
+    finally { CHILD_MODULE_CACHE = prev; }
   };
   req.resolve = s => {
     const r = resolveRequest(s, fromFile);
@@ -7012,29 +8283,51 @@ function exportStar(target, namespace) {
   copyExportStar(target, namespace);
   if (watchEsmBinding(namespace)) watchEsmBinding(namespace, () => copyExportStar(target, namespace));
 }
-function importModule(spec, fromFile) {
+function importModule(spec, fromFile, ownerCache = activeModuleCache()) {
+  const cacheToUse = ownerCache || activeModuleCache();
   const resolved = resolveModule(spec, fromFile);
-  if (resolved.core) return interopNamespace(CORE[resolved.core]);
-  const exportsObject = loadFile(resolved.file);
+  if (resolved.core) {
+    const coreMod = (resolved.core === 'worker_threads' && cacheToUse.__beownirWorkerThreads)
+      ? cacheToUse.__beownirWorkerThreads
+      : CORE[resolved.core];
+    return interopNamespace(coreMod);
+  }
+  const prev = CHILD_MODULE_CACHE;
+  if (cacheToUse !== cache) CHILD_MODULE_CACHE = cacheToUse;
+  let exportsObject;
+  try { exportsObject = loadFile(resolved.file); }
+  finally { CHILD_MODULE_CACHE = prev; }
   // import() always sees the ES module namespace, even when require() got the
   // 'module.exports' binding instead.
-  const record = activeModuleCache()[resolved.file];
+  const record = cacheToUse[resolved.file];
   const ns = interopNamespace(record && record.namespace ? record.namespace : exportsObject);
   recordEsmCycle(ns);
   return ns;
 }
-function importEsm(spec, fromFile) { return importModule(spec, fromFile); }
-async function importEsmAsync(spec, fromFile) {
+function importEsm(spec, fromFile, ownerCache = activeModuleCache()) { return importModule(spec, fromFile, ownerCache); }
+async function importEsmAsync(spec, fromFile, ownerCache = activeModuleCache()) {
+  const cacheToUse = ownerCache || activeModuleCache();
   const resolved = resolveModule(spec, fromFile);
-  if (resolved.core) return interopNamespace(CORE[resolved.core]);
-  let exportsObject;
-  try { exportsObject = loadFile(resolved.file); }
-  catch (error) {
-    // The dependency uses top-level await; the async ESM loader can evaluate it.
-    if (error && error.code === 'ERR_REQUIRE_ASYNC_MODULE') exportsObject = await loadEsmFileAsync(resolved.file);
-    else throw error;
+  if (resolved.core) {
+    const coreMod = (resolved.core === 'worker_threads' && cacheToUse.__beownirWorkerThreads)
+      ? cacheToUse.__beownirWorkerThreads
+      : CORE[resolved.core];
+    return interopNamespace(coreMod);
   }
-  const record = activeModuleCache()[resolved.file];
+  const prev = CHILD_MODULE_CACHE;
+  if (cacheToUse !== cache) CHILD_MODULE_CACHE = cacheToUse;
+  let exportsObject;
+  try {
+    try { exportsObject = loadFile(resolved.file); }
+    catch (error) {
+      // The dependency uses top-level await; the async ESM loader can evaluate it.
+      if (error && error.code === 'ERR_REQUIRE_ASYNC_MODULE') exportsObject = await loadEsmFileAsync(resolved.file);
+      else throw error;
+    }
+  } finally {
+    CHILD_MODULE_CACHE = prev;
+  }
+  const record = cacheToUse[resolved.file];
   /* CJS dependencies must go through the same default-import interop as the
    * sync path: `import colors from 'kleur'` inside an async-loaded module was
    * reading `.default` off the raw module.exports. */
@@ -7042,10 +8335,10 @@ async function importEsmAsync(spec, fromFile) {
   recordEsmCycle(ns);
   return ns;
 }
-async function dynamicImportEsm(spec, fromFile) {
-  try { return importModule(spec, fromFile); }
+async function dynamicImportEsm(spec, fromFile, ownerCache = activeModuleCache()) {
+  try { return importModule(spec, fromFile, ownerCache); }
   catch (error) {
-    if (error && error.code === 'ERR_REQUIRE_ASYNC_MODULE') return await importEsmAsync(spec, fromFile);
+    if (error && error.code === 'ERR_REQUIRE_ASYNC_MODULE') return await importEsmAsync(spec, fromFile, ownerCache);
     throw error;
   }
 }
@@ -7060,8 +8353,9 @@ function importMetaFor(file) {
 
 /** Loads an ES module and returns its namespace (Node 22 require(esm) shape). */
 function loadEsmFile(file) {
+  const ownerCache = activeModuleCache();
   const mod = { exports: {}, id: file, filename: file, loaded: false, children: [], paths: [], esm: true };
-  activeModuleCache()[file] = mod;
+  ownerCache[file] = mod;
   const namespace = mod.exports;
   Object.defineProperty(namespace, '__esModule', { value: true });
   Object.defineProperty(namespace, Symbol.toStringTag, { value: 'Module' });
@@ -7073,7 +8367,7 @@ function loadEsmFile(file) {
   let fn;
   try { fn = (0, eval)(wrapper + '\n//# sourceURL=' + file); }
   catch (error) {
-    delete activeModuleCache()[file];
+    delete ownerCache[file];
     /* A plain-function wrapper cannot parse top-level await, and V8 reports it
      * in roundabout ways ("await is only valid in async functions", or the
      * awaited identifier itself, e.g. svelte-kit's `await import_peer(...)`).
@@ -7090,10 +8384,10 @@ function loadEsmFile(file) {
   }
   esmLoadingSet.add(namespace);
   try {
-    fn.call(namespace, namespace, makeRequire(file), mod,
-      spec => importEsm(spec, file), exportStar, spec => dynamicImportEsm(spec, file), importMetaFor(file), watchEsmBinding);
+    fn.call(namespace, namespace, makeRequire(file, ownerCache), mod,
+      spec => importEsm(spec, file, ownerCache), exportStar, spec => dynamicImportEsm(spec, file, ownerCache), importMetaFor(file), watchEsmBinding);
   } catch (error) {
-    delete activeModuleCache()[file];
+    delete ownerCache[file];
     esmLoadingSet.delete(namespace);
     if (esmLoadingSet.size === 0) { esmPendingWatches.length = 0; esmCycleTainted.clear(); }
     throw error;
@@ -7113,8 +8407,9 @@ function loadEsmFile(file) {
  * it. require() cannot (Node raises ERR_REQUIRE_ASYNC_MODULE), so the entry is
  * loaded through an async wrapper instead of refusing to run the program. */
 async function loadEsmFileAsync(file) {
+  const ownerCache = activeModuleCache();
   const mod = { exports: {}, id: file, filename: file, loaded: false, children: [], paths: [], esm: true };
-  activeModuleCache()[file] = mod;
+  ownerCache[file] = mod;
   const namespace = mod.exports;
   Object.defineProperty(namespace, '__esModule', { value: true });
   Object.defineProperty(namespace, Symbol.toStringTag, { value: 'Module' });
@@ -7125,13 +8420,13 @@ async function loadEsmFileAsync(file) {
   const wrapper = '(async function(__beownirExports, __beownirRequire, __beownirModule, __beownirImport, __beownirExportStar, __beownirDynamicImport, __beownirImportMeta, __beownirWatch){' + code + '\n})';
   let fn;
   try { fn = (0, eval)(wrapper + '\n//# sourceURL=' + file); }
-  catch (error) { delete activeModuleCache()[file]; throw new SyntaxError(file + ': ' + (error && error.message)); }
+  catch (error) { delete ownerCache[file]; throw new SyntaxError(file + ': ' + (error && error.message)); }
   esmLoadingSet.add(namespace);
   try {
-    await fn.call(namespace, namespace, makeRequire(file), mod,
-      spec => importEsmAsync(spec, file), exportStar, spec => dynamicImportEsm(spec, file), importMetaFor(file), watchEsmBinding);
+    await fn.call(namespace, namespace, makeRequire(file, ownerCache), mod,
+      spec => importEsmAsync(spec, file, ownerCache), exportStar, spec => dynamicImportEsm(spec, file, ownerCache), importMetaFor(file), watchEsmBinding);
   } catch (error) {
-    delete activeModuleCache()[file];
+    delete ownerCache[file];
     esmLoadingSet.delete(namespace);
     if (esmLoadingSet.size === 0) { esmPendingWatches.length = 0; esmCycleTainted.clear(); }
     throw error;
@@ -7190,8 +8485,9 @@ function loadFile(file, parent){
   catch(e){ delete activeModuleCache()[file]; throw new SyntaxError(file+': '+e.message); }
   const h = (t,p,...c)=>{ const R = tryReact(file); return R? R.createElement(t,p,...c) : {type:t,props:{...p,children:c}}; };
   const Frag = (p)=>p.children;
-  try { fn.call(mod.exports, mod.exports, makeRequire(file), mod, file, dirname(file), h, Frag, spec => dynamicImportEsm(spec, file), importMetaFor(file)); }
-  catch(e){ delete activeModuleCache()[file]; throw e; }
+  const ownerCache = activeModuleCache();
+  try { fn.call(mod.exports, mod.exports, makeRequire(file, ownerCache), mod, file, dirname(file), h, Frag, spec => dynamicImportEsm(spec, file, ownerCache), importMetaFor(file)); }
+  catch(e){ delete ownerCache[file]; throw e; }
   mod.loaded = true;
   return mod.exports;
 }
@@ -7638,7 +8934,9 @@ const COLOR = {log:'', info:'\x1b[36m', warn:'\x1b[33m', error:'\x1b[31m', debug
 
 function mkConsole(){
   const mk = (lvl) => (...a)=>{ const s = a.map(x=>typeof x==='string'?x:fmt(x)).join(' ');
-    (lvl==='error'||lvl==='warn'? errOut : out)((COLOR[lvl]||'')+s+(COLOR[lvl]?'\x1b[0m':'')+'\n'); };
+    const isErr = lvl==='error'||lvl==='warn';
+    const ansi = COLOR[lvl] && (isErr ? processObj.stderr?.isTTY !== false : processObj.stdout?.isTTY !== false) ? COLOR[lvl] : '';
+    (isErr ? errOut : out)(ansi+s+(ansi?'\x1b[0m':'')+'\n'); };
   const counts={}, timers={};
   const instance = new Console({ stdout: { write: text => out(String(text)) }, stderr: { write: text => errOut(String(text)) } });
   Object.assign(instance, { log:mk('log'), info:mk('info'), warn:mk('warn'), error:mk('error'), debug:mk('debug'), trace:mk('debug'),
@@ -8880,6 +10178,14 @@ function packDependencies() {
   depsCheckpointFiles = files.length; depsCheckpointBytes = packed.length;
   return packed;
 }
+function packDependenciesCached() {
+  if (!FS['/project/node_modules']) { cachedDepsArchive = null; cachedDepsVersion = -1; return null; }
+  if (cachedDepsArchive && cachedDepsVersion === nodeModulesDirtyVersion) return cachedDepsArchive;
+  const packed = packDependencies();
+  cachedDepsArchive = packed ? new Uint8Array(packed) : null;
+  cachedDepsVersion = nodeModulesDirtyVersion;
+  return cachedDepsArchive;
+}
 function createDependencyReader() {
   let pending = Buffer.alloc(0), state = 'magic', need = 0, header = null, files = 0, written = 0;
   const write = (meta, data) => {
@@ -8938,6 +10244,12 @@ async function restoreDependencyCheckpoint(input) {
     if (inflate.err) throw new Error('Invalid dependency checkpoint archive.');
     const result = reader.end();
     dirty.clear();
+    if (typeof nodeModulesDirtyVersion !== 'undefined') {
+      nodeModulesDirtyVersion++;
+      cachedDepsArchive = new Uint8Array(bytes).slice();
+      cachedDepsVersion = nodeModulesDirtyVersion;
+      nodeModulesSyncedVersion = nodeModulesDirtyVersion;
+    }
     post({ type: 'deps-restored', files: result.files, bytes: result.bytes });
     return result;
   } finally { holdSync--; }
@@ -9051,7 +10363,7 @@ for (const [name, value] of Object.entries({
 const SHELL = { stdin: '', history: [], lastCode: 0, lastStorage: null };
 
 const stdinText = () => (typeof SHELL.stdin === 'string' ? SHELL.stdin : '');
-const contentText = value => (typeof value === 'string' ? value : td.decode(value));
+const contentText = value => (typeof value === 'string' ? value : decodeBytes(value));
 const expandPath = word => (typeof word === 'string' && word.startsWith('~') ? word.replace(/^~\/?/, '/') : word);
 
 /** Expands $VAR, ${VAR}, $? and $$ using the shell environment. */
@@ -9138,6 +10450,11 @@ function parseRedirections(line) {
     if (ch === '\\' && quote !== "'") { rest += ch + (line[i + 1] || ''); i++; continue; }
     if (quote) { rest += ch; if (ch === quote) quote = null; continue; }
     if (ch === '"' || ch === "'") { quote = ch; rest += ch; continue; }
+    if (ch === '>' && line[i + 1] === '&' && (line[i + 2] === '1' || line[i + 2] === '2')) {
+      if (line[i + 2] === '2') redirect.stdoutToStderr = true;
+      i += 2;
+      continue;
+    }
     const fdTarget = line[i + 3];
     const fdDup = (ch === '1' || ch === '2' || ch === '&') && line[i + 1] === '>' && line[i + 2] === '&' && (fdTarget === '1' || fdTarget === '2');
     if (fdDup) {
@@ -9304,11 +10621,20 @@ async function executeLine(line) {
   const source = String(line ?? '').slice(0, 16384);
   if (source.trim()) SHELL.history.push(source.trim());
   let code = 0;
-  for (const { operator, text } of commandChunks(source)) {
-    if (operator === '&&' && code !== 0) continue;
-    if (operator === '||' && code === 0) continue;
-    code = await executeChunk(text);
-    SHELL.lastCode = code;
+  try {
+    for (const { operator, text } of commandChunks(source)) {
+      if (operator === '&&' && code !== 0) continue;
+      if (operator === '||' && code === 0) continue;
+      code = await executeChunk(text);
+      SHELL.lastCode = code;
+    }
+  } catch (error) {
+    if (error && error.__shellExit !== undefined) {
+      code = Number(error.__shellExit) || 0;
+      SHELL.lastCode = code;
+      return code;
+    }
+    throw error;
   }
   return code;
 }
@@ -9316,7 +10642,7 @@ async function executeLine(line) {
 async function executeChunk(rawLine) {
   const redirect = parseRedirections(rawLine);
   const line = redirect.line.trim();
-  let stdin = '';
+  let stdin = typeof SHELL.stdin === 'string' ? SHELL.stdin : '';
   if (redirect.stdin) {
     try { stdin = requireFile(redirect.stdin).text; }
     catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
@@ -9388,6 +10714,7 @@ async function executeStage(line, stderrRedirect) {
       }
     }
   } catch (error) {
+    if (error && error.__shellExit !== undefined) throw error;
     if (error && error.__exit !== undefined) return Number(error.__exit) || 0;
     const message = '\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n';
     if (shellCapture?.captureStderr) { shellCapture.stderr.push(message); return 1; }
@@ -9875,7 +11202,7 @@ async function executeCommand(input) {
         }
         const bytes = await registryBytes(url);
         if (target) { writeRedirect({ path: target, append: false }, bytes); out('saved ' + humanSize(bytes.length) + ' to ' + resolve(target) + '\n'); }
-        else out(td.decode(bytes));
+        else out(decodeBytes(bytes));
         return 0;
       }
       const response = await fetch(url, { method, credentials: 'omit', headers: values.d || values.data ? { 'content-type': 'application/json' } : undefined, body: values.d || values.data });
@@ -9938,6 +11265,12 @@ async function executeCommand(input) {
     }
     case 'true': case ':': return 0;
     case 'false': return 1;
+    case 'exit': {
+      const raw = args[0];
+      const n = raw === undefined ? (SHELL.lastCode || 0) : Number(raw);
+      const exitCode = Number.isInteger(n) ? ((n % 256) + 256) % 256 : 2;
+      throw { __shellExit: exitCode };
+    }
     case 'time': {
       const start = performance.now();
       const code = await executeCommand(args);
@@ -10055,6 +11388,9 @@ let EVAL_SOURCE;
 function entryWorkPending() {
   return (globalThis.__beownirEsbuildJobs || 0) || fsJobs || kernelPending.size || [...kernelTimers.values()].some(timer => timer._referenced) ||
     [...kernelChildren].some(child => child._referenced && !child._closed) ||
+    [...KERNEL_THREADS.values()].some(thread => thread._referenced && !thread._exited) ||
+    [...VIRTUAL_THREADS.values()].some(thread => thread._referenced && !thread._exited) ||
+    [...ACTIVE_MESSAGE_PORTS].some(p => p._referenced && !p._closed && (p.listenerCount('message') > 0 || typeof p._onmessage === 'function')) ||
     [...fsWatchers].some(watcher => !watcher.closed && watcher._beownirRef !== false) ||
     [...fsWatchFile.values()].some(set => [...set].some(watcher => watcher._beownirRef !== false));
 }
@@ -10071,10 +11407,24 @@ async function runNode(args) {
     if (args[1] === undefined) throw new Error('node -e requires a quoted code argument.');
     self.require = makeRequire(CWD + '/__eval__.js');
     processObj.exitCode = undefined;
+    processExitRequested = false;
     EVAL_SOURCE = String(args[1]);
     processObj.argv = [processObj.execPath || 'node', '-e', ...args.slice(2)];
     kernelReadyForInput();
-    const value = await (0, eval)(args[1]); if (args[0] === '-p') out(fmt(value) + '\n'); return 0;
+    try {
+      const value = await (0, eval)(args[1]);
+      if (args[0] === '-p') out(fmt(value) + '\n');
+    } catch (error) {
+      if (error && error.__exit !== undefined && !(error instanceof Error)) {
+        processObj.exitCode = undefined;
+        return Number(error.__exit) || 0;
+      }
+      throw error;
+    }
+    await settleEntryWork();
+    const exitCode = processObj.exitCode;
+    processObj.exitCode = undefined;
+    return exitCode === undefined ? 0 : exitCode;
   }
   // `node -` names stdin explicitly, so the arguments after it belong to the
   // script rather than being mistaken for the entry file.
@@ -10404,13 +11754,12 @@ it is restored from a compressed dependency checkpoint after a reload.
 The lightweight serve adapter uses live reload (no HMR) and preserves scroll,
 form values and focus. Installed Vite 6 has a bounded Node-API path for builds
 and virtual dev/HMR tests; arbitrary CLI options and plugins are not supported.
-No native OS binaries, sync child processes, cross-process raw TCP/TLS,
-worker_threads, native addons or full Next.js/Nuxt CLIs.
+worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); no native OS binaries, sync child processes, cross-process raw TCP/TLS, native addons or full Next.js/Nuxt CLIs.
 `;
 post({type:'boot'});
 
 function NodeStringDecoder(encoding='utf8'){this.encoding=String(encoding).toLowerCase();this._textDecoder=/^utf-?8$/.test(this.encoding)?new TextDecoder():/^(?:utf-?16le|ucs-?2)$/.test(this.encoding)?new TextDecoder('utf-16le'):null;this.lastNeed=0;this.lastTotal=0;this.lastChar=Buffer.alloc(4);}
-NodeStringDecoder.prototype.write=function(bytes){return this._textDecoder?this._textDecoder.decode(Buffer.from(bytes),{stream:true}):Buffer.from(bytes).toString(this.encoding);};
+NodeStringDecoder.prototype.write=function(bytes){return this._textDecoder?this._textDecoder.decode(unsharedView(Buffer.from(bytes)),{stream:true}):Buffer.from(bytes).toString(this.encoding);};
 NodeStringDecoder.prototype.end=function(bytes){let text=bytes?this.write(bytes):'';if(this._textDecoder)text+=this._textDecoder.decode();return text;};
 
 /* Custom virtual OS process client. Appended to runtime.js in the single-file build.
@@ -10428,40 +11777,69 @@ let kernelInputReady = false; const kernelDeferredInput = [];
 function kernelReadyForInput() { if (kernelInputReady) return; kernelInputReady = true; for (const message of kernelDeferredInput.splice(0)) queueMicrotask(() => self.onmessage({ data: message })); }
 const kernelPending = new Map(), kernelChildren = new Set(), kernelChildrenByPID = new Map(), kernelTimers = new Map();
 const virtualError = (code, message) => Object.assign(new Error(message), { code });
-function kernelCall(op, data = {}) {
+function kernelCall(op, data = {}, transfer) {
   if (kernelPending.size >= 256) return Promise.reject(virtualError('EAGAIN', 'Too many outstanding virtual OS calls.'));
   const id = ++kernelCounter;
   return new Promise((resolve, reject) => {
     const timer = runtimeNativeSetTimeout(() => { kernelPending.delete(id); reject(virtualError('ETIMEDOUT', 'Virtual OS call timed out: ' + op)); kernelMaybeIdle(); }, 20000);
-    kernelPending.set(id, { resolve, reject, timer }); post({ type: 'kernel-call', id, op, data });
+    kernelPending.set(id, { resolve, reject, timer });
+    if (Array.isArray(transfer) && transfer.length) self.postMessage({ type: 'kernel-call', id, op, data }, transfer.filter(Boolean));
+    else post({ type: 'kernel-call', id, op, data });
   });
 }
 function kernelHasHandles() {
+  const parentPort = CORE.worker_threads?.parentPort;
+  const parentPortOpen = kernelInfo.isThread && parentPort && parentPort._referenced && !parentPort._closed && (parentPort.listenerCount('message') > 0 || typeof parentPort._onmessage === 'function');
   return kernelEntryRunning || fsJobs || (globalThis.__beownirEsbuildJobs || 0) || kernelPending.size || [...kernelTimers.values()].some(t => t._referenced) ||
-    [...kernelChildren].some(c => c._referenced && !c._closed) || [...SERVERS.values()].some(s => !s._beownirUnref) || NET_SERVERS.size ||
+    [...kernelChildren].some(c => c._referenced && !c._closed) ||
+    [...KERNEL_THREADS.values()].some(t => t._referenced && !t._exited) ||
+    [...VIRTUAL_THREADS.values()].some(t => t._referenced && !t._exited) ||
+    [...ACTIVE_MESSAGE_PORTS].some(p => p._referenced && !p._closed && (p.listenerCount('message') > 0 || typeof p._onmessage === 'function')) ||
+    Boolean(parentPortOpen) ||
+    [...SERVERS.values()].some(s => !s._beownirUnref) || NET_SERVERS.size ||
     [...fsWatchers].some(w => !w.closed && w._beownirRef !== false) || [...fsWatchFile.values()].some(set => [...set].some(w => w._beownirRef !== false)) ||
     pendingQuestion || !processObj.stdin._ended && (processObj.stdin.listenerCount('data') || processObj.stdin.listenerCount('readable')) ||
     processObj.connected && (processEvents.listenerCount('message') || processEvents.listenerCount('disconnect'));
 }
 function kernelMaybeIdle() {
-  if (kernelInfo.pid === 1 || kernelExiting) return;
+  if ((kernelInfo.pid === 1 && !kernelInfo.isThread) || kernelExiting) return;
   runtimeNativeClearTimeout(kernelIdleTimer);
   kernelIdleTimer = runtimeNativeSetTimeout(() => {
     if (kernelHasHandles()) { beforeExitSent = false; return; }
     if (!beforeExitSent) { beforeExitSent = true; try { processEvents.emit('beforeExit', Number(processObj.exitCode) || 0); } catch (e) { kernelUnhandled(e); return; } if (kernelHasHandles()) { kernelMaybeIdle(); return; } }
-    kernelExit(Number(processObj.exitCode) || 0);
+    if (kernelInfo.isThread) kernelThreadExit(Number(processObj.exitCode) || 0);
+    else kernelExit(Number(processObj.exitCode) || 0);
   }, 40);
 }
 async function kernelFlush() { if (holdSync) throw virtualError('EBUSY', 'A filesystem transaction is in progress; wait for it before flushing.'); syncBack(); return kernelCall('barrier'); }
+function kernelThreadExit(code = 0, failure = null) {
+  if (kernelExiting || !kernelInfo.isThread) return;
+  kernelExiting = true; runtimeNativeClearTimeout(kernelIdleTimer);
+  const exitCode = Number(code) || 0;
+  try { processEvents.emit('exit', exitCode); } catch {}
+  try {
+    const pp = CORE.worker_threads?.parentPort;
+    if (pp && !pp._closed) { pp.postMessage({ __beownirThreadFlush: true }); pp.close(); }
+  } catch {}
+  syncBack();
+  const errPayload = failure ? { name: failure.name || 'Error', code: failure.code, message: String(failure.message || failure) } : null;
+  kernelCall('barrier').catch(() => {}).then(() => post({ type: 'thread-exit', code: exitCode, error: errPayload }));
+}
 function kernelExit(code = 0, signal = null) {
-  if (kernelExiting || kernelInfo.pid === 1) return;
+  if (kernelExiting || (kernelInfo.pid === 1 && !kernelInfo.isThread)) return;
+  if (kernelInfo.isThread) return kernelThreadExit(code);
   kernelExiting = true; runtimeNativeClearTimeout(kernelIdleTimer);
   try { processEvents.emit('exit', Number(code) || 0); } catch {}
   syncBack();
   kernelCall('barrier').catch(() => {}).then(() => post({ type: 'kernel-exit', code: Number(code) || 0, signal }));
 }
 function kernelUnhandled(e) {
-  if (e?.__exit !== undefined) { kernelExit(e.__exit); return; }
+  if (e?.__exit !== undefined) {
+    if (kernelInfo.isThread) kernelThreadExit(e.__exit);
+    else kernelExit(e.__exit);
+    return;
+  }
+  if (kernelInfo.isThread) { kernelThreadExit(1, e); return; }
   // A throw from a timer or a detached promise is still a Node crash: print it
   // with the same file:line, source line, caret and version trailer as a
   // top-level throw, not as a bare stack.
@@ -10469,7 +11847,10 @@ function kernelUnhandled(e) {
   if (frame) reportUncaught(e, frame[1]);
   else errOut('\x1b[31m' + String(e?.stack || e) + '\x1b[0m\n');
   if (kernelInfo.pid !== 1) kernelExit(1);
-  else if (typeof SHELL === 'object' && SHELL) SHELL.lastCode = 1;
+  else {
+    if (typeof SHELL === 'object' && SHELL) SHELL.lastCode = 1;
+    if (!processObj.exitCode) processObj.exitCode = 1;
+  }
 }
 function timerFunction(fn, repeating) {
   return function(callback, delay = 0, ...args) {
@@ -10478,7 +11859,7 @@ function timerFunction(fn, repeating) {
     // exception in a timer still belongs in the terminal instead of escaping to
     // the page's error handler (it used to abort the whole worker).
     if (kernelInternalDepth) return fn(callback, delay, ...args);
-    if (kernelInfo.pid === 1) return fn((...args_) => { try { callback(...args_); } catch (e) { kernelUnhandled(e); } }, delay, ...args);
+    if (kernelInfo.pid === 1 && !kernelInfo.isThread) return fn((...args_) => { try { callback(...args_); } catch (e) { kernelUnhandled(e); } }, delay, ...args);
     let handle;
     const id = fn(() => {
       if (!repeating) kernelTimers.delete(id);
@@ -10633,7 +12014,15 @@ class WorkerChildProcess extends EventEmitter {
         const file = tryFiles(resolve(cwd, childArgs[0])); if (file) await prepareModules(file);
       }
       await kernelFlush();
-      const result = await kernelCall('spawn', { command: childCommand, args: childArgs, cwd, env, stdio: modes, ipc: this.connected, prepared: [...preparedModules] });
+      let depsBuf;
+      if (FS['/project/node_modules'] && nodeModulesSyncedVersion !== nodeModulesDirtyVersion) {
+        const packed = packDependenciesCached();
+        if (packed) {
+          depsBuf = packed.buffer.slice(packed.byteOffset, packed.byteOffset + packed.byteLength);
+          nodeModulesSyncedVersion = nodeModulesDirtyVersion;
+        }
+      }
+      const result = await kernelCall('spawn', { command: childCommand, args: childArgs, cwd, env, stdio: modes, ipc: this.connected, prepared: [...preparedModules], deps: depsBuf }, depsBuf ? [depsBuf] : undefined);
       this.pid = result.pid; kernelChildrenByPID.set(this.pid, this); return this;
     })();
     let deadline; const abort = () => this.kill(options.killSignal || 'SIGTERM');
@@ -10672,7 +12061,173 @@ function captureWorker(file, args, options, callback) {
     callback(error, encoding ? output.toString(encoding) : output, encoding ? errors.toString(encoding) : errors);
   }); return child;
 }
-const unsupportedSyncProcess = () => { throw virtualError('ERR_NOT_SUPPORTED', 'Synchronous child processes require a synchronous cross-worker syscall architecture. Use spawn, exec, execFile or fork; this build never runs a fake same-worker subprocess.'); };
+const unsupportedSyncProcess = () => { throw virtualError('ERR_NOT_SUPPORTED', 'Synchronous child processes require cross-origin isolation (SharedArrayBuffer + Atomics.wait). Use spawn, exec, execFile or fork; this build never runs a fake same-worker subprocess.'); };
+function runSyncProcess(command, args, options = {}, { throwOnError = false } = {}) {
+  if (typeof SharedArrayBuffer === 'undefined' || typeof Atomics === 'undefined' || !kernelInfo.ctrlSab || !kernelInfo.threads) {
+    unsupportedSyncProcess();
+  }
+  options = options || {};
+  if (options.detached || options.uid !== undefined || options.gid !== undefined || (options.serialization && options.serialization !== 'json')) {
+    throw virtualError('ERR_NOT_SUPPORTED', 'Detached sessions, uid/gid changes and advanced IPC serialization are not supported.');
+  }
+  if (options.shell && options.shell !== true && !['sh', '/bin/sh'].includes(options.shell)) {
+    throw virtualError('ERR_NOT_SUPPORTED', 'Only the documented virtual sh command subset is available.');
+  }
+  let modes = options.stdio || ['pipe', 'pipe', 'pipe'];
+  if (typeof modes === 'string') modes = [modes, modes, modes];
+  if (!Array.isArray(modes) || modes.slice(0, 3).some(mode => mode !== undefined && !['pipe', 'inherit', 'ignore'].includes(mode))) {
+    throw virtualError('ERR_NOT_SUPPORTED', 'Only pipe, inherit and ignore virtual stdio are supported.');
+  }
+  modes = [modes[0] || 'pipe', modes[1] || 'pipe', modes[2] || 'pipe'];
+  let childCommand = String(command);
+  let childArgs = Array.isArray(args) ? args.map(String) : [];
+  if (options.shell) {
+    const shellLine = childArgs.length ? [childCommand, ...childArgs.map(shellQuote)].join(' ') : childCommand;
+    childCommand = 'sh';
+    childArgs = ['-c', shellLine];
+  }
+  const cwd = resolve(options.cwd || CWD);
+  const env = Object.fromEntries(
+    Object.entries(options.env || processObj.env)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => [key, String(value)])
+  );
+  let inputBytes = null;
+  if (options.input !== undefined && options.input !== null && modes[0] !== 'ignore') {
+    if (ArrayBuffer.isView(options.input)) inputBytes = new Uint8Array(unsharedView(options.input));
+    else if (options.input instanceof ArrayBuffer) inputBytes = new Uint8Array(options.input.slice(0));
+    else if (typeof SharedArrayBuffer !== 'undefined' && options.input instanceof SharedArrayBuffer) inputBytes = new Uint8Array(new Uint8Array(options.input).slice(0));
+    else inputBytes = new Uint8Array(Buffer.from(String(options.input), (options.encoding && options.encoding !== 'buffer') ? options.encoding : 'utf8'));
+  }
+  syncBack();
+  let depsBuf;
+  if (FS['/project/node_modules'] && nodeModulesSyncedVersion !== nodeModulesDirtyVersion) {
+    const packed = packDependenciesCached();
+    if (packed) {
+      depsBuf = packed.buffer.slice(packed.byteOffset, packed.byteOffset + packed.byteLength);
+      nodeModulesSyncedVersion = nodeModulesDirtyVersion;
+    }
+  }
+  const maxBuffer = Math.min(8 * 1024 * 1024, Math.max(1024, Number(options.maxBuffer) || 1024 * 1024));
+  const sabBytes = Math.min(16 * 1024 * 1024, Math.max(2 * 1024 * 1024, maxBuffer * 2 + 512 * 1024));
+  const syncSab = new SharedArrayBuffer(sabBytes);
+  const i32 = new Int32Array(syncSab, 0, 16);
+  const u8 = new Uint8Array(syncSab);
+  const transfer = depsBuf ? [depsBuf] : undefined;
+  post({
+    type: 'spawn-sync',
+    syncSab,
+    command: childCommand,
+    args: childArgs,
+    cwd,
+    env,
+    stdio: modes,
+    prepared: [...preparedModules],
+    deps: depsBuf,
+    inputBytes,
+    maxBuffer,
+    timeout: Number(options.timeout) || 0,
+    killSignal: options.killSignal || 'SIGTERM',
+  }, transfer);
+  const waitMs = Number(options.timeout) > 0 ? Math.max(100, Number(options.timeout) + 5000) : 30000;
+  if (Atomics.load(i32, 0) === 0) {
+    const statusWait = Atomics.wait(i32, 0, 0, waitMs);
+    if (Atomics.load(i32, 0) === 0 && statusWait === 'timed-out') {
+      const err = Object.assign(new Error('spawnSync ' + command + ' ETIMEDOUT'), {
+        code: 'ETIMEDOUT',
+        syscall: 'spawnSync ' + command,
+        path: String(command),
+        spawnargs: [childCommand, ...childArgs],
+        pid: 0,
+        status: null,
+        signal: null,
+        stdout: null,
+        stderr: null,
+        output: [null, null, null],
+      });
+      if (throwOnError) throw err;
+      return { pid: 0, output: [null, null, null], stdout: null, stderr: null, status: null, signal: null, error: err };
+    }
+  }
+  const pid = i32[1];
+  const rawStatus = i32[2];
+  const status = rawStatus < 0 ? null : rawStatus;
+  const outLen = i32[3], errLen = i32[4], sigLen = i32[5], codeLen = i32[6], msgLen = i32[7], deltaLen = i32[8], newEpoch = i32[9];
+  let off = 64;
+  const take = len => {
+    const slice = len > 0 ? u8.slice(off, off + len) : new Uint8Array(0);
+    off += len;
+    return slice;
+  };
+  const outBytes = take(outLen);
+  const errBytes = take(errLen);
+  const sigStr = sigLen ? decodeBytes(take(sigLen)) : null;
+  const errCode = codeLen ? decodeBytes(take(codeLen)) : '';
+  const errMsg = msgLen ? decodeBytes(take(msgLen)) : '';
+  const deltaBytes = take(deltaLen);
+  if (deltaBytes.length) {
+    try {
+      const parsed = JSON.parse(decodeBytes(deltaBytes));
+      applyKernelFiles(parsed.files || {}, parsed.versions || {}, false);
+      kernelEpoch = newEpoch;
+    } catch { kernelRefreshNeeded = true; }
+  } else if (typeof kernelEpoch === 'number' && newEpoch !== kernelEpoch) {
+    kernelRefreshNeeded = true;
+  }
+  let outBuf = Buffer.from(outBytes);
+  let errBuf = Buffer.from(errBytes);
+  if (modes[1] === 'inherit') {
+    if (outBuf.length) processObj.stdout.write(outBuf);
+    outBuf = null;
+  } else if (modes[1] === 'ignore') {
+    outBuf = null;
+  }
+  if (modes[2] === 'inherit') {
+    if (errBuf.length) processObj.stderr.write(errBuf);
+    errBuf = null;
+  } else if (modes[2] === 'ignore') {
+    errBuf = null;
+  }
+  const enc = options.encoding;
+  const formatOut = v => v === null ? null : (enc && enc !== 'buffer' ? v.toString(enc) : v);
+  const stdoutVal = errCode === 'ENOENT' ? null : formatOut(outBuf);
+  const stderrVal = errCode === 'ENOENT' ? null : formatOut(errBuf);
+  const outputArr = errCode === 'ENOENT' ? [null, null, null] : [null, stdoutVal, stderrVal];
+  let error = null;
+  if (errCode || errMsg) {
+    error = Object.assign(new Error(errMsg || ('spawnSync ' + command + ' ' + errCode)), {
+      code: errCode || 'ERR_VIRTUAL_OS',
+      ...(errCode === 'ENOENT' ? { errno: -2 } : {}),
+      syscall: 'spawnSync ' + command,
+      path: String(command),
+      spawnargs: [childCommand, ...childArgs],
+      pid,
+      status,
+      signal: sigStr,
+      stdout: stdoutVal,
+      stderr: stderrVal,
+      output: outputArr,
+    });
+  }
+  const res = { pid, output: outputArr, stdout: stdoutVal, stderr: stderrVal, status, signal: sigStr };
+  if (error) res.error = error;
+  if (throwOnError) {
+    if (error) throw error;
+    if ((status !== null && status !== 0) || sigStr) {
+      const errText = errBuf ? errBuf.toString('utf8') : '';
+      throw Object.assign(new Error('Command failed: ' + [childCommand, ...childArgs].join(' ') + (errText ? '\n' + errText : '')), {
+        status,
+        signal: sigStr,
+        output: outputArr,
+        stdout: stdoutVal,
+        stderr: stderrVal,
+        pid,
+      });
+    }
+    return stdoutVal;
+  }
+  return res;
+}
 Object.assign(CHILD_PROCESS, {
   ChildProcess: WorkerChildProcess, spawn: spawnWorker,
   fork(file, args, options) {
@@ -10686,7 +12241,18 @@ Object.assign(CHILD_PROCESS, {
     if (typeof options === 'function') { callback = options; options = {}; }
     return captureWorker(file, args, options || {}, callback);
   },
-  spawnSync: unsupportedSyncProcess, execSync: unsupportedSyncProcess, execFileSync: unsupportedSyncProcess, constants: {}
+  spawnSync(command, args, options) {
+    if (args !== undefined && !Array.isArray(args)) { options = args; args = []; }
+    return runSyncProcess(command, args || [], options || {}, { throwOnError: false });
+  },
+  execSync(command, options) {
+    return runSyncProcess('sh', ['-c', String(command)], options || {}, { throwOnError: true });
+  },
+  execFileSync(file, args, options) {
+    if (args !== undefined && !Array.isArray(args)) { options = args; args = []; }
+    return runSyncProcess(file, args || [], options || {}, { throwOnError: true });
+  },
+  constants: {}
 });
 /* Node's pid/ppid are own *enumerable* properties, so `Object.keys(process)`
  * and `{ ...process }` keep them. They used to be non-enumerable, which made the
@@ -10722,15 +12288,19 @@ processObj.finalization = {
 processObj.connected = false; processObj.exitCode = undefined;
 const originalChdir = processObj.chdir; processObj.chdir = path => { originalChdir(path); post({ type: 'kernel-cwd', cwd: CWD }); };
 const originalProcessExit = processObj.exit;
-processObj.exit = code => { if (kernelInfo.pid === 1) return originalProcessExit(code); kernelExit(code); throw { __exit: Number(code) || 0 }; };
+processObj.exit = code => {
+  if (kernelInfo.isThread) { kernelThreadExit(code); throw { __exit: Number(code) || 0 }; }
+  if (kernelInfo.pid === 1) return originalProcessExit(code);
+  kernelExit(code); throw { __exit: Number(code) || 0 };
+};
 processObj.send = undefined;
 processObj.virtualOS = Object.freeze({ version: '0.1.0', flush: kernelFlush, refresh: kernelRefresh, ps: () => kernelCall('ps'), kill: (pid, signal = 'SIGTERM', options = {}) => kernelCall('kill', { pid, signal, tree: !!options.tree }), capabilities: Object.freeze({ separateWorkers: true, jsonIPC: true, virtualHTTP: true, asyncSharedFS: true, synchronousSyscalls: false, nativeBinaries: false, maxProcesses: 8 }) });
 processObj.kill = (pid, signal = 'SIGTERM') => { if (!kernelTable.some(p => p.pid === Number(pid))) throw virtualError('ESRCH', 'No process with PID ' + pid); if (signal !== 0 && signal !== '0') kernelCall('kill', { pid, signal }).catch(kernelUnhandled); return true; };
-processObj.getActiveResourcesInfo = () => [...kernelTimers.values()].filter(t => t._referenced).map(() => 'Timeout').concat([...SERVERS.keys()].map(() => 'VirtualHTTPServer'), [...kernelChildren].filter(c => !c._closed).map(() => 'WorkerProcess'));
+processObj.getActiveResourcesInfo = () => [...kernelTimers.values()].filter(t => t._referenced).map(() => 'Timeout').concat([...SERVERS.keys()].map(() => 'VirtualHTTPServer'), [...kernelChildren].filter(c => !c._closed).map(() => 'WorkerProcess'), [...KERNEL_THREADS.values()].filter(t => !t._exited).map(() => 'WorkerThread'));
 
 function kernelStdio(kind) {
   const stream = new EventEmitter(); let pendingBytes = 0;
-  stream.writable = true; stream.writableEnded = false; stream.isTTY = kernelInfo.pid === 1 || kernelInfo.stdio?.[kind === 'stdout' ? 1 : 2] === 'inherit'; stream.columns = 80;
+  stream.writable = true; stream.writableEnded = false; stream.isTTY = (kernelInfo.pid === 1 && !kernelInfo.isThread) || kernelInfo.stdio?.[kind === 'stdout' ? 1 : 2] === 'inherit'; stream.columns = 80;
   // The same TTY surface the default stdout has: mocha and other reporters call these.
   stream.rows = 24; stream.getWindowSize = () => [stream.columns, stream.rows]; stream.hasColors = () => true; stream.getColorDepth = () => 8;
   // TTY cursor control for progress spinners (vite build, ora, ...).
@@ -10742,7 +12312,7 @@ function kernelStdio(kind) {
     if (!stream.writable) throw virtualError('ERR_STREAM_WRITE_AFTER_END', 'write after end');
     if (typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) throw new TypeError('stdout/stderr require a string, Buffer or Uint8Array.');
     const bytes = Buffer.from(chunk, encoding);
-    if (kernelInfo.pid === 1) { (kind === 'stdout' ? out : errOut)(bytes.toString()); callback?.(null); return true; }
+    if (kernelInfo.pid === 1 && !kernelInfo.isThread) { (kind === 'stdout' ? out : errOut)(bytes.toString()); callback?.(null); return true; }
     if (pendingBytes + bytes.length > 8 * 1024 * 1024) throw virtualError('ERR_CHILD_PROCESS_STDIO_MAXBUFFER', 'Pending virtual output exceeds 8 MiB. Respect stream backpressure.');
     pendingBytes += bytes.length;
     kernelCall('write-output', { stream: kind, bytes }).then(() => { pendingBytes -= bytes.length; callback?.(null); if (pendingBytes < 65536) stream.emit('drain'); }, e => { pendingBytes -= bytes.length; if (callback) callback(e); else { try { stream.emit('error', e); } catch (failure) { kernelUnhandled(failure); } } });
@@ -10751,6 +12321,52 @@ function kernelStdio(kind) {
   stream.end = (chunk, encoding, callback) => { if (typeof chunk === 'function') { callback = chunk; chunk = undefined; } if (typeof encoding === 'function') { callback = encoding; encoding = undefined; } if (chunk !== undefined) stream.write(chunk, encoding); stream.writable = false; stream.writableEnded = true; kernelFlush().then(() => { stream.emit('finish'); callback?.(); }); return stream; };
   return stream;
 }
+async function runWorkerThreadEntry() {
+  kernelEntryRunning = true;
+  let code = 0, failure = null;
+  try {
+    if (kernelInfo.isEval) {
+      const source = String(kernelInfo.filename || '').replace(/^#![^\n]*(?:\n|$)/, '');
+      const evalPath = resolve(CWD, '__worker_eval__.js');
+      processObj.argv = [processObj.execPath || 'node', '[worker eval]', ...(kernelInfo.argv || [])];
+      if (ESM_STATEMENT.test(source)) {
+        const transformed = transformEsm(source, evalPath, true);
+        const fn = (0, eval)('(async function(__beownirExports, __beownirRequire, __beownirModule, __beownirImport, __beownirExportStar, __beownirDynamicImport, __beownirImportMeta, __beownirWatch){' + transformed + '\n})');
+        const ns = Object.defineProperty(Object.defineProperty({}, '__esModule', { value: true }), Symbol.toStringTag, { value: 'Module' });
+        await fn.call(ns, ns, makeRequire(evalPath), { exports: ns, id: evalPath, filename: evalPath }, spec => importEsmAsync(spec, evalPath), exportStar, spec => dynamicImportEsm(spec, evalPath), importMetaFor(evalPath), watchEsmBinding);
+      } else {
+        const fn = (0, eval)('(async function(exports, require, module, __filename, __dirname){' + source + '\n})');
+        const mod = { exports: {}, id: evalPath, filename: evalPath };
+        await fn.call(mod.exports, mod.exports, makeRequire(evalPath), mod, evalPath, CWD);
+      }
+    } else {
+      const file = tryFiles(resolve(CWD, kernelInfo.filename));
+      if (!file) {
+        const missing = resolve(CWD, kernelInfo.filename);
+        throw Object.assign(new Error("Cannot find module '" + missing + "'"), { code: 'MODULE_NOT_FOUND' });
+      }
+      processObj.argv = [processObj.execPath || 'node', file, ...(kernelInfo.argv || [])];
+      for (const key of Object.keys(cache)) if (!key.startsWith('/.beownir/')) delete cache[key];
+      setMainModule(file);
+      await prepareModules(file);
+      try { loadFile(file); }
+      catch (error) {
+        if (error && error.__exit !== undefined && !(error instanceof Error)) code = Number(error.__exit) || 0;
+        else if (error && error.code === 'ERR_REQUIRE_ASYNC_MODULE') await loadEsmFileAsync(file);
+        else throw error;
+      }
+    }
+    if (processObj.exitCode !== undefined) code = Number(processObj.exitCode) || 0;
+  } catch (e) {
+    if (e && e.__exit !== undefined && !(e instanceof Error)) code = Number(e.__exit) || 0;
+    else { code = 1; failure = e; }
+  } finally {
+    kernelEntryRunning = false;
+    syncBack();
+    if (failure) kernelThreadExit(1, failure);
+    else kernelMaybeIdle();
+  }
+}
 const originalWorkerMessage = self.onmessage;
 self.onmessage = async event => {
   const message = event.data; if (!message || typeof message !== 'object') return;
@@ -10758,14 +12374,80 @@ self.onmessage = async event => {
     if (message.type === 'init') {
       kernelInfo = message.kernel || kernelInfo; CWD = kernelInfo.cwd || '/project';
       kernelEpoch = typeof kernelInfo.epoch === 'number' ? kernelInfo.epoch : null; kernelRefreshNeeded = false;
-      processObj.env = { ...(kernelInfo.pid === 1 ? processObj.env : {}), ...(kernelInfo.env || {}), PWD: CWD }; processObj.connected = !!kernelInfo.ipc;
+      for (const [k, v] of kernelInfo.envData || []) ENV_DATA.set(k, v);
+      processObj.env = { ...(kernelInfo.pid === 1 && !kernelInfo.isThread ? processObj.env : {}), ...(kernelInfo.env || {}), PWD: CWD }; processObj.connected = !!kernelInfo.ipc;
       processObj.stdout = kernelStdio('stdout'); processObj.stderr = kernelStdio('stderr');
+      if (kernelInfo.hasSyncInput) {
+        const inputBytes = kernelInfo.syncInput instanceof Uint8Array ? kernelInfo.syncInput : null;
+        SHELL.stdin = inputBytes?.length ? decodeBytes(inputBytes) : '';
+        kernelDeferredInput.push({ type: 'kernel-stdin', bytes: inputBytes?.length ? inputBytes : null, end: true });
+      }
+      if (kernelInfo.isThread) {
+        const port = new NodeMessagePort(kernelInfo.port || null, { rxSab: kernelInfo.mailboxes?.toWorker || null, txSab: kernelInfo.mailboxes?.toMain || null });
+        port.once('close', () => kernelMaybeIdle());
+        CORE.worker_threads.isMainThread = false;
+        CORE.worker_threads.threadId = kernelInfo.threadId;
+        CORE.worker_threads.threadName = kernelInfo.name || '';
+        CORE.worker_threads.resourceLimits = kernelInfo.resourceLimits || { ...DEFAULT_RESOURCE_LIMITS };
+        CORE.worker_threads.parentPort = port;
+        CORE.worker_threads.workerData = reviveNodePortsFromPost(kernelInfo.workerData);
+        if (kernelInfo.shareEnv) shareEnvActive = true;
+      }
       if (processObj.connected) {
         processObj.send = (value, callback) => { if (!processObj.connected) { const e = virtualError('ERR_IPC_CHANNEL_CLOSED', 'Virtual IPC channel is closed.'); if (callback) callback(e); else throw e; return false; } const clone = JSON.parse(JSON.stringify(value)); syncBack(); kernelCall('ipc', { direction: 'parent', message: clone }).then(() => callback?.(null), e => callback ? callback(e) : kernelUnhandled(e)); return true; };
         processObj.disconnect = () => kernelCall('disconnect');
       }
       for (const [path, prepared] of kernelInfo.prepared || []) preparedModules.set(path, prepared);
+      if (kernelInfo.isThread) {
+        // Initialize filesystem and optional dependency archive synchronously-before-ready for worker threads.
+        holdSync++;
+        FS = Object.create(null); FS['/'] = { d: true, m: Date.now() };
+        for (const [path, value] of Object.entries(message.files || {})) {
+          if (!path.startsWith('/project/') && path !== '/project' && !path.startsWith('/tmp/') && path !== '/tmp') continue;
+          FS[path] = value.d ? { d: true, m: Date.now() } : { c: unpackFileData(value.c), m: Date.now() };
+          baseRevisions[path] = message.versions?.[path] || 0;
+        }
+        mkdirp('/project'); mkdirp('/tmp'); mkdirp('/.beownir/runtime');
+        FS['/.beownir/runtime/esbuild.js'] = { c: message.embeddedEsbuildBrowser, m: Date.now() };
+        FS['/.beownir/runtime/esbuild.wasm'] = { c: Buffer.from(message.embeddedEsbuildWasm), m: Date.now() };
+        FS['/.beownir/runtime/esbuild-shim.js'] = { c: ESBUILD_SHIM_SOURCE, m: Date.now() };
+        FS['/.beownir/runtime/compat/oxide.cjs'] = { c: COMPAT_OXIDE_SOURCE, m: Date.now() };
+        FS['/.beownir/runtime/compat/lightningcss.cjs'] = { c: COMPAT_LIGHTNINGCSS_SOURCE, m: Date.now() };
+        FS['/.beownir/runtime/pako.js'] = { c: message.embeddedPako, m: Date.now() };
+        FS['/.beownir/runtime/rollup/native.js'] = { c: ROLLUP_NATIVE_SOURCE, m: Date.now() };
+        FS['/.beownir/runtime/rollup/wasm-node/bindings_wasm.js'] = { c: ROLLUP_BINDINGS_SOURCE, m: Date.now() };
+        try { FS['/.beownir/runtime/rollup/wasm-node/bindings_wasm_bg.wasm'] = { c: Buffer.from(pakoApi().ungzip(Buffer.from(ROLLUP_WASM_GZ_B64, 'base64'))), m: Date.now() }; } catch {}
+        dirty.clear(); holdSync--;
+        if (message.deps) { try { await restoreDependencyCheckpoint(message.deps); } catch {} }
+        post({ type: 'ready' });
+        post({ type: 'thread-online' });
+        await runWorkerThreadEntry();
+        return;
+      }
       return await originalWorkerMessage(event);
+    }
+    if (message.type === 'kernel-env-data') {
+      if (message.deleted) ENV_DATA.delete(message.key);
+      else ENV_DATA.set(message.key, message.value);
+      return;
+    }
+    if (message.type === 'kernel-share-env') {
+      applyingRemoteShareEnv = true;
+      try {
+        if (message.deleted) delete envStore[message.key];
+        else envStore[message.key] = String(message.value);
+      } finally { applyingRemoteShareEnv = false; }
+      return;
+    }
+    if (message.type === 'thread-direct-message') {
+      const revived = reviveNodePortsFromPost(message.value);
+      processEvents.emit('workerMessage', revived, message.fromThreadId);
+      return;
+    }
+    if (message.type === 'thread-event') {
+      const thread = KERNEL_THREADS.get(message.threadId);
+      if (thread) thread._handleKernelEvent(message);
+      return;
     }
     if (message.type === 'setfiles') { applyKernelFiles(message.files || {}, message.versions); if (typeof message.kernelEpoch === 'number') kernelEpoch = message.kernelEpoch; return; }
     if (message.type === 'kernel-reply') {

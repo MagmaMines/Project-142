@@ -28,6 +28,7 @@
     "embed:check": "node tools/build-embed.mjs --check",
     "embed:e2e": "node test/embed/embed-e2e.cjs",
     "e2e:browser": "node test/browser/vite-hmr-e2e.cjs",
+    "e2e:threads": "node test/browser/worker-threads-e2e.cjs",
     "release:candidate": "node tools/package-release.mjs",
     "reports": "node tools/reports.mjs",
     "reports:fast": "node tools/reports.mjs --fast",

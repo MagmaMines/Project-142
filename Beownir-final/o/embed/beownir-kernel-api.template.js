@@ -141,6 +141,7 @@
       /* allow-scripts only: the kernel runs in an opaque origin, so project code
        * cannot reach this page's storage, cookies or DOM. */
       frame.setAttribute('sandbox', 'allow-scripts');
+      frame.setAttribute('allow', 'cross-origin-isolated');
       frame.setAttribute('referrerpolicy', 'no-referrer');
       frame.setAttribute('aria-hidden', 'true');
       frame.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden';

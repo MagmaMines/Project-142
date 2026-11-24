@@ -10,6 +10,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { loadRuntime } from './helpers/runtime.mjs';
 
 const privatePem = fs.readFileSync(new URL('./fixtures/rsa-2048.pem', import.meta.url), 'utf8');
@@ -175,4 +178,189 @@ test('unsupported asymmetric features fail loudly instead of returning wrong byt
   assert.equal(result.digestCode, 'ERR_CRYPTO_INVALID_DIGEST');
   assert.equal(result.tooLargeCode, 'ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE');
   assert.equal(result.pssConstant, 6);
+});
+
+test('X509Certificate parses OpenSSL certificates and matches Node 22 fields & checks', async t => {
+  let certPem;
+  let caPem;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-x509-'));
+  try {
+    try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); }
+    catch { t.skip('openssl CLI not available'); return; }
+    const keyPath = path.join(tmp, 'key.pem');
+    const certPath = path.join(tmp, 'cert.pem');
+    const caPath = path.join(tmp, 'ca.pem');
+    fs.writeFileSync(keyPath, privatePem);
+    execFileSync('openssl', [
+      'req', '-x509', '-new', '-key', keyPath,
+      '-subj', '/C=US/ST=California/O=Beownir/OU=Runtime/CN=example.com/emailAddress=admin@example.com',
+      '-addext', 'subjectAltName=DNS:example.com,DNS:*.sub.example.com,IP:127.0.0.1,email:alt@example.com',
+      '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:1',
+      '-addext', 'extendedKeyUsage=serverAuth,clientAuth',
+      '-addext', 'authorityInfoAccess=OCSP;URI:http://ocsp.example.com,caIssuers;URI:http://ca.example.com/ca.crt',
+      '-days', '365', '-out', certPath,
+    ]);
+    execFileSync('openssl', [
+      'req', '-x509', '-new', '-key', keyPath,
+      '-subj', '/CN=Other Root CA',
+      '-days', '30', '-out', caPath,
+    ]);
+    certPem = fs.readFileSync(certPath, 'utf8');
+    caPem = fs.readFileSync(caPath, 'utf8');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const expected = new crypto.X509Certificate(certPem);
+  const runtime = await runtimeWithKey();
+  runtime.FS['/project/cert.pem'] = { c: certPem };
+  runtime.FS['/project/ca.pem'] = { c: caPem };
+  const actual = run(runtime, `
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const pem = fs.readFileSync('/project/cert.pem', 'utf8');
+    const cert = new crypto.X509Certificate(pem);
+    const other = new crypto.X509Certificate(fs.readFileSync('/project/ca.pem', 'utf8'));
+    const priv = crypto.createPrivateKey(fs.readFileSync('/project/private.pem', 'utf8'));
+    const fromDer = new crypto.X509Certificate(cert.raw);
+    const pubFromPem = crypto.createPublicKey(pem);
+    const legacy = cert.toLegacyObject();
+    ({
+      subject: cert.subject,
+      issuer: cert.issuer,
+      subjectAltName: cert.subjectAltName,
+      infoAccess: cert.infoAccess,
+      validFrom: cert.validFrom,
+      validTo: cert.validTo,
+      validFromIso: cert.validFromDate.toISOString(),
+      validToIso: cert.validToDate.toISOString(),
+      serialNumber: cert.serialNumber,
+      fingerprint: cert.fingerprint,
+      fingerprint256: cert.fingerprint256,
+      fingerprint512: cert.fingerprint512,
+      ca: cert.ca,
+      keyUsage: cert.keyUsage,
+      keyType: cert.publicKey.asymmetricKeyType,
+      pubSpki: cert.publicKey.export({ type: 'spki', format: 'pem' }),
+      pubFromPemMatches: pubFromPem.equals(cert.publicKey),
+      derMatches: fromDer.fingerprint256 === cert.fingerprint256,
+      toJsonMatches: cert.toJSON() === cert.toString() && cert.toString().includes('-----BEGIN CERTIFICATE-----'),
+      hostExact: cert.checkHost('example.com'),
+      hostWild: cert.checkHost('a.sub.example.com'),
+      hostDeep: cert.checkHost('a.b.sub.example.com'),
+      hostMiss: cert.checkHost('evil.com'),
+      emailHit: cert.checkEmail('alt@example.com'),
+      emailMiss: cert.checkEmail('other@example.com'),
+      ipHit: cert.checkIP('127.0.0.1'),
+      ipMiss: cert.checkIP('10.0.0.1'),
+      issuedSelf: cert.checkIssued(cert),
+      issuedOther: cert.checkIssued(other),
+      privMatch: cert.checkPrivateKey(priv),
+      verifySelf: cert.verify(cert.publicKey),
+      verifyOtherPub: (() => {
+        // flip modulus bit via fresh test key fails verify: test tampered cert raw verify fails
+        const der = Buffer.from(cert.raw);
+        der[der.length - 5] ^= 0xff;
+        try { return new crypto.X509Certificate(der).verify(cert.publicKey); } catch { return false; }
+      })(),
+      legacyModulus: legacy.modulus,
+      legacyBits: legacy.bits,
+      legacyExponent: legacy.exponent,
+      legacySubject: legacy.subject,
+      legacyCa: legacy.ca,
+      legacyExtUsage: legacy.ext_key_usage,
+      legacySan: legacy.subjectaltname,
+    });
+  `);
+
+  const expectedLegacy = expected.toLegacyObject();
+  assert.equal(actual.subject, expected.subject);
+  assert.equal(actual.issuer, expected.issuer);
+  assert.equal(actual.subjectAltName, expected.subjectAltName);
+  assert.equal(actual.infoAccess, expected.infoAccess);
+  assert.equal(actual.validFrom, expected.validFrom);
+  assert.equal(actual.validTo, expected.validTo);
+  assert.equal(actual.validFromIso, expected.validFromDate.toISOString());
+  assert.equal(actual.validToIso, expected.validToDate.toISOString());
+  assert.equal(actual.serialNumber, expected.serialNumber);
+  assert.equal(actual.fingerprint, expected.fingerprint);
+  assert.equal(actual.fingerprint256, expected.fingerprint256);
+  assert.equal(actual.fingerprint512, expected.fingerprint512);
+  assert.equal(actual.ca, expected.ca);
+  assert.deepEqual(plain(actual.keyUsage), expected.keyUsage);
+  assert.equal(actual.keyType, 'rsa');
+  assert.equal(actual.pubSpki, publicPem);
+  assert.equal(actual.pubFromPemMatches, true);
+  assert.equal(actual.derMatches, true);
+  assert.equal(actual.toJsonMatches, true);
+  assert.equal(actual.hostExact, expected.checkHost('example.com'));
+  assert.equal(actual.hostWild, expected.checkHost('a.sub.example.com'));
+  assert.equal(actual.hostDeep, expected.checkHost('a.b.sub.example.com'));
+  assert.equal(actual.hostMiss, expected.checkHost('evil.com'));
+  assert.equal(actual.emailHit, expected.checkEmail('alt@example.com'));
+  assert.equal(actual.emailMiss, expected.checkEmail('other@example.com'));
+  assert.equal(actual.ipHit, expected.checkIP('127.0.0.1'));
+  assert.equal(actual.ipMiss, expected.checkIP('10.0.0.1'));
+  assert.equal(actual.issuedSelf, true);
+  assert.equal(actual.issuedOther, false);
+  assert.equal(actual.privMatch, true);
+  assert.equal(actual.verifySelf, true);
+  assert.equal(actual.verifyOtherPub, false);
+  assert.equal(actual.legacyModulus, expectedLegacy.modulus);
+  assert.equal(actual.legacyBits, expectedLegacy.bits);
+  assert.equal(actual.legacyExponent, expectedLegacy.exponent);
+  assert.deepEqual(plain(actual.legacySubject), plain(expectedLegacy.subject));
+  assert.equal(actual.legacyCa, expectedLegacy.ca);
+  assert.deepEqual(plain(actual.legacyExtUsage), expectedLegacy.ext_key_usage);
+  assert.equal(actual.legacySan, expectedLegacy.subjectaltname);
+});
+
+test('Certificate verifies OpenSSL SPKAC and extracts challenge and public key', async t => {
+  let spkacB64;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-spkac-'));
+  try {
+    try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); }
+    catch { t.skip('openssl CLI not available'); return; }
+    const keyPath = path.join(tmp, 'key.pem');
+    fs.writeFileSync(keyPath, privatePem);
+    const spkacOut = execFileSync('openssl', ['spkac', '-key', keyPath, '-challenge', 'beownir-challenge-42'], { encoding: 'utf8' });
+    spkacB64 = spkacOut.trim().replace(/^SPKAC\s*=\s*/i, '');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const runtime = await runtimeWithKey();
+  const badBuf = Buffer.from(spkacB64, 'base64');
+  badBuf[badBuf.length - 3] ^= 0xff;
+  const badB64 = badBuf.toString('base64');
+
+  const actual = run(runtime, `
+    const crypto = require('crypto');
+    const spkac = ${JSON.stringify(spkacB64)};
+    const bad = ${JSON.stringify(badB64)};
+    const inst = crypto.Certificate();
+    ({
+      isInst: inst instanceof crypto.Certificate,
+      staticVerify: crypto.Certificate.verifySpkac(spkac),
+      instVerify: inst.verifySpkac(Buffer.from(spkac)),
+      badVerify: crypto.Certificate.verifySpkac(bad),
+      invalidVerify: crypto.Certificate.verifySpkac('not-valid-spkac'),
+      challenge: crypto.Certificate.exportChallenge(spkac).toString('utf8'),
+      instChallenge: inst.exportChallenge(spkac).toString('utf8'),
+      badChallenge: crypto.Certificate.exportChallenge('not-valid'),
+      pubPem: crypto.Certificate.exportPublicKey(spkac).toString('utf8'),
+      instPubPem: inst.exportPublicKey(Buffer.from(spkac)).toString('utf8'),
+    });
+  `);
+
+  assert.equal(actual.isInst, true);
+  assert.equal(actual.staticVerify, true);
+  assert.equal(actual.instVerify, true);
+  assert.equal(actual.badVerify, false);
+  assert.equal(actual.invalidVerify, false);
+  assert.equal(actual.challenge, 'beownir-challenge-42');
+  assert.equal(actual.instChallenge, 'beownir-challenge-42');
+  assert.equal(actual.badChallenge, '');
+  assert.equal(actual.pubPem, publicPem);
+  assert.equal(actual.instPubPem, publicPem);
 });

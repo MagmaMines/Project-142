@@ -14,7 +14,7 @@ const OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 };
 const WHENCE = { SET: 0, CUR: 1, END: 2 };
 const ALL_RIGHTS = (1n << 64n) - 1n;
 const ERRNO_BY_CODE = { ENOENT: ERRNO.NOENT, EEXIST: ERRNO.EXIST, EISDIR: ERRNO.ISDIR, ENOTDIR: ERRNO.NOTDIR, ENOTEMPTY: ERRNO.NOTEMPTY, EBADF: ERRNO.BADF, EINVAL: ERRNO.INVAL, ENOTCAPABLE: ERRNO.NOTCAPABLE };
-const UNSUPPORTED = ['fd_filestat_set_times', 'path_link', 'path_readlink', 'path_symlink', 'path_filestat_set_times', 'poll_oneoff', 'proc_raise', 'sock_accept', 'sock_recv', 'sock_send', 'sock_shutdown', 'fd_readdir_cookie'];
+const UNSUPPORTED = ['fd_filestat_set_times', 'path_link', 'path_readlink', 'path_symlink', 'path_filestat_set_times', 'proc_raise', 'sock_accept', 'sock_recv', 'sock_send', 'sock_shutdown', 'fd_readdir_cookie'];
 
 // Errors have the same codes and messages as Node's WASI class, so code that handles them works unchanged.
 function nodeError(code, message) {
@@ -55,7 +55,7 @@ class WASI {
     this._env = Object.entries(options.env || {}).map(([key, value]) => key + '=' + value);
     this._stdout = typeof options.stdout === 'function' ? options.stdout : null;
     this._stderr = typeof options.stderr === 'function' ? options.stderr : null;
-    this._memory = null;
+    this._memory = typeof WebAssembly !== 'undefined' && options.memory instanceof WebAssembly.Memory ? options.memory : null;
     this._fds = new Map([
       [0, { kind: 'stdin' }],
       [1, { kind: 'stdout' }],
@@ -66,6 +66,7 @@ class WASI {
       this._fds.set(this._nextFd++, { kind: 'dir', host: nodePath.resolve(host), preopen: guest });
     }
     this._imports = this._buildImports();
+    this.wasiImport = this._imports;
   }
 
   getImportObject() {
@@ -124,16 +125,18 @@ class WASI {
   _checkInstance(instance) {
     const exports = instance && instance.exports;
     if (typeof exports !== 'object' || exports === null) throw invalidType('instance.exports', 'object', exports);
-    if (!(exports.memory instanceof WebAssembly.Memory)) {
-      throw nodeError('ERR_INVALID_ARG_TYPE', `"instance.exports.memory" property must be a WebAssembly.Memory object. Received ${describe(exports.memory)}`);
-    }
-    return exports.memory;
+    if (exports.memory instanceof WebAssembly.Memory) return exports.memory;
+    if (this._memory instanceof WebAssembly.Memory) return this._memory;
+    throw nodeError('ERR_INVALID_ARG_TYPE', `"instance.exports.memory" property must be a WebAssembly.Memory object. Received ${describe(exports.memory)}`);
   }
 
   // Memory is read through the buffer each time, because a memory that grows replaces its buffer.
   _bytes(ptr, len) { return new Uint8Array(this._memory.buffer, ptr, len); }
   _view() { return new DataView(this._memory.buffer); }
-  _text(ptr, len) { return new TextDecoder().decode(this._bytes(ptr, len)); }
+  _text(ptr, len) {
+    const view = this._bytes(ptr, len);
+    return new TextDecoder().decode(typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer ? view.slice() : view);
+  }
 
   _entry(fd, kind) {
     const entry = this._fds.get(fd);
@@ -255,6 +258,80 @@ class WASI {
         return ERRNO.SUCCESS;
       },
       sched_yield() { return ERRNO.SUCCESS; },
+      poll_oneoff(inPtr, outPtr, nsubscriptions, neventsPtr) {
+        const count = Number(nsubscriptions);
+        if (!Number.isInteger(count) || count <= 0) return ERRNO.INVAL;
+        const view = this._view();
+        const ready = [];
+        const clocks = [];
+        const nowMs = Date.now();
+        for (let i = 0; i < count; i++) {
+          const base = inPtr + i * 48;
+          const userdata = view.getBigUint64(base, true);
+          const type = view.getUint8(base + 8);
+          if (type === 0) {
+            const timeoutNs = view.getBigUint64(base + 24, true);
+            const flags = view.getUint16(base + 40, true);
+            const delayMs = (flags & 1) ? Math.max(0, Number(timeoutNs) / 1e6 - nowMs) : Math.max(0, Number(timeoutNs) / 1e6);
+            clocks.push({ userdata, type, delayMs });
+          } else if (type === 1 || type === 2) {
+            const fd = view.getInt32(base + 16, true);
+            const entry = this._fds.get(fd);
+            if (!entry) {
+              ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n });
+            } else if (type === 1) {
+              if (entry.kind === 'file') {
+                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(Math.max(0, entry.data.length - entry.pos)) });
+              } else if (entry.kind === 'stdin') {
+                if (count === 1) ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 0n });
+              } else {
+                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n });
+              }
+            } else {
+              if (entry.kind === 'file' || entry.kind === 'stdout' || entry.kind === 'stderr') {
+                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 65536n });
+              } else {
+                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n });
+              }
+            }
+          } else {
+            return ERRNO.INVAL;
+          }
+        }
+        if (!ready.length && clocks.length) {
+          let minDelay = Infinity;
+          for (const c of clocks) if (c.delayMs < minDelay) minDelay = c.delayMs;
+          const waitMs = Math.max(0, Math.min(30000, Math.ceil(minDelay)));
+          if (waitMs > 0) {
+            let slept = false;
+            if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
+              try {
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+                slept = true;
+              } catch {}
+            }
+            if (!slept) {
+              const until = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + waitMs;
+              while ((typeof performance !== 'undefined' ? performance.now() : Date.now()) < until) {}
+            }
+          }
+          for (const c of clocks) {
+            if (c.delayMs <= minDelay + 1) ready.push({ userdata: c.userdata, type: 0, error: ERRNO.SUCCESS, nbytes: 0n });
+          }
+        }
+        const outView = this._view();
+        for (let i = 0; i < ready.length; i++) {
+          const ev = ready[i];
+          const ptr = outPtr + i * 32;
+          this._bytes(ptr, 32).fill(0);
+          outView.setBigUint64(ptr, ev.userdata, true);
+          outView.setUint16(ptr + 8, ev.error, true);
+          outView.setUint8(ptr + 10, ev.type);
+          if (ev.type === 1 || ev.type === 2) outView.setBigUint64(ptr + 16, ev.nbytes, true);
+        }
+        outView.setUint32(neventsPtr, ready.length, true);
+        return ERRNO.SUCCESS;
+      },
       proc_exit(code) { throw new WASIExit(code); },
       fd_write(fd, iovs, iovsLen, writtenPtr) {
         const entry = this._entry(fd);
