@@ -157,7 +157,11 @@ export async function fetchPackage(meta) {
 /**
  * Resolves a dependency graph breadth-first and returns the install plan.
  * Flat install, first version wins — the same shape npm produces for the
- * overwhelming majority of framework trees.
+ * overwhelming majority of framework trees. When a later dependent needs a
+ * version the hoisted one cannot satisfy (SvelteKit: svelte wants
+ * is-reference ^3, @rollup/plugin-commonjs pins 1.2.1), the alternate is
+ * recorded in `nested` and installed under its dependent's node_modules,
+ * the way npm resolves the conflict.
  */
 const RUNTIME_OS = ['browser', 'wasi'];
 const RUNTIME_CPU = ['wasm32'];
@@ -176,12 +180,41 @@ function requiredPeers(meta) {
   return Object.fromEntries(Object.entries(meta.peerDependencies || {}).filter(([name]) => !(meta2[name] && meta2[name].optional)));
 }
 
+const NEST_DEPTH_LIMIT = 5;
+const NESTED_CAP = 160;
+function nestDepth(dir) { return (dir.match(/node_modules/g) || []).length - 1; }
+
 export async function resolveTree(roots, { concurrency = 8, maxPackages = 400, log = () => {} } = {}) {
   const resolved = new Map();
+  /* key = install dir (relative), value = { name, version, tarball, dir, dependencies }. */
+  const nested = new Map();
   const queue = roots.map(({ name, range }) => ({ name, range, from: '<root>' }));
   const failures = [];
   let active = 0;
   let done = false;
+  /* Every dependent re-checks its ranges against the hoisted tree (that is how
+   * conflicts are discovered), so identical (name, range) lookups repeat
+   * constantly. Memoize the registry lookups by promise. */
+  const rangeCache = new Map();
+  const cachedResolve = (name, range) => {
+    const key = name + '\u0000' + range;
+    let entry = rangeCache.get(key);
+    if (!entry) { entry = resolveRange(name, range); rangeCache.set(key, entry); }
+    return entry;
+  };
+
+  /* Record an alternate version at `dir` and enqueue its own dependencies
+   * (a nested package may need versions that differ from the hoisted tree,
+   * e.g. lazystream's readable-stream@2 wanting process-nextick-args). */
+  const recordNested = (job, meta, dir) => {
+    if (nested.has(dir) || nested.size >= NESTED_CAP || nestDepth(dir) > NEST_DEPTH_LIMIT) return false;
+    nested.set(dir, { name: job.name, version: meta.version, tarball: meta.dist.tarball, dir, dependencies: meta.dependencies || {} });
+    log('nested ' + job.name + '@' + meta.version + ' at ' + dir);
+    for (const [dep, depRange] of Object.entries(meta.dependencies || {})) {
+      queue.push({ name: dep, range: depRange, from: job.name, nestedDir: dir });
+    }
+    return true;
+  };
 
   return await new Promise(resolve => {
     const pump = () => {
@@ -189,17 +222,29 @@ export async function resolveTree(roots, { concurrency = 8, maxPackages = 400, l
       while (active < concurrency && queue.length) {
         const job = queue.shift();
         active++;
-        resolveRange(job.name, job.range).then(meta => {
+        cachedResolve(job.name, job.range).then(meta => {
           active--;
           if (meta.skipped) { failures.push({ name: job.name, range: job.range, from: job.from, reason: meta.reason }); return pump(); }
           // npm installs an optional dependency only when its os/cpu fields accept the platform.
           // The runtime identifies as browser/wasm32 (WASI-compatible), so native-only binaries are skipped.
           if (job.soft && (!platformAccepts(meta.os, RUNTIME_OS) || !platformAccepts(meta.cpu, RUNTIME_CPU))) { pump(); return; }
-          if (resolved.has(job.name)) { pump(); return; }
+          if (resolved.has(job.name)) {
+            const hoisted = resolved.get(job.name);
+            if (!maxSatisfying([hoisted.version], job.range) && job.from !== '<root>' && meta.version !== hoisted.version) {
+              /* The dependent is itself nested: keep drilling down inside it.
+               * Otherwise npm semantics: nest beside the dependent's files. */
+              const dir = job.nestedDir ? job.nestedDir + '/node_modules/' + job.name : 'node_modules/' + job.from + '/node_modules/' + job.name;
+              recordNested(job, meta, dir);
+            }
+            pump(); return;
+          }
           if (resolved.size >= maxPackages) { failures.push({ name: job.name, range: job.range, reason: 'package cap reached' }); return pump(); }
           resolved.set(job.name, { name: job.name, version: meta.version, tarball: meta.dist.tarball, dependencies: meta.dependencies || {}, optional: meta.optionalDependencies || {}, peer: meta.peerDependencies || {} });
           log('resolved ' + job.name + '@' + meta.version);
-          for (const [dep, depRange] of Object.entries({ ...(meta.dependencies || {}) })) if (!resolved.has(dep)) queue.push({ name: dep, range: depRange, from: job.name });
+          /* Enqueue unconditionally: a dep whose name is already hoisted may
+           * still need a different version (path-scurry wants lru-cache ^10
+           * while cacache's ^7 got hoisted) — the handler records the conflict. */
+          for (const [dep, depRange] of Object.entries({ ...(meta.dependencies || {}) })) queue.push({ name: dep, range: depRange, from: job.name, nestedDir: job.nestedDir });
           for (const [dep, depRange] of Object.entries({ ...(meta.optionalDependencies || {}), ...requiredPeers(meta) })) if (!resolved.has(dep)) queue.push({ name: dep, range: depRange, from: job.name, soft: true });
           pump();
         }).catch(failure => {
@@ -208,27 +253,31 @@ export async function resolveTree(roots, { concurrency = 8, maxPackages = 400, l
           pump();
         });
       }
-      if (active === 0 && queue.length === 0) { done = true; resolve({ packages: resolved, failures }); }
+      if (active === 0 && queue.length === 0) { done = true; resolve({ packages: resolved, failures, nested }); }
     };
     pump();
   });
 }
 
 /** Downloads every resolved package and returns a virtual-FS file map. */
-export async function installTree(packages, { concurrency = 6, log = () => {} } = {}) {
+export async function installTree(packages, { concurrency = 6, log = () => {}, nested = [] } = {}) {
   const files = {};
   const installed = [];
   const failures = [];
   const jobs = [...packages.values()];
+  for (const entry of nested) jobs.push({ ...entry, nestedUnder: entry.dir });
   let index = 0;
   const worker = async () => {
     while (index < jobs.length) {
       const job = jobs[index++];
       try {
         const pkg = await fetchPackage(job);
-        for (const [relative, contents] of Object.entries(pkg.files)) files['node_modules/' + job.name + '/' + relative] = contents;
-        installed.push({ name: job.name, version: job.version, bytes: pkg.bytes });
-        log('fetched ' + job.name + '@' + job.version);
+        /* A nested entry's dir already names the full install path including
+         * the package itself: node_modules/<dependent>/node_modules/<name>. */
+        const prefix = job.nestedUnder ? job.nestedUnder + '/' : 'node_modules/' + job.name + '/';
+        for (const [relative, contents] of Object.entries(pkg.files)) files[prefix + relative] = contents;
+        installed.push({ name: job.name, version: job.version, bytes: pkg.bytes, nestedUnder: job.nestedUnder || null });
+        log('fetched ' + job.name + '@' + job.version + (job.nestedUnder ? ' under ' + job.nestedUnder : ''));
       } catch (failure) {
         failures.push({ name: job.name, version: job.version, reason: failure.message });
       }

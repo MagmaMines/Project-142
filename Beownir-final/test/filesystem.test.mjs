@@ -72,3 +72,19 @@ test('rm, rmdir and root protection still behave', () => withScratch(async () =>
   assert.equal(fs.existsSync('/project/scratch/gone'), false);
   assert.equal(fs.existsSync('/'), true);
 }));
+
+test('openSync handles directory fds and writeSync handles stdio fds like Node', () => withScratch(async () => {
+  fs.mkdirSync('/project/scratch/dir');
+  fs.writeFileSync('/project/scratch/file.txt', 'ok');
+  const dirFd = fs.openSync('/project/scratch/dir', 'r');
+  try {
+    assert.equal(typeof dirFd, 'number');
+    assert.equal(fs.fstatSync(dirFd).isDirectory(), true);
+  } finally {
+    fs.closeSync(dirFd);
+  }
+  assert.throws(() => fs.openSync('/project/scratch/dir', 'w'), error => error.code === 'EISDIR');
+  assert.throws(() => fs.openSync('/project/scratch/dir', fs.constants.O_WRONLY), error => error.code === 'EISDIR');
+  assert.throws(() => fs.openSync('/project/scratch/file.txt', fs.constants.O_RDONLY | fs.constants.O_DIRECTORY), error => error.code === 'ENOTDIR');
+  assert.equal(fs.writeSync(1, 'hello-stdout\n'), 13);
+}));

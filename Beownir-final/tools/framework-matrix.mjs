@@ -550,12 +550,199 @@ const profiles = [
   {
     name: 'tailwind-3',
     packages: [{ name: 'tailwindcss', range: '3' }, { name: 'postcss', range: 'latest' }],
-    note: 'Tailwind v3 is pure JavaScript. Tailwind v4 needs the native lightningcss binary and is not supported here',
+    note: 'Tailwind v3 is pure JavaScript and needs no native fallbacks; Tailwind v4 runs through its real PostCSS plugin with the oxide scanner and lightningcss served by JavaScript compat shims (the tailwind-4 row)',
     smoke: `(async () => {
       const postcss = require('postcss');
       const tailwind = require('tailwindcss');
       const result = await postcss([tailwind({ content: [], theme: {}, plugins: [] })]).process('@tailwind base;@tailwind utilities;', { from: undefined });
       return 'tailwind ' + require('tailwindcss/package.json').version + ' compiled css=' + result.css.length + ' bytes';
+    })()`,
+  },
+  /* --- the rows below are the "hard" framework set. They existed only as
+   * prose claims before; now each one installs the real framework and records
+   * either the milestone it reached or the exact error that stopped it. --- */
+  {
+    name: 'next',
+    packages: [
+      { name: 'next', range: '15.5.29' },
+      { name: 'react', range: '19.3.1' },
+      { name: 'react-dom', range: '19.3.1' },
+      /* The JS-only SWC build: the resolver serves this when Next requires its
+       * per-platform @next/swc-* native bindings (see native-fallback tests). */
+      { name: '@next/swc-wasm-nodejs', range: '15.5.29' },
+    ],
+    note: 'Next 15 boots with SWC served by the WASM twin (59 ms first transform, 0-13 ms after, measured). The dev server also boots and webpack compiled 147 modules to its done hook in the VM harness, but a full page render costs ~17 min per page there (~1 GiB RSS) - beyond row budget, so the render is not claimed',
+    timeoutMs: 420000,
+    smoke: `(async () => {
+      process.env.NODE_ENV = 'development';
+      process.env.NEXT_TELEMETRY_DISABLED = '1';
+      const next = require('next');
+      const version = require('next/package.json').version;
+      /* The platform binding is deliberately NOT installed: resolution must
+       * land on the wasm twin, which is the whole JS-only-fallback contract. */
+      const resolved = require.resolve('@next/swc-linux-x64-gnu');
+      if (!String(resolved).includes('@next/swc-wasm-nodejs')) throw new Error('platform binding resolved to ' + resolved);
+      const swc = require('@next/swc-wasm-nodejs');
+      const page = "export default function Home() { return <main><h1 id='app'>NEXT_SMOKE_OK</h1></main>; }";
+      const started = Date.now();
+      const out = swc.transformSync(page, { jsc: { parser: { syntax: 'ecmascript', jsx: true }, transform: { react: { runtime: 'automatic' } } }, isModule: true });
+      const code = String((out && out.code) || out);
+      if (!code.includes('NEXT_SMOKE_OK')) throw new Error('swc output missing the marker: ' + code.slice(0, 200));
+            if (!/jsx-runtime|createElement/.test(code)) throw new Error('the JSX was not transformed: ' + code.slice(0, 200));
+      return 'next ' + version + ' loads; @next/swc-linux-x64-gnu resolves to the wasm twin; transformSync compiled the JSX page to ' + code.length + ' bytes in ' + (Date.now() - started) + ' ms';
+    })()`,
+  },
+  {
+    name: 'nestjs',
+    packages: [
+      { name: '@nestjs/core', range: '12' },
+      { name: '@nestjs/common', range: '12' },
+      { name: '@nestjs/platform-express', range: '12' },
+      { name: 'reflect-metadata', range: 'latest' },
+      { name: 'rxjs', range: 'latest' },
+      { name: 'express', range: 'latest' },
+    ],
+    note: 'NestJS 12 bootstrap with the exact metadata TypeScript decorators emit, defined by hand in plain JavaScript',
+    timeoutMs: 240000,
+    smoke: `(async () => {
+      require('reflect-metadata');
+      const { NestFactory } = require('@nestjs/core');
+      class AppService { getHello() { return 'NEST_SMOKE_OK'; } }
+      class AppController {
+        constructor(appService) { this.appService = appService; }
+        getHello() { return this.appService.getHello(); }
+      }
+      Reflect.defineMetadata('design:paramtypes', [AppService], AppController);
+      Reflect.defineMetadata('path', '', AppController);
+      Reflect.defineMetadata('method', 0, AppController.prototype.getHello);
+      Reflect.defineMetadata('path', '', AppController.prototype.getHello);
+      class AppModule {}
+      Reflect.defineMetadata('controllers', [AppController], AppModule);
+      Reflect.defineMetadata('providers', [AppService], AppModule);
+      const app = await NestFactory.create(AppModule, { logger: false });
+      await app.listen(0);
+      const port = app.getHttpServer().address().port;
+      const response = await probe(port, '/');
+      await app.close();
+      if (!String(response.body).includes('NEST_SMOKE_OK')) throw new Error('nest answered ' + response.status + ': ' + String(response.body).slice(0, 200));
+      return 'nestjs ' + require('@nestjs/core/package.json').version + ' served ' + response.status + ' ' + String(response.body).trim() + ' (express adapter)';
+    })()`,
+  },
+  {
+    name: 'nuxt',
+    packages: [{ name: 'nuxt', range: '4.4.8' }],
+    note: 'Nuxt 4.4.8 (last Rollup-based line; >=4.5.0 needs vite 8 / rolldown whose @rolldown/binding-wasm32-wasi spawns a real worker_threads WASI thread pool at require time - impossible in a single-threaded browser worker). The tree installs fully (~530 packages incl. nested version conflicts); loadNuxt + nuxt.ready() complete in-VM in roughly 210 s (telemetry disabled: it prompts on stdin otherwise); the nitro dev server listens on the virtual loopback - but the first SSR request never finishes, so the row times out honestly. Nuxt >=4.5.0 recorded as blocked, not claimed',
+    files: {
+      'package.json': '{"name":"nuxt-smoke","private":true,"type":"module"}\n',
+      'nuxt.config.js': 'export default { devtools: { enabled: false }, telemetry: false, compatibilityDate: \'2026-11-01\' };\n',
+      'app/app.vue': '<template><main><h1 id="app">NUXT_SMOKE_OK</h1></main></template>\n',
+    },
+    timeoutMs: 420000,
+    smoke: `(async () => {
+      const { loadNuxt } = require('nuxt');
+      const nuxt = await loadNuxt({ cwd: '/project', dev: true });
+      const { toNodeListener } = require('h3');
+      const handler = toNodeListener(nuxt.server.app);
+      const server = http.createServer(handler);
+      server.listen(0);
+      await once(server, 'listening');
+      const response = await probe(server.port, '/');
+      server.close();
+      const body = String(response.body);
+      if (!body.includes('NUXT_SMOKE_OK')) throw new Error('nuxt answered ' + response.status + ' without the marker: ' + body.slice(0, 300));
+      return 'nuxt ' + require('nuxt/package.json').version + ' dev-rendered the app.vue page';
+    })()`,
+  },
+  {
+    name: 'astro',
+    packages: [{ name: 'astro', range: '5.18.2' }],
+    note: 'Astro 5.18.2 static build of a one-page site (Vite + esbuild WASM + Astro compiler). Astro 6 requires Node >=22.23.4, newer than the 22.22.3 differential baseline, so it is not claimed either',
+    files: {
+      'package.json': '{"name":"astro-smoke","private":true,"type":"module"}\n',
+      'astro.config.mjs': "import { defineConfig } from 'astro/config';\nexport default defineConfig({ output: 'static' });\n",
+      'src/pages/index.astro': "---\nconst marker = 'ASTRO_SMOKE_OK';\n---\n<html><body><main><h1 id=\"app\">{marker}</h1></main></body></html>\n",
+    },
+    timeoutMs: 420000,
+    smoke: `(async () => {
+      const { build } = require('astro');
+      await build({ root: '/project', logLevel: 'warn' });
+      const fs = require('fs');
+      const html = fs.readFileSync('/project/dist/index.html', 'utf8');
+      if (!html.includes('ASTRO_SMOKE_OK')) throw new Error('dist/index.html missing the marker: ' + html.slice(0, 200));
+      return 'astro ' + require('astro/package.json').version + ' built dist/index.html (' + html.length + ' bytes)';
+    })()`,
+  },
+  {
+    name: 'sveltekit',
+    packages: [
+      { name: '@sveltejs/kit', range: '2.70.4' },
+      { name: 'svelte', range: '5' },
+      { name: '@sveltejs/vite-plugin-svelte', range: '6' },
+      { name: '@sveltejs/adapter-node', range: '5.5.8' },
+      { name: 'vite', range: '7' },
+    ],
+    note: 'SvelteKit 2.70.4 sync + vite 7 build with the kit plugin and adapter-node (precompress disabled: browsers ship no Brotli codec for zlib streams; gzip assets are produced with createGzip). SvelteKit 3 peers vite 8 / rolldown, whose @rolldown/binding-wasm32-wasi spawns a real worker_threads WASI thread pool at require time - a single-threaded browser worker cannot nest real threads, so that line is recorded as blocked here rather than claimed',
+    files: {
+      'package.json': '{"name":"kit-smoke","private":true,"type":"module"}\n',
+      'svelte.config.js': "import adapter from '@sveltejs/adapter-node';\nexport default { kit: { adapter: adapter({ precompress: false }) } };\n",
+      'vite.config.js': "import { sveltekit } from '@sveltejs/kit/vite';\nexport default { plugins: [sveltekit()] };\n",
+      'src/routes/+page.svelte': '<main><h1 id="app">KIT_SMOKE_OK</h1></main>\n',
+      'src/app.html': '<html><head>%sveltekit.head%</head><body>%sveltekit.body%</body></html>\n',
+    },
+    timeoutMs: 420000,
+    command: 'npx svelte-kit sync && npx vite build',
+    verify: `(() => { const fs = require('fs'); const entry = '/project/build/index.js'; const handler = '/project/build/handler.js'; if (!fs.existsSync(entry) || !fs.existsSync(handler)) return 'missing adapter-node output'; return 'adapter-node output present (' + fs.statSync(entry).size + ' byte entry, ' + fs.statSync(handler).size + ' byte handler)'; })()`,
+  },
+  {
+    name: 'remix',
+    packages: [
+      { name: '@remix-run/dev', range: '2' },
+      { name: '@remix-run/node', range: '2' },
+      { name: '@remix-run/react', range: '2' },
+      { name: 'react', range: '18.3.1' },
+      { name: 'react-dom', range: '18.3.1' },
+      { name: 'isbot', range: 'latest' },
+    ],
+    note: 'Remix v2 compiler build (esbuild-based) of a one-route app',
+    files: {
+      'package.json': '{"name":"remix-smoke","private":true,"sideEffects":false,"dependencies":{"@remix-run/node":"^2","@remix-run/react":"^2","react":"^18.3.1","react-dom":"^18.3.1","isbot":"^4"}}\n',
+      'remix.config.js': "module.exports = { appDirectory: 'app', assetsBuildDirectory: 'public/build', serverBuildPath: 'server/build/index.js' };\n",
+      'app/root.jsx': "import { Links, Meta, Outlet, Scripts } from '@remix-run/react';\nexport default function Root() { return (<html><head><Meta /><Links /></head><body><Outlet /><Scripts /></body></html>); }\n",
+      'app/routes/index.jsx': "export default function Index() { return <main><h1 id=\"app\">REMIX_SMOKE_OK</h1></main>; }\n",
+    },
+    timeoutMs: 420000,
+    command: 'NODE_ENV=production npx remix build',
+    verify: `(() => require('fs').readFileSync('/project/server/build/index.js', 'utf8').length + ' byte server bundle')()`,
+  },
+  {
+    name: 'angular',
+    packages: [
+      { name: '@angular/core', range: 'latest' },
+      { name: '@angular/common', range: 'latest' },
+      { name: '@angular/compiler', range: 'latest' },
+      { name: '@angular/platform-server', range: 'latest' },
+      { name: '@angular/platform-browser', range: 'latest' },
+      { name: 'rxjs', range: 'latest' },
+    ],
+    note: 'Angular platform-server renderApplication of a zoneless standalone component',
+    timeoutMs: 240000,
+    smoke: `(async () => {
+      /* renderModule runs a runtime-decorated (JIT) component, and Angular
+       * requires the JIT compiler to be loaded before any injectable from a
+       * partially-compiled library declares itself - the same import Node
+       * programs need before calling renderModule. */
+      require('@angular/compiler');
+      const { renderApplication } = require('@angular/platform-server');
+      const { bootstrapApplication } = require('@angular/platform-browser');
+      const { Component, provideZonelessChangeDetection } = require('@angular/core');
+      const AppComponent = (() => {
+        class AppComponent {}
+        Component({ selector: 'app-root', template: '<main><h1 id="app">ANGULAR_SMOKE_OK</h1></main>', standalone: true })(AppComponent);
+        return AppComponent;
+      })();
+      const html = await renderApplication((context) => bootstrapApplication(AppComponent, { providers: [provideZonelessChangeDetection()] }, context), { document: '<!doctype html><html><body><app-root></app-root></body></html>' });
+      if (!String(html).includes('ANGULAR_SMOKE_OK')) throw new Error('angular rendered no marker: ' + String(html).slice(0, 200));
+      return 'angular ' + require('@angular/core/package.json').version + ' server-rendered a standalone component';
     })()`,
   },
 ];
@@ -575,24 +762,35 @@ globalThis.once = (emitter, event) => new Promise((resolve, reject) => {
   if (event === 'listening' && emitter.once) emitter.once('error', reject);
 });
 globalThis.probe = (port, requestPath, options = {}) => new Promise((resolve, reject) => {
+  /* A dev server's first hit pays the framework's full compile; the default
+   * budget is for warm servers, and rows that compile pass a bigger one. */
+  const timer = setTimeout(() => reject(new Error('probe timed out after ' + (options.timeoutMs || 10000) + ' ms')), options.timeoutMs || 10000);
   const req = CORE.http.request({ port, path: requestPath, method: options.method || 'GET', headers: options.headers }, res => {
     let text = ''; res.setEncoding('utf8');
     res.on('data', chunk => text += chunk);
-    res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: text }));
+    res.on('end', () => { clearTimeout(timer); resolve({ status: res.statusCode, headers: res.headers, body: text }); });
   });
-  req.on('error', reject);
+  req.on('error', error => { clearTimeout(timer); reject(error); });
   if (options.body) req.write(options.body);
   req.end();
 });`;
 
 const formatError = failure => {
   const code = failure?.code ? failure.code + ': ' : '';
-  return code + String(failure?.message || failure).split('\n')[0].slice(0, 220);
+  /* Nest-style errors carry structured messages (validation arrays); string
+   * them instead of printing "[object Object]". */
+  const raw = failure?.message;
+  const text = typeof raw === 'string' ? raw : JSON.stringify(raw) || String(failure);
+  return code + text.split('\n')[0].slice(0, 220);
 };
 
 const run = async ({ only, write, check }) => {
   // Boot through the real init path so /.beownir/runtime holds the esbuild shim and Rollup WASM.
-  const rt = await initToolchain(loadRuntime());
+  /* Framework trees are large: Next.js alone installs ~90 MiB unpacked. A real
+   * hosted page derives the workspace budget from its origin quota (up to the
+   * 20 GiB ceiling), so the rows run with a 1 GiB workspace — the same rule,
+   * a realistic number instead of the 64 MiB no-quota floor. */
+  const rt = await initToolchain(loadRuntime(), { limits: { bytes: 1024 ** 3, perFile: 64 * 1024 ** 2, entries: 60000 } });
   rt.evaluate(INJECT);
   rt.evaluate("CORE.process = CORE.process || processObj; CORE.http = CORE.http || http;");
   /* Each row starts from a clean project: twenty dependency trees do not fit in
@@ -602,6 +800,13 @@ const run = async ({ only, write, check }) => {
     for (const key of Object.keys(__internal.getFS())) {
       if (key === '/project/node_modules' || key.startsWith('/project/node_modules/') || key === '/project/smoke' || key.startsWith('/project/smoke/')) { delete __internal.getFS()[key]; removed++; }
     }
+    /* A hosted page boots a fresh runtime, so one row must not see another
+     * row's module cache any more than it sees another row's files. Without
+     * this, the tailwind-3 row required the tailwindcss 4.3.5 modules the
+     * tailwind-4 row had already cached at the same paths. The runtime's own
+     * /.beownir/ modules stay, exactly as runNode keeps them. */
+    const moduleCache = (CORE.module && CORE.module._cache) || {};
+    for (const key of Object.keys(moduleCache)) if (!String(key).startsWith('/.beownir/')) delete moduleCache[key];
     return removed;
   })()`);
   const results = [];
@@ -609,15 +814,23 @@ const run = async ({ only, write, check }) => {
     if (only && !profile.name.includes(only)) continue;
     resetProject();
     const started = Date.now();
-    const tree = await resolveTree(profile.packages);
-    const { files, installed, failures } = await installTree(tree.packages);
+    const tree = await resolveTree(profile.packages, { maxPackages: 1000 });
+    const { files, installed, failures } = await installTree(tree.packages, { nested: [...tree.nested.values()] });
     rt.sandbox.__inject('/project/', files);
     if (profile.files) rt.sandbox.__inject('/project/', profile.files);
     const versions = installed.filter(item => profile.packages.some(root => root.name === item.name)).map(item => item.name + '@' + item.version);
     let outcome, code;
+    /* Heavy frameworks can hang (a dev server waiting on something a page
+     * cannot provide). A row that exceeds its budget is a failure with the
+     * timeout named, not a wedged harness. */
+    const timeoutMs = profile.timeoutMs || 240000;
+    const withTimeout = (promise, ms) => Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('row timed out after ' + ms + ' ms')), ms)),
+    ]);
     try {
       if (profile.command) {
-        const result = await rt.run(profile.command);
+        const result = await withTimeout(rt.run(profile.command), timeoutMs);
         outcome = (result.output || '').trim() || 'command completed with exit ' + result.code;
         code = result.code;
         if (code === 0 && profile.verify) {
@@ -625,10 +838,13 @@ const run = async ({ only, write, check }) => {
           outcome += '; ' + String(verified);
         }
       } else {
-        const value = await rt.evaluate(`(async () => { const require = CORE.module.createRequire('/project/index.js'); const http = CORE.http; return (${profile.smoke}); })()`);
+        const value = await withTimeout(rt.evaluate(`(async () => { const require = CORE.module.createRequire('/project/index.js'); const http = CORE.http; return (${profile.smoke}); })()`), timeoutMs);
         outcome = String(value); code = 0;
       }
-    } catch (failure) { outcome = formatError(failure); code = 1; }
+    } catch (failure) {
+      if (process.env.BEOWNIR_MATRIX_VERBOSE) console.log('[verbose] ' + profile.name + ':\n' + (failure && failure.stack || failure));
+      outcome = formatError(failure); code = 1;
+    }
     results.push({ name: profile.name, passed: code === 0, detail: outcome, note: profile.note, packages: installed.length, versions, installFailures: failures.length, resolveFailures: tree.failures.length, ms: Date.now() - started });
     console.log(`${code === 0 ? '  ok  ' : ' FAIL '} ${profile.name.padEnd(9)} ${outcome}`);
   }
@@ -650,6 +866,13 @@ const run = async ({ only, write, check }) => {
   return results;
 };
 
+/* A timed-out dev-server row leaves rejected promises inside the VM; the
+ * result table is already printed, so absorb them instead of crashing before
+ * the summary and --write can run. */
+process.on('unhandledRejection', () => {});
 const args = process.argv.slice(2);
 const only = args.find(argument => argument.startsWith('--only='))?.slice('--only='.length);
 await run({ only, write: args.includes('--write'), check: args.includes('--check') });
+/* A timed-out dev-server row leaves its timers alive inside the VM; the result
+ * table is already printed, so exit instead of hanging on open handles. */
+process.exit(process.exitCode || 0);

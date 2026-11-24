@@ -167,7 +167,7 @@ test('WebAssembly and WASI work in a worker without SharedArrayBuffer', async ()
   assert.deepEqual(result, { module: true, imports: 'function' });
 });
 
-test('worker_threads advertises its real limits instead of pretending', async () => {
+test('worker_threads is virtualized on the single main thread', async () => {
   const { sync } = await degraded();
   const result = sync(`(() => {
     const threads = require('worker_threads');
@@ -181,9 +181,11 @@ test('worker_threads advertises its real limits instead of pretending', async ()
   assert.equal(result.parentPort, null);
   assert.equal(result.port, 'function');
   assert.equal(result.channel, 'function');
-  // The single-file runtime runs one main thread: spawning is refused by name
-  // rather than silently running code on the caller's thread.
-  assert.match(result.worker, /Nested Node worker_threads are unsupported/);
+  // Workers are virtualized in-process: constructing one runs its module on
+  // the one main thread and routes messages through a virtual port, which is
+  // what tools spawning small workers need. There is no second thread, and
+  // the isMainThread/parentPort answers above keep saying so.
+  assert.equal(result.worker, 'no throw');
   assert.equal(result.channelName, 'function');
 });
 

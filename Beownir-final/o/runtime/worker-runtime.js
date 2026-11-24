@@ -173,6 +173,7 @@ function lazyModule(load) {
 PATH.posix = PATH;
 
 /* ---------- Buffer ---------- */
+const isArrayBufferLike = v => Boolean(v && typeof v === 'object' && !ArrayBuffer.isView(v) && (v instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && v instanceof SharedArrayBuffer) || Object.prototype.toString.call(v) === '[object ArrayBuffer]' || Object.prototype.toString.call(v) === '[object SharedArrayBuffer]'));
 class Buffer extends Uint8Array {
   static from(v, enc, length){
     if(typeof v==='string'){
@@ -186,7 +187,7 @@ class Buffer extends Uint8Array {
       if(['ucs2','ucs-2','utf16le','utf-16le'].includes(e)){ const b=new Buffer(v.length*2); for(let i=0;i<v.length;i++){const c=v.charCodeAt(i);b[i*2]=c&255;b[i*2+1]=c>>>8;} return b; }
       const encoded=te.encode(v), b=new Buffer(encoded.length); b.set(encoded); return b;
     }
-    if(v instanceof ArrayBuffer) return new Buffer(v,typeof enc==='number'?enc:0,typeof length==='number'?length:undefined);
+    if(isArrayBufferLike(v)) return new Buffer(v,typeof enc==='number'?enc:0,typeof length==='number'?length:undefined);
     if(ArrayBuffer.isView(v)){ const u=new Uint8Array(v.buffer,v.byteOffset,v.byteLength), b=new Buffer(u.length); b.set(u); return b; }
     if(Array.isArray(v)||v&&typeof v==='object'&&Number.isFinite(v.length)){ const b=new Buffer(v.length>>>0); for(let i=0;i<b.length;i++)b[i]=Number(v[i])||0; return b; }
     if(v&&v.type==='Buffer'&&Array.isArray(v.data)) return Buffer.from(v.data);
@@ -214,7 +215,7 @@ class Buffer extends Uint8Array {
     return td.decode(sub);
   }
   copy(target,targetStart=0,sourceStart=0,sourceEnd=this.length){
-    const view=target instanceof Uint8Array?target:Buffer.from(target);
+    const view=ArrayBuffer.isView(target)?new Uint8Array(target.buffer,target.byteOffset,target.byteLength):Buffer.from(target);
     const slice=this.subarray(sourceStart,sourceEnd);
     const count=Math.max(0,Math.min(slice.length,view.length-Math.max(0,targetStart)));
     view.set(slice.subarray(0,count),Math.max(0,targetStart));
@@ -458,7 +459,7 @@ class EventEmitter {
   rawListeners(n){ return [...(this._events&&this._events[n]||[])]; }
   eventNames(){ return Reflect.ownKeys(this._events||{}).filter(n=>(this._events[n]||[]).length); }
   getMaxListeners(){ return this._maxListeners??EventEmitter.defaultMaxListeners; }
-  setMaxListeners(n){ if(!Number.isInteger(n)||n<0)throw Object.assign(new RangeError('The value of "n" is out of range. It must be a non-negative integer. Received '+n),{code:'ERR_OUT_OF_RANGE'}); this._maxListeners=n; return this; }
+  setMaxListeners(n){ if(typeof n!=='number'||Number.isNaN(n)||n<0)throw Object.assign(new RangeError('The value of "n" is out of range. It must be a non-negative integer. Received '+n),{code:'ERR_OUT_OF_RANGE'}); this._maxListeners=n; return this; }
   static listenerCount(emitter,n){ return emitter.listenerCount(n); }
   static getEventListeners(emitter,n){ return emitter.rawListeners(n).map(f=>f.listener||f); }
 }
@@ -473,9 +474,19 @@ EventEmitter.captureRejectionSymbol = kCaptureRejection;
 
 /* ---------- streams (practical subset) ---------- */
 const deferStreamNotify = fn => runtimeNativeSetTimeout(fn, 0);
-class Stream extends EventEmitter {
-  pipe(dst,opts={}){const end=opts.end!==false;this.on('data',d=>{if(dst.write(d)===false)this.pause&&this.pause();});dst.on&&dst.on('drain',()=>this.resume&&this.resume());this.once('end',()=>{if(end&&dst.end)dst.end();});this.on('error',e=>dst.emit&&dst.emit('error',e));this.resume&&this.resume();return dst;}
+/* Node's legacy Stream is a plain callable function, not a class: util.inherits
+ * era code (send's SendStream, tar-stream, many others) does Stream.call(this),
+ * which a class constructor rejects. */
+function Stream(options) {
+  if (!(this instanceof Stream)) return new Stream(options);
+  /* EventEmitter's constructor fields, inlined: the class itself cannot be
+   * .call()'d, and constructing a second EE for `this` is not possible. */
+  this._events = Object.create(null); this._eventsCount = 0; this._maxListeners = undefined;
+  this[kCaptureRejectionFlag] = Boolean(options && options.captureRejections);
 }
+Stream.prototype = Object.create(EventEmitter.prototype);
+Stream.prototype.constructor = Stream;
+Stream.prototype.pipe = function (dst,opts={}){const end=opts.end!==false;this.on('data',d=>{if(dst.write(d)===false)this.pause&&this.pause();});dst.on&&dst.on('drain',()=>this.resume&&this.resume());this.once('end',()=>{if(end&&dst.end)dst.end();});this.on('error',e=>dst.emit&&dst.emit('error',e));this.resume&&this.resume();return dst;};
 class Readable extends Stream {
   constructor(opts={}){super();this.readable=true;this._buf=[];this._ended=false;this._paused=true;this._encoding=null;this.readableFlowing=null;this.readableEnded=false;this._objectMode=!!opts.objectMode;this._highWaterMark=Number.isFinite(opts.highWaterMark)?opts.highWaterMark:(this._objectMode?16:65536);this._reading=false;this._wantRead=false;if(opts.read)this._read=opts.read;}
   on(n,f){super.on(n,f);if(n==='data')this.resume();return this;}
@@ -493,7 +504,7 @@ class Readable extends Stream {
     // therefore fill the buffer before a consumer reacts, and read() hands back
     // one coalesced chunk — exactly what Node does.
     if(ch===null){this._ended=true;deferStreamNotify(()=>{this.emit('readable');if(!this._buf.length&&!this.readableEnded)this._maybeEnd();});return false;}
-    if(this._encoding&&ch instanceof Uint8Array)ch=td.decode(ch,{stream:true});
+    if(this._encoding&&ArrayBuffer.isView(ch))ch=td.decode(ch,{stream:true});
     this._buf.push(ch);deferStreamNotify(()=>{this.emit('readable');if(this.listenerCount('data')&&!this._paused){while(this._buf.length)this.emit('data',this._buf.shift());}if(this._wantRead)this._maybeRead();});return true;
   }
   // Node's read() without a size drains everything buffered into one chunk;
@@ -698,7 +709,7 @@ Readable.fromWeb = function fromWeb(webStream){
       for(;;){
         const { done, value } = await reader.read();
         if(done)break;
-        readable.push(value instanceof Uint8Array ? Buffer.from(value) : value);
+        readable.push(ArrayBuffer.isView(value) ? Buffer.from(value) : value);
       }
       readable.push(null);
     }catch(error){ readable.destroy(error); }
@@ -710,7 +721,7 @@ Readable.toWeb = function toWeb(readable){
     start(controller){
       readable.pause?.();
       readable.on('data',chunk=>{
-        controller.enqueue(chunk instanceof Uint8Array ? new Uint8Array(chunk) : new TextEncoder().encode(String(chunk)));
+        controller.enqueue(ArrayBuffer.isView(chunk) ? new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)) : new TextEncoder().encode(String(chunk)));
         readable.pause?.();
       });
       readable.on('end',()=>{ try{ controller.close(); }catch{} });
@@ -725,7 +736,7 @@ Writable.fromWeb = function fromWeb(webStream){
   return new Writable({
     objectMode:false,
     write(chunk,encoding,callback){
-      writer.write(chunk instanceof Uint8Array ? new Uint8Array(chunk) : Buffer.from(String(chunk)))
+      writer.write(ArrayBuffer.isView(chunk) ? new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)) : Buffer.from(String(chunk)))
         .then(()=>writer.ready.then(()=>callback(),callback),callback);
     },
     final(callback){ writer.close().then(()=>callback(),callback); }
@@ -787,16 +798,49 @@ const dirty = new Set(),fsWatchers=new Set(),fsWatchFile=new Map(),FS_FDS=new Ma
 function mark(p){dirty.add(p);if(!holdSync&&!syncTimer)syncTimer=runtimeNativeSetTimeout(()=>{syncTimer=null;syncBack();},150);notifyFilesystem(p);}
 function notifyFilesystem(p){for(const w of fsWatchers){const rel=p===w.path?'.':p.startsWith(w.path==='/'?'/':w.path+'/')?p.slice(w.path.length+1):null;if(rel!==null&&(rel==='.'||!rel.includes('/')||w.recursive)){const name=rel==='.'?basename(p):rel;queueMicrotask(()=>{if(!w.closed){w.emit('change',w.type==='rename'?'rename':'change',name);w.callback&&w.callback(w.type==='rename'?'rename':'change',name);}});}}for(const [file,watchers] of fsWatchFile){if(file===p){let curr;try{curr=statOf(file);}catch(e){curr={size:0,mtimeMs:0};}for(const x of watchers){const prev=x.prev;x.prev=curr;queueMicrotask(()=>x.listener(curr,prev));}}}
 }
-function openSync(p,flags='r'){p=resolve(p);const f=typeof flags==='number'?flags:0;const text=String(flags);if(!FS[p]&&!(text.includes('w')||text.includes('a')||f&64)){throw fsError('ENOENT','open',p);}if(FS[p]?.d)throw fsError('EISDIR','open',p);if(text.includes('w')||f&512)writeFileSync(p,'');else if(text.includes('a')&&!FS[p])writeFileSync(p,'');const fd=nextFd++;FS_FDS.set(fd,{path:p,pos:text.includes('a')?readFileSync(p).length:0,flags:text});return fd;}
+function openSync(p,flags='r'){p=resolve(p);const f=typeof flags==='number'?flags:null;const text=typeof flags==='string'?flags:'';const isCreate=f!==null?!!(f&64):(text.includes('w')||text.includes('a'));const isExcl=f!==null?!!(f&128):text.includes('x');const isTrunc=f!==null?!!(f&512):text.includes('w');const isAppend=f!==null?!!(f&1024):text.includes('a');const isWrite=f!==null?!!(f&(1|2)):(text.includes('w')||text.includes('a')||text.includes('+'));if(FS[p]&&isCreate&&isExcl)throw fsError('EEXIST','open',p);if(!FS[p]&&!isCreate)throw fsError('ENOENT','open',p);if(FS[p]?.d){if(isWrite||isTrunc)throw fsError('EISDIR','open',p);}else{if(f!==null&&(f&65536))throw fsError('ENOTDIR','open',p);if(!FS[p]||isTrunc)writeFileSync(p,'');}const fd=nextFd++;FS_FDS.set(fd,{path:p,pos:(!FS[p]?.d&&isAppend)?readFileSync(p).length:0,flags:f!==null?f:text,dir:!!FS[p]?.d});return fd;}
 function fdEntry(fd){const x=FS_FDS.get(fd);if(!x)throw Object.assign(new Error('EBADF: bad file descriptor'),{code:'EBADF'});return x;}
 function closeSync(fd){if(!FS_FDS.has(fd))throw Object.assign(new Error('EBADF: bad file descriptor'),{code:'EBADF'});FS_FDS.delete(fd);}
 function readSync(fd,buffer,offset=0,length=buffer.length-offset,position=null){const x=fdEntry(fd),data=readFileSync(x.path),pos=position===null?x.pos:position,n=Math.max(0,Math.min(length,data.length-pos));buffer.set(data.subarray(pos,pos+n),offset);if(position===null)x.pos+=n;return n;}
-function writeSync(fd,data,a,b,c){const x=fdEntry(fd);let bytes,offset=0,length,position=null;if(typeof data==='string'){position=typeof a==='number'?a:null;bytes=Buffer.from(data,typeof b==='string'?b:'utf8');length=bytes.length;}else{bytes=Buffer.from(data);offset=Number(a)||0;length=Number.isFinite(b)?b:bytes.length-offset;position=typeof c==='number'?c:null;bytes=bytes.subarray(offset,offset+length);}const old=readFileSync(x.path),pos=position===null?x.pos:position,outbuf=Buffer.alloc(Math.max(old.length,pos+bytes.length));outbuf.set(old);outbuf.set(bytes,pos);writeFileSync(x.path,outbuf);if(position===null)x.pos=pos+bytes.length;return bytes.length;}
+function writeSync(fd,data,a,b,c){let bytes,offset=0,length,position=null;if(typeof data==='string'){position=typeof a==='number'?a:null;bytes=Buffer.from(data,typeof b==='string'?b:'utf8');length=bytes.length;}else{bytes=Buffer.from(data);offset=Number(a)||0;length=Number.isFinite(b)?b:bytes.length-offset;position=typeof c==='number'?c:null;bytes=bytes.subarray(offset,offset+length);}if(fd===1||fd===2){writeFileSync(fd,bytes);return bytes.length;}const x=fdEntry(fd);const old=readFileSync(x.path),pos=position===null?x.pos:position,outbuf=Buffer.alloc(Math.max(old.length,pos+bytes.length));outbuf.set(old);outbuf.set(bytes,pos);writeFileSync(x.path,outbuf);if(position===null)x.pos=pos+bytes.length;return bytes.length;}
 function watchFs(p,options,callback){if(typeof options==='function'){callback=options;options={};}const w=new EventEmitter();w.path=resolve(p);w.recursive=!!(options&&options.recursive);w.callback=callback;w.closed=false;w.close=()=>{w.closed=true;fsWatchers.delete(w);};w.ref=()=>w;w.unref=()=>w;fsWatchers.add(w);return w;}
 function watchFile(p,options,listener){if(typeof options==='function'){listener=options;options={};}p=resolve(p);let curr;try{curr=statOf(p);}catch(e){curr={size:0,mtimeMs:0};}const item={listener,prev:curr};if(!fsWatchFile.has(p))fsWatchFile.set(p,new Set());fsWatchFile.get(p).add(item);return item;}
 function unwatchFile(p,listener){p=resolve(p);const s=fsWatchFile.get(p);if(!s)return;for(const x of [...s])if(!listener||x.listener===listener)s.delete(x);if(!s.size)fsWatchFile.delete(p);}
 function unpackFileData(c){ const p='__BEOWNIR_WASM64__:'; return typeof c==='string'&&c.startsWith(p)?Buffer.from(c.slice(p.length),'base64'):c; }
 function wasmCompanion(p){if(String(p).endsWith('.node')){for(const q of [p+'.wasm',p.slice(0,-5)+'.wasm'])if(FS[q]&&!FS[q].d)return q;}return null;}
+/* A browser cannot execute .node binaries. Where the ecosystem ships a
+ * JavaScript/WASM build of the *same* package, requiring the native binding
+ * loads that instead — same API, pure JavaScript underneath, so frameworks
+ * that hard-require their platform bindings (Next.js → @next/swc-<platform>)
+ * run unmodified. Anything without a JS build fails with ENOSYS naming the
+ * package, never a silent no-op. Hosts can map their own pairs through
+ * BEOWNIR_NATIVE_FALLBACK='{"native-pkg":"js-pkg"}'. */
+const NATIVE_FALLBACK_RULES=[
+  // Next.js installs @next/swc-<platform>-<arch> per target; @next/swc-wasm-nodejs is the same binding compiled to WASM.
+  [/^@next\/swc-(?!wasm)/,'@next/swc-wasm-nodejs'],
+  // @swc/core's optional per-platform bindings; @swc/wasm serves the same API.
+  [/^@swc\/core-(?!wasm)/,'@swc/wasm'],
+];
+function nativeFallbackFor(name){
+  if(!name)return null;
+  let overrides={};
+  try{overrides=JSON.parse(processObj.env.BEOWNIR_NATIVE_FALLBACK||'{}')||{};}catch(e){}
+  if(Object.prototype.hasOwnProperty.call(overrides,name))return overrides[name]||null;
+  for(const rule of NATIVE_FALLBACK_RULES)if(rule[0].test(name))return rule[1];
+  return null;
+}
+function owningPackage(file){
+  const found=/(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/]+)\//.exec(String(file));
+  return found?found[1]:null;
+}
+function loadNativeFallback(file){
+  const owner=owningPackage(file),fallback=nativeFallbackFor(owner);
+  if(!fallback)return null;
+  let resolved=null;
+  try{resolved=resolveModule(fallback,file);}catch(e){resolved=null;}
+  if(resolved&&resolved.file){try{return loadFile(resolved.file);}catch(e){return null;}}
+  return null;
+}
 // libuv reports a negative errno next to the code string; programmes branch on
 // both, and `util.getSystemErrorName(err.errno)` needs the number.
 const ERRNO_NUMBERS={EPERM:1,ENOENT:2,ESRCH:3,EINTR:4,EIO:5,ENXIO:6,E2BIG:7,ENOEXEC:8,EBADF:9,ECHILD:10,EAGAIN:11,ENOMEM:12,EACCES:13,EFAULT:14,EBUSY:16,EEXIST:17,EXDEV:18,ENODEV:19,ENOTDIR:20,EISDIR:21,EINVAL:22,ENFILE:23,EMFILE:24,ENOTTY:25,ETXTBSY:26,EFBIG:27,ENOSPC:28,ESPIPE:29,EROFS:30,EMLINK:31,EPIPE:32,EDOM:33,ERANGE:34,EDEADLK:35,ENAMETOOLONG:36,ENOLCK:37,ENOSYS:38,ENOTEMPTY:39,ELOOP:40,EPROTO:71,EBADMSG:74,ENOTSOCK:88,EMSGSIZE:90,EOPNOTSUPP:95,ENOTSUP:95,EAFNOSUPPORT:97,EADDRINUSE:98,EADDRNOTAVAIL:99,ENETDOWN:100,ENETUNREACH:101,ECONNABORTED:103,ECONNRESET:104,ENOTCONN:107,ETIMEDOUT:110,ECONNREFUSED:111,EHOSTUNREACH:113,EALREADY:114,EINPROGRESS:115};
@@ -845,10 +889,13 @@ function readFileSync(p, opt){
   // which implements all of Node's encodings.
   if (enc) {
     const encoding = String(enc).toLowerCase();
-    if (typeof e.c==='string' && (encoding==='utf8'||encoding==='utf-8')) return e.c;
-    return Buffer.from(e.c).toString(encoding);
+    /* unpackFileData: binary records arrive base64-prefixed from host-side
+     * writes; reading one must yield its bytes, not the storage marker. */
+    const data = unpackFileData(e.c);
+    if (typeof data==='string' && (encoding==='utf8'||encoding==='utf-8')) return data;
+    return Buffer.from(data).toString(encoding);
   }
-  return typeof e.c==='string'? Buffer.from(e.c) : Buffer.from(e.c);
+  return Buffer.from(unpackFileData(e.c));
 }
 function contentSize(entry){return !entry||entry.d?0:typeof entry.c==='string'?te.encode(entry.c).length:entry.c?.length||0;}
 /* ---------- workspace quota ----------
@@ -989,7 +1036,7 @@ const FSMOD = {
   readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync:p=>{p=resolve(p);return !!FS[p]||!!wasmCompanion(p);},
   openSync,closeSync,readSync,writeSync,fstatSync:fd=>statOf(fdEntry(fd).path),ftruncateSync:(fd,len=0)=>{const x=fdEntry(fd),b=readFileSync(x.path),n=Buffer.alloc(len);n.set(b.subarray(0,len));writeFileSync(x.path,n);},
   statSync:(p,o)=>statOrUndefined(statOf,p,o), lstatSync:(p,o)=>statOrUndefined(statL,p,o), unlinkSync, rmSync, rmdirSync,
-  appendFileSync:(p,d)=>{const old=FSMOD.existsSync(p)?readFileSync(p):'';if(old instanceof Uint8Array||d instanceof Uint8Array)writeFileSync(p,Buffer.concat([Buffer.from(old),Buffer.from(d)]));else writeFileSync(p,String(old)+String(d));},
+  appendFileSync:(p,d)=>{const old=FSMOD.existsSync(p)?readFileSync(p):'';if(ArrayBuffer.isView(old)||ArrayBuffer.isView(d))writeFileSync(p,Buffer.concat([Buffer.from(old),Buffer.from(d)]));else writeFileSync(p,String(old)+String(d));},
   copyFileSync:(a,b)=>{writeFileSync(b, readFileSync(a));const src=FS[resolve(a)],dst=FS[resolve(b)];if(src&&dst&&typeof src.mode==='number')dst.mode=src.mode;},
   renameSync:(a,b)=>{a=resolve(a);b=resolve(b);if(a===b)return;if(!FS[a])throw fsError('ENOENT','rename',a);if(a==='/project'||b.startsWith(a+'/'))throw new Error('Invalid rename target.');if(FS[b])throw fsError('EEXIST','rename',b);if(!FS[dirname(b)]?.d)throw fsError('ENOENT','rename',b);const entries=Object.keys(FS).filter(p=>p===a||p.startsWith(a+'/'));for(const p of entries){const q=b+p.slice(a.length);FS[q]=FS[p];mark(q);}for(const p of entries){delete FS[p];mark(p);}},
   realpathSync:Object.assign(p=>resolve(p),{native:p=>resolve(p)}),
@@ -1031,16 +1078,24 @@ FSMOD.promises.mkdir = async (p,opt)=>mkdirSync(p,opt);
 const processEvents=new EventEmitter();
 const processObj = {
   argv:['node'], env:{NODE_ENV:'development', HOME:'/', PATH:'/usr/bin', PWD:CWD}, platform:'browser', arch:'wasm32',
-  version:'v20.11.0-beownir', versions:{beownir:'2.1.0',node:'20.11.0',v8:'11.3',uv:'1.44.2',zlib:'1.2.13',brotli:'1.0.9',modules:'115'}, release:{name:'node',lts:'Iron',sourceUrl:'https://nodejs.org/download/release/v20.11.0/',headersUrl:'https://nodejs.org/download/release/v20.11.0/headers.tar.gz'}, execPath:'/usr/bin/node',execArgv:[],mainModule:null,title:'node',features:{inspector:false,debug:false,uv:true,ipv6:true,tls_alpn:true,tls_sni:true,tls_ocsp:false,wasm:true},allowedNodeEnvironmentFlags:new Set(['--inspect','--trace-warnings','--enable-source-maps']),
-  cwd:()=>CWD, chdir:p=>{const next=resolve(p);if(!FS[next]?.d)throw fsError('ENOTDIR','chdir',next);CWD=next;processObj.env.PWD=CWD;}, exit:(c)=>{ throw {__exit:c||0}; }, abort:()=>{throw new Error('process.abort is disabled in the browser runtime');},
+  /* The reported version matches the Node the compatibility layer is
+   * differentially tested against (22.22.3) - claiming an older line made
+   * version-gating tools (Astro requires >=22) reject a runtime whose exports
+   * were actually measured against 22. */
+  version:'v22.22.3-beownir', versions:{beownir:'2.1.0',node:'22.22.3',v8:'12.4',uv:'1.48.0',zlib:'1.3.1',brotli:'1.1.0',modules:'127'}, release:{name:'node',lts:'Jod',sourceUrl:'https://nodejs.org/download/release/v22.22.3/',headersUrl:'https://nodejs.org/download/release/v22.22.3/headers.tar.gz'}, execPath:'/usr/bin/node',execArgv:[],mainModule:null,title:'node',features:{inspector:false,debug:false,uv:true,ipv6:true,tls_alpn:true,tls_sni:true,tls_ocsp:false,wasm:true},allowedNodeEnvironmentFlags:new Set(['--inspect','--trace-warnings','--enable-source-maps']),
+  cwd:()=>CWD, chdir:p=>{const next=resolve(p);if(!FS[next]?.d)throw fsError('ENOTDIR','chdir',next);CWD=next;processObj.env.PWD=CWD;}, exit:(c)=>{ /* Node records the status; async callers throw the sentinel past awaits, so the shell reads exitCode after the entry settles instead of catching it synchronously. */ processObj.exitCode=Number(c)||0; processExitRequested=true; /* The dying entry never consumes its in-flight wasm service calls. */ globalThis.__beownirEsbuildJobs=0; throw {__exit:c||0}; }, abort:()=>{throw new Error('process.abort is disabled in the browser runtime');},
   getBuiltinModule:id=>CORE[String(id).replace(/^node:/,'')]||undefined,setSourceMapsEnabled:()=>{},getActiveResourcesInfo:()=>[...SERVERS.keys()].map(p=>'HTTPServer'),_getActiveHandles:()=>[...SERVERS.values(),...NET_SERVERS.values()],_getActiveRequests:()=>[],resourceUsage:()=>({userCPUTime:0,systemCPUTime:0,maxRSS:50000,sharedMemorySize:0,unsharedDataSize:0,unsharedStackSize:0,minorPageFault:0,majorPageFault:0,swappedOut:0,fsRead:0,fsWrite:0,ipcSent:0,ipcReceived:0,signalsCount:0,voluntaryContextSwitches:0,involuntaryContextSwitches:0}),
   nextTick:(f,...a)=>queueMicrotask(()=>f(...a)), hrtime:Object.assign((p)=>{ const t=performance.now()*1e6; if(p){const d=t-(p[0]*1e9+p[1]); return [Math.floor(d/1e9), d%1e9];} return [Math.floor(t/1e9), t%1e9]; },{bigint:()=>BigInt(Math.round(performance.now()*1e6))}),
   uptime:()=>performance.now()/1000, memoryUsage:()=>({rss:5e7,heapTotal:3e7,heapUsed:2e7,external:1e6}),
-  stdout:{ write:(s)=>{ out(s); return true; }, isTTY:true, columns:80, rows:24, getWindowSize:()=>[80,24], hasColors:()=>true, getColorDepth:()=>8, on(){}, end(){} },
+  stdout:{ write:(s)=>{ out(s); return true; }, isTTY:true, columns:80, rows:24, getWindowSize:()=>[80,24], hasColors:()=>true, getColorDepth:()=>8,
+    /* TTY cursor control: vite's build progress, ora and other spinners call
+     * these because isTTY is true. */
+    clearLine(dir){ out(dir===1?'\u001b[1K':dir===-1?'\u001b[2K\r':'\u001b[2K'); return true; }, cursorTo(x){ out('\u001b['+(Number(x)+1)+'G'); return true; }, moveCursor(dx,dy){ if(Number(dx)) out(Number(dx)>0?'\u001b['+Number(dx)+'C':'\u001b['+(-Number(dx))+'D'); if(Number(dy)) out(Number(dy)>0?'\u001b['+Number(dy)+'B':'\u001b['+(-Number(dy))+'A'); return true; },
+    on(){}, end(){} },
   stderr:{ write:(s)=>{ errOut(s); return true; }, isTTY:true, columns:80, rows:24, getWindowSize:()=>[80,24], hasColors:()=>true, getColorDepth:()=>8, on(){}, end(){} },
   stdin:new Readable(), on:(...a)=>{processEvents.on(...a);return processObj;}, once:(...a)=>{processEvents.once(...a);return processObj;}, off:(...a)=>{processEvents.off(...a);return processObj;}, emit:(...a)=>processEvents.emit(...a),
   removeListener:(...a)=>{processEvents.off(...a);return processObj;}, emitWarning(w){const e=w instanceof Error?w:new Error(String(w));e.name='Warning';processEvents.emit('warning',e);}, setMaxListeners(n){processEvents.setMaxListeners(n);}, addListener:(...a)=>{processEvents.on(...a);return processObj;}, prependListener:(...a)=>{processEvents.prependListener(...a);return processObj;}, prependOnceListener:(...a)=>{processEvents.prependOnceListener(...a);return processObj;}, listenerCount:(...a)=>processEvents.listenerCount(...a), listeners:(...a)=>processEvents.listeners(...a), rawListeners:(...a)=>processEvents.rawListeners(...a), eventNames:()=>processEvents.eventNames(), removeAllListeners:(...a)=>{processEvents.removeAllListeners(...a);return processObj;}, getMaxListeners:()=>processEvents.getMaxListeners(),  umask:()=>0, binding(name){if(name==='natives')return Object.fromEntries(Object.keys(CORE).map(k=>[k,'/* browser runtime shim */']));if(name==='buffer')return{kMaxLength:0x7fffffff,kStringMaxLength:0x1fffffe8};if(name==='constants')return{os:{signals:{SIGTERM:15,SIGINT:2}}};const e=new Error('process.binding("'+name+'") is unavailable in the browser runtime');e.code='ERR_UNKNOWN_BUILTIN_MODULE';throw e;}, send:null,
-  dlopen:(mod,file)=>{const f=String(file),wasm=f.endsWith('.wasm')?f:wasmCompanion(f);if(wasm){mod.exports=loadWasmModule(wasm);return;}throw new Error("Cannot load native addon '"+file+"' in a browser. Compile it to WebAssembly and provide a matching .wasm companion.");},
+  dlopen:(mod,file)=>{const f=String(file),wasm=f.endsWith('.wasm')?f:wasmCompanion(f);if(wasm){mod.exports=loadWasmModule(wasm);return;}const js=loadNativeFallback(f);if(js){mod.exports=js;return;}const e=new Error("Cannot load native addon '"+file+"' in a browser. Compile it to WebAssembly and provide a matching .wasm companion, or install/map a JS-only build.");e.code='ENOSYS';throw e;},
 };
 /* process.env stores strings, exactly like Node: `process.env.PORT = 3000` must
  * read back as '3000' and assigning undefined yields 'undefined'. A plain object
@@ -1099,18 +1154,21 @@ class ServerResponse extends EventEmitter {
   writeHead(code, msg, hdrs){ this.statusCode=code; if(typeof msg==='object'){hdrs=msg;msg=null;} if(msg)this.statusMessage=msg;
     if(hdrs) for(const k in hdrs) this.setHeader(k,hdrs[k]); this.headersSent=true; return this; }
   write(c){const b=Buffer.from(c);this._size=(this._size||0)+b.length;if(this._size>8*1024*1024)throw new Error('Virtual HTTP response exceeds 8 MiB.');this._body.push(b);this.headersSent=true;return true;}
+  /* Node internal the compression middleware (and anything else wrapping the
+   * stream) calls before the first write when no writeHead happened. */
+  _implicitHeader(){ if(!this.headersSent) this.writeHead(this.statusCode); }
   end(c){ if(c!==undefined&&c!==null)this.write(c); if(this.finished)return this; this.finished=true;
     const mh=this._request&&this._request._middlewareHeaders;if(mh)mh.forEach((v,k)=>{if(!k.startsWith('x-middleware-'))this.setHeader(k,v);});
     this._done({status:this.statusCode,statusMessage:this.statusMessage,headers:this._headers,body:Buffer.concat(this._body)}); this.socket.writable=false; this.emit('finish'); return this; }
   json(o){ this.setHeader('content-type','application/json'); this.end(JSON.stringify(o)); }
-  send(x){ if(typeof x==='object'&&!(x instanceof Uint8Array)) return this.json(x); if(!this.getHeader('content-type'))this.setHeader('content-type','text/html; charset=utf-8'); this.end(x); }
+  send(x){ if(typeof x==='object'&&!ArrayBuffer.isView(x)) return this.json(x); if(!this.getHeader('content-type'))this.setHeader('content-type','text/html; charset=utf-8'); this.end(x); }
   status(c){ this.statusCode=c; return this; }
   assignSocket(socket){ this.socket = socket; this.connection = socket; this._assignedSocket = socket; return socket; }
   detachSocket(socket){ if (!socket || this.socket === socket) { this.socket = virtualSocket(); this.connection = this.socket; } this._assignedSocket = null; }
   writeContinue(){} flushHeaders(){} setTimeout(){return this;}
 }
 class Server extends EventEmitter {
-  constructor(handler){ super(); if(handler) this.on('request', handler); this.listening=false; }
+  constructor(handler){ super(); if(handler) this.on('request', handler); this.listening=false; this.requestTimeout=300000; }
   listen(port, ...rest){
     const cb = rest.find(x=>typeof x==='function');
     if (typeof port === 'object') port = port.port;
@@ -1128,7 +1186,12 @@ class Server extends EventEmitter {
 }
 function handleHttp(msg,callback){
   const srv = SERVERS.get(msg.port);
-  const reply=(r)=>{const response={type:'httpres',id:msg.id,status:r.status,statusMessage:r.statusMessage,headers:r.headers,body:r.body instanceof Uint8Array?r.body:Buffer.from(String(r.body||''))};if(callback)callback(response);else post(response);};
+  let requestTimer = null;
+  const reply=(r)=>{
+    if(requestTimer){ runtimeNativeClearTimeout(requestTimer); requestTimer = null; }
+    const response={type:'httpres',id:msg.id,status:r.status,statusMessage:r.statusMessage,headers:r.headers,body:ArrayBuffer.isView(r.body)?Buffer.from(r.body):Buffer.from(String(r.body||''))};
+    if(callback)callback(response);else post(response);
+  };
   if (!srv) return reply({status:502, headers:{'content-type':'text/html'},
     body: Buffer.from('<h3 style="font:600 16px system-ui;padding:24px">No server listening on port '+msg.port+'</h3><p style="font:14px system-ui;padding:0 24px;color:#666">Run your app first (e.g. <code>node server.js</code>).</p>')});
   const incomingBody=msg.body===null||msg.body===undefined?null:Buffer.from(msg.body);const incomingHeaders={host:'localhost:'+msg.port};for(const[k,v]of Object.entries(msg.headers||{}))incomingHeaders[k.toLowerCase()]=v;if(incomingBody&&!Object.prototype.hasOwnProperty.call(incomingHeaders,'content-length'))incomingHeaders['content-length']=String(incomingBody.length);
@@ -1138,7 +1201,14 @@ function handleHttp(msg,callback){
     for(const handler of srv.rawListeners('request')){const value=handler.call(srv,req,res);if(value&&typeof value.then==='function')value.catch(e=>{if(!res.finished){res.statusCode=500;res.end(String(e?.stack||e));}});}
     if(incomingBody?.length)req.push(incomingBody);
     req.push(null);req.complete=true;
-    runtimeNativeSetTimeout(()=>{ if(!res.finished) res.writeHead(504,{'content-type':'text/plain'}).end('Virtual request timed out after 10 seconds.'); }, 10000);
+    /* Node's server.requestTimeout defaults to 300 s: a dev server's first
+     * hit legitimately spends minutes compiling. Ours honours the same knob
+     * instead of a fixed 10 s that no framework could ever meet. */
+    const requestTimeoutMs = Number.isFinite(Number(srv.requestTimeout)) && Number(srv.requestTimeout) > 0 ? Number(srv.requestTimeout) : 300000;
+    if (!res.finished) {
+      requestTimer = runtimeNativeSetTimeout(()=>{ requestTimer = null; if(!res.finished) res.writeHead(504,{'content-type':'text/plain'}).end('Virtual request timed out after '+Math.round(requestTimeoutMs/1000)+' seconds.'); }, requestTimeoutMs);
+      if (requestTimer && typeof requestTimer.unref === 'function') requestTimer.unref();
+    }
   } catch(e){ reply({status:500, headers:{'content-type':'text/plain'}, body:Buffer.from(String(e&&e.stack||e))}); }
 }
 const HTTP_STATUS_CODES = {100:"Continue",101:"Switching Protocols",102:"Processing",103:"Early Hints",200:"OK",201:"Created",202:"Accepted",203:"Non-Authoritative Information",204:"No Content",205:"Reset Content",206:"Partial Content",207:"Multi-Status",208:"Already Reported",226:"IM Used",300:"Multiple Choices",301:"Moved Permanently",302:"Found",303:"See Other",304:"Not Modified",305:"Use Proxy",307:"Temporary Redirect",308:"Permanent Redirect",400:"Bad Request",401:"Unauthorized",402:"Payment Required",403:"Forbidden",404:"Not Found",405:"Method Not Allowed",406:"Not Acceptable",407:"Proxy Authentication Required",408:"Request Timeout",409:"Conflict",410:"Gone",411:"Length Required",412:"Precondition Failed",413:"Payload Too Large",414:"URI Too Long",415:"Unsupported Media Type",416:"Range Not Satisfiable",417:"Expectation Failed",418:"I'm a Teapot",421:"Misdirected Request",422:"Unprocessable Entity",423:"Locked",424:"Failed Dependency",425:"Too Early",426:"Upgrade Required",428:"Precondition Required",429:"Too Many Requests",431:"Request Header Fields Too Large",451:"Unavailable For Legal Reasons",500:"Internal Server Error",501:"Not Implemented",502:"Bad Gateway",503:"Service Unavailable",504:"Gateway Timeout",505:"HTTP Version Not Supported",506:"Variant Also Negotiates",507:"Insufficient Storage",508:"Loop Detected",509:"Bandwidth Limit Exceeded",510:"Not Extended",511:"Network Authentication Required"};
@@ -1555,9 +1625,9 @@ function makeUtilTypes() {
   const typedArrayTags = new Set(['Int8Array','Uint8Array','Uint8ClampedArray','Int16Array','Uint16Array','Int32Array','Uint32Array','Float32Array','Float64Array','BigInt64Array','BigUint64Array','Float16Array']);
   const primitiveObject = (value, name) => typeof value === 'object' && value !== null && tag(value) === '[object ' + name + ']';
   return {
-    isAnyArrayBuffer: value => value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer),
+    isAnyArrayBuffer: value => isArrayBufferLike(value),
     isArgumentsObject: value => tag(value) === '[object Arguments]',
-    isArrayBuffer: value => value instanceof ArrayBuffer,
+    isArrayBuffer: value => value instanceof ArrayBuffer || tag(value) === '[object ArrayBuffer]',
     isAsyncFunction: value => typeof value === 'function' && tag(value) === '[object AsyncFunction]',
     isBigInt64Array: value => typeof BigInt64Array !== 'undefined' && value instanceof BigInt64Array,
     isBigIntObject: value => primitiveObject(value, 'BigInt'),
@@ -1601,11 +1671,11 @@ function makeUtilTypes() {
     isRegExp: value => value instanceof RegExp,
     isSet: value => value instanceof Set,
     isSetIterator: value => tag(value) === '[object Set Iterator]',
-    isSharedArrayBuffer: value => typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer,
+    isSharedArrayBuffer: value => (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) || tag(value) === '[object SharedArrayBuffer]',
     isStringObject: value => primitiveObject(value, 'String'),
     isSymbolObject: value => primitiveObject(value, 'Symbol'),
     isTypedArray: value => tag(value).slice(8, -1) !== '' && typedArrayTags.has(tag(value).slice(8, -1)) && ArrayBuffer.isView(value),
-    isUint8Array: value => value instanceof Uint8Array,
+    isUint8Array: value => value instanceof Uint8Array || (ArrayBuffer.isView(value) && tag(value) === '[object Uint8Array]'),
     isUint8ClampedArray: value => value instanceof Uint8ClampedArray,
     isUint16Array: value => value instanceof Uint16Array,
     isUint32Array: value => value instanceof Uint32Array,
@@ -1903,6 +1973,86 @@ const TLS={connect:()=>{const s=new NetSocket();queueMicrotask(()=>s.emit('error
 const CHILD_PROCESS = {};
 function shellQuote(value){return "'"+String(value).split("'").join("'\\''")+"'";}
 
+/* worker_threads.Worker, virtualized in-process. The runtime is one JS thread,
+ * so real parallel workers are impossible; but the common fork pattern
+ * (SvelteKit's postbuild analyse/adapt) only needs a fresh module evaluation
+ * plus message passing with the parent, and that can run on the same thread:
+ * module load is queued behind a promise chain, parentPort is swapped around
+ * it, and postMessage hops through a macrotask so neither side re-enters the
+ * other synchronously. Workers that genuinely need parallel memory
+ * (rolldown's WASI thread pool coordinating through SharedArrayBuffer) remain
+ * out of reach and fail with their own clear error. */
+let __virtualWorkerSeq = 0;
+let __virtualWorkerBusy = false;
+const __virtualWorkerQueue = [];
+class VirtualNodeWorker {
+  constructor(filename, options = {}) {
+    this._handlers = {};
+    this.onmessage = null;
+    this.threadId = ++__virtualWorkerSeq;
+    this._loaded = false;
+    const task = async () => {
+      let file = String(filename);
+      if (file.startsWith('file://')) { try { file = decodeURIComponent(new URL(file).pathname); } catch { file = file.slice('file://'.length); } }
+      const worker = this;
+      const port = {
+        _handlers: {},
+        on(type, fn) { if (type === 'message') (this._handlers.message = this._handlers.message || []).push(fn); return this; },
+        once(type, fn) { const wrapped = data => { fn(data); this.off('message', wrapped); }; return this.on('message', wrapped); },
+        off(type, fn) { const list = this._handlers[type] || []; const at = list.indexOf(fn); if (at >= 0) list.splice(at, 1); return this; },
+        addEventListener(type, fn) { return this.on(type, fn); },
+        removeEventListener(type, fn) { return this.off(type, fn); },
+        /* child -> parent */
+        postMessage(data) { setTimeout(() => worker._emit('message', data), 0); },
+        close() {}, ref() {}, unref() {},
+      };
+      this._port = port;
+      const savedParentPort = CORE.worker_threads.parentPort;
+      CORE.worker_threads.parentPort = port;
+      const savedChildCache = CHILD_MODULE_CACHE;
+      CHILD_MODULE_CACHE = Object.create(null);
+      const envBackup = {};
+      try {
+        for (const [key, value] of Object.entries((options && options.env) || {})) { envBackup[key] = processObj.env[key]; processObj.env[key] = String(value); }
+        await importEsmAsync(file, '/project/index.js');
+      } catch (error) {
+        CHILD_MODULE_CACHE = savedChildCache;
+        CORE.worker_threads.parentPort = savedParentPort;
+        for (const [key, value] of Object.entries(envBackup)) { if (value === undefined) delete processObj.env[key]; else processObj.env[key] = value; }
+        setTimeout(() => { worker._emit('error', error); worker._emit('exit', 1); }, 0);
+        return;
+      }
+      CORE.worker_threads.parentPort = savedParentPort;
+      CHILD_MODULE_CACHE = savedChildCache;
+      for (const [key, value] of Object.entries(envBackup)) { if (value === undefined) delete processObj.env[key]; else processObj.env[key] = value; }
+      this._loaded = true;
+    };
+    __virtualWorkerQueue.push(task);
+    if (!__virtualWorkerBusy) {
+      __virtualWorkerBusy = true;
+      (async () => {
+        while (__virtualWorkerQueue.length) { const next = __virtualWorkerQueue.shift(); try { await next(); } catch (e) {} }
+        __virtualWorkerBusy = false;
+      })();
+    }
+  }
+  _emit(type, payload) {
+    if (type === 'message' && typeof this.onmessage === 'function') { try { this.onmessage(payload); } catch (e) { this._emit('error', e); } }
+    for (const handler of this._handlers[type] || []) { try { handler(payload); } catch (e) { try { this._emit('error', e); } catch (e2) {} } }
+  }
+  _emitPort(data) { setTimeout(() => { const handlers = this._port && this._port._handlers.message || []; for (const handler of handlers) { try { handler(data); } catch (e) { this._emit('error', e); } } }, 0); }
+  on(type, fn) { (this._handlers[type] = this._handlers[type] || []).push(fn); return this; }
+  once(type, fn) { const wrapped = payload => { fn(payload); this.off(type, wrapped); }; return this.on(type, wrapped); }
+  off(type, fn) { const list = this._handlers[type] || []; const at = list.indexOf(fn); if (at >= 0) list.splice(at, 1); return this; }
+  addEventListener(type, fn) { return this.on(type, fn); }
+  removeEventListener(type, fn) { return this.off(type, fn); }
+  /* parent -> child */
+  postMessage(data) { this._emitPort(data); }
+  terminate() { this._emit('exit', 0); }
+  unref() {} ref() {}
+  getHeapCodeStatistics() { return {}; }
+}
+
 const CORE = {
   path:PATH, fs:FSMOD, 'fs/promises':FSMOD.promises, os:OS, process:processObj, util:UTIL, events:Object.assign(EventEmitter,{EventEmitter, once:(e,n)=>new Promise(r=>e.once(n,r)), default:EventEmitter}),
   stream:STREAMMOD, 'stream/promises':STREAM_PROMISES, buffer:{Buffer, constants:{}}, http:HTTP,
@@ -1914,7 +2064,7 @@ const CORE = {
   timers:{setTimeout,setInterval,clearTimeout,clearInterval,setImmediate:(f,...a)=>setTimeout(f,0,...a)},
   'timers/promises':{ setTimeout:(ms,v)=>new Promise(r=>setTimeout(()=>r(v),ms)) },
   child_process:CHILD_PROCESS,
-  worker_threads:{isMainThread:true,parentPort:null,Worker:class{constructor(){throw new Error('Nested Node worker_threads are unsupported.');}}},
+  worker_threads:{isMainThread:true,parentPort:null,Worker:VirtualNodeWorker,markAsUntransferable:()=>{},moveMessagePortToContext:()=>{throw new Error('moveMessagePortToContext is not available in the virtual runtime.');},transferListIsEmpty:()=>true,isMarkedAsUntransferable:()=>false},
   cluster:{isMaster:true,isPrimary:true,fork:()=>{throw new Error('cluster requires native Node processes.');},on(){}},
   readline:{ createInterface:()=>{ const e=new EventEmitter(); e.question=(q,cb)=>{pendingQuestion=cb;post({type:'question',data:String(q)});}; e.close=()=>{}; e.prompt=()=>{}; return e; } },
   perf_hooks:{ performance }, v8:{ getHeapStatistics:()=>({}) }, vm:{ runInNewContext:(c,ctx)=>Function('with(this){return eval('+JSON.stringify(c)+')}').call(ctx||{}) },
@@ -3509,12 +3659,12 @@ let pendingQuestion = null;
   UTIL.types = Object.assign({
     isDate: value => value instanceof Date, isRegExp: value => value instanceof RegExp,
     isPromise: value => Boolean(value) && typeof value.then === 'function',
-    isUint8Array: value => value instanceof Uint8Array, isNativeError: value => value instanceof Error,
-    isArrayBuffer: value => value instanceof ArrayBuffer, isSharedArrayBuffer: value => typeof SharedArrayBuffer === 'function' && value instanceof SharedArrayBuffer,
+    isUint8Array: value => value instanceof Uint8Array || (ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === '[object Uint8Array]'), isNativeError: value => value instanceof Error,
+    isArrayBuffer: value => value instanceof ArrayBuffer || Object.prototype.toString.call(value) === '[object ArrayBuffer]', isSharedArrayBuffer: value => (typeof SharedArrayBuffer === 'function' && value instanceof SharedArrayBuffer) || Object.prototype.toString.call(value) === '[object SharedArrayBuffer]',
     isMap: value => value instanceof Map, isSet: value => value instanceof Set,
     isWeakMap: value => value instanceof WeakMap, isWeakSet: value => value instanceof WeakSet,
     isTypedArray: value => ArrayBuffer.isView(value) && !(value instanceof DataView), isDataView: value => value instanceof DataView,
-    isAnyArrayBuffer: value => value instanceof ArrayBuffer,
+    isAnyArrayBuffer: value => isArrayBufferLike(value),
     isFunction: value => typeof value === 'function', isString: value => typeof value === 'string', isNumber: value => typeof value === 'number',
     isBoolean: value => typeof value === 'boolean', isSymbol: value => typeof value === 'symbol', isBigInt: value => typeof value === 'bigint',
     isNull: value => value === null, isUndefined: value => value === undefined, isObject: value => typeof value === 'object' && value !== null,
@@ -4321,7 +4471,7 @@ let pendingQuestion = null;
     if (typeof value === 'bigint') return value;
     if (typeof value === 'number') return BigInt(Math.trunc(value));
     if (typeof value === 'string') return BigInt(/^0x/i.test(value) ? value : '0x' + value);
-    if (value instanceof ArrayBuffer) value = new Uint8Array(value);
+    if (isArrayBufferLike(value)) value = new Uint8Array(value);
     const bytes = Buffer.from(value);
     let hex = '';
     for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
@@ -4463,7 +4613,7 @@ let pendingQuestion = null;
     static from(key) { return key instanceof KeyObject ? key : createSecretKey(key); }
   }
   const createSecretKey = (key, encoding) => {
-    if (typeof key !== 'string' && !ArrayBuffer.isView(key) && !(key instanceof ArrayBuffer)) throw Object.assign(new TypeError('The "key" argument must be of type string, ArrayBuffer, Buffer, TypedArray, or DataView'), { code: 'ERR_INVALID_ARG_TYPE' });
+    if (typeof key !== 'string' && !ArrayBuffer.isView(key) && !isArrayBufferLike(key)) throw Object.assign(new TypeError('The "key" argument must be of type string, ArrayBuffer, Buffer, TypedArray, or DataView'), { code: 'ERR_INVALID_ARG_TYPE' });
     const bytes = typeof key === 'string' ? Buffer.from(key, encoding || 'utf8') : Buffer.from(key);
     if (!bytes.length) throw Object.assign(new Error('Zero-length key is not supported'), { code: 'ERR_CRYPTO_INVALID_KEYLEN' });
     return new KeyObject('secret', bytes);
@@ -5710,6 +5860,11 @@ function hash(s){ let h=0; for(const c of s) h=(h*31+c.charCodeAt(0))>>>0; retur
 
 /* ---------- require ---------- */
 const cache = Object.create(null);
+/* A virtual worker_threads.Worker re-evaluates its module graph in a fresh
+ * cache, the way a real child process would: SvelteKit's fork() pattern loads
+ * the same files again and must observe the swapped parentPort this time. */
+let CHILD_MODULE_CACHE = null;
+function activeModuleCache() { return CHILD_MODULE_CACHE || cache; }
 /* Node keeps one cache: module._cache === require.cache. */
 if (CORE.module) { CORE.module._cache = cache; if (CORE.module.Module) CORE.module.Module._cache = cache; }
 function tryFiles(p,seen=new Set()){p=normalize(p);if(seen.has(p))return null;seen.add(p);
@@ -5720,7 +5875,10 @@ function tryFiles(p,seen=new Set()){p=normalize(p);if(seen.has(p))return null;se
     const pj = p+'/package.json';
     if (FS[pj]){ try { const j = JSON.parse(readFileSync(pj,'utf8'));
       const ex=j.exports&&(typeof j.exports==='string'?j.exports:(j.exports['.']&&(typeof j.exports['.']==='string'?j.exports['.']:(j.exports['.'].require||j.exports['.'].browser||j.exports['.'].node||j.exports['.'].default||j.exports['.'].import))));
-      const main=(typeof j.browser==='string'?j.browser:null)||j.main||ex||j.module||'index.js';
+      /* main outranks the legacy browser field: this worker is Node-like (no DOM);
+       * napi-rs wasm-node packages point `browser` at a page-oriented ESM build
+       * (top-level await, dedicated workers) that cannot load under require(). */
+      const main=j.main||(typeof j.browser==='string'?j.browser:null)||ex||j.module||'index.js';
       const m=tryFiles(normalize(p+'/'+main),seen);if(m)return m;}catch(e){} }
     for (const c of ['/index.js','/index.jsx','/index.ts','/index.json','/index.cjs'])
       if (FS[p+c]) return p+c;
@@ -5742,6 +5900,191 @@ const COMPAT_LIGHTNINGCSS_SOURCE = "// Pass-through stand-in for lightningcss: T
  * binary that cannot run in a worker, so require('esbuild') resolves to this file,
  * which drives the embedded esbuild WASM build instead. Async calls wait for
  * initialize(), so a caller never stalls on a cold service. */
+/* The esbuild-wasm browser service makes every syscall through globalThis.fs;
+ * its own fallback is ENOSYS for everything, so bundling that has to read
+ * directories (vite bundling a vite.config.js) dies with "not implemented on
+ * js". This installs a Go-wasm-compatible fs backed by the virtual FS. */
+/* Originals of the three fd-protocol methods, captured the first time the
+ * Go fs is installed on an object, so re-runs after esbuild's service start
+ * can still route real-file fds to the object's own implementations. */
+const goFsOriginals = new WeakMap();
+function installEsbuildGoFs() {
+  /* esbuild's in-process service start (worker: false) replays its worker
+   * bootstrap, which overwrites globalThis.fs.read and .writeSync with
+   * stdin/stdout protocol stubs ("Bad read"). Re-running this installer
+   * restores real file I/O on the same object the Go runtime already holds. */
+  const vfs = CORE.fs;
+  const S_IFDIR = 16384, S_IFREG = 32768;
+  const fail = e => { const error = e instanceof Error ? e : new Error(String(e && e.message || e)); if (!error.code) error.code = 'ENOENT'; return error; };
+  const enosys = () => { const error = new Error('not implemented'); error.code = 'ENOSYS'; return error; };
+  const statOf = path => {
+    const st = vfs.statSync(path);
+    const isDir = typeof st.isDirectory === 'function' ? st.isDirectory() : false;
+    const size = st.size || 0;
+    const ms = st.mtimeMs || Date.now();
+    const time = new Date(ms);
+    /* Go's wasm setStat reads atimeMs/mtimeMs/ctimeMs as numbers; older toolchains
+     * call getTime() on Date fields, so both shapes are provided. */
+    return { dev: 1, ino: 1, mode: isDir ? S_IFDIR | 0o555 : S_IFREG | 0o444, nlink: 1, uid: 0, gid: 0, rdev: 0, size, blksize: 4096, blocks: Math.ceil(size / 512), atimeMs: ms, mtimeMs: ms, ctimeMs: ms, atime: time, mtime: time, ctime: time, isDirectory: () => isDir, isFile: () => !isDir };
+  };
+  let nextFd = 100;
+  const fds = new Map();
+  /* Method set assigned onto the existing object so the Go service keeps its reference. */
+  const fileRead = (fd, buffer, offset, length, position, callback) => {
+    const data = fds.get(fd);
+    if (!data) { const error = new Error('bad file descriptor'); error.code = 'EBADF'; return callback(error); }
+    if (data.dir) { const error = new Error('illegal operation on a directory, read'); error.code = 'EISDIR'; return callback(error); }
+    /* position === null is Node's sequential read: the fd keeps its own
+     * cursor and ADVANCES by the number of bytes returned, or Go never sees
+     * EOF and its read buffer grows without bound. */
+    let pos;
+    if (position == null) { pos = data.pos || 0; data.pos = pos; }
+    else pos = Number(position) || 0;
+    const chunk = data.subarray(pos, pos + length);
+    buffer.set(chunk, offset);
+    if (position == null) data.pos = pos + chunk.length;
+    callback(null, chunk.length);
+  };
+  const methods = {
+    constants: { O_WRONLY: -1, O_RDWR: -1, O_CREAT: -1, O_TRUNC: -1, O_APPEND: -1, O_EXCL: -1 },
+    fsync(fd, callback) { callback(null); },
+    close(fd, callback) { fds.delete(fd); callback(null); },
+    open(path, flags, mode, callback) {
+      try {
+        const st = vfs.statSync(String(path));
+        const isDir = typeof st.isDirectory === 'function' ? st.isDirectory() : false;
+        const fd = nextFd++;
+        /* Go opens a directory and then readdir()s it by path; a directory fd
+         * carries no bytes (reads on it are a caller error anyway). */
+        fds.set(fd, isDir ? { dir: true } : Buffer.from(vfs.readFileSync(String(path))));
+        callback(null, fd);
+      }
+      catch (e) { callback(fail(e)); }
+    },
+    fstat(fd, callback) {
+      const data = fds.get(fd);
+      const ms = Date.now();
+      const isDir = !!(data && data.dir);
+      const size = data && !isDir ? data.length : 0;
+      callback(null, { dev: 1, ino: 1, mode: isDir ? S_IFDIR | 0o555 : S_IFREG | 0o444, nlink: 1, uid: 0, gid: 0, rdev: 0, size, blksize: 4096, blocks: Math.ceil(size / 512), atimeMs: ms, mtimeMs: ms, ctimeMs: ms, atime: new Date(ms), mtime: new Date(ms), ctime: new Date(ms), isDirectory: () => isDir, isFile: () => !isDir });
+    },
+    readdir(path, callback) { try { callback(null, vfs.readdirSync(String(path))); } catch (e) { callback(fail(e)); } },
+    stat(path, callback) { try { callback(null, statOf(String(path))); } catch (e) { callback(fail(e)); } },
+    lstat(path, callback) { try { callback(null, statOf(String(path))); } catch (e) { callback(fail(e)); } },
+    realpath(path, callback) { try { callback(null, typeof vfs.realpathSync === 'function' ? vfs.realpathSync(String(path)) : String(path)); } catch (e) { callback(fail(e)); } },
+    mkdir(path, perm, callback) { try { vfs.mkdirSync(String(path), { recursive: true }); callback(null); } catch (e) { callback(fail(e)); } },
+    rmdir(path, callback) { try { vfs.rmdirSync(String(path)); callback(null); } catch (e) { callback(fail(e)); } },
+    unlink(path, callback) { try { vfs.unlinkSync(String(path)); callback(null); } catch (e) { callback(fail(e)); } },
+    rename(from, to, callback) { try { vfs.renameSync(String(from), String(to)); callback(null); } catch (e) { callback(fail(e)); } },
+    utimes(path, atime, mtime, callback) { callback(null); },
+    chmod(path, mode, callback) { callback(null); },
+    chown(path, uid, gid, callback) { callback(null); },
+    fchmod(fd, mode, callback) { callback(null); },
+    fchown(fd, uid, gid, callback) { callback(null); },
+    ftruncate(fd, length, callback) { callback(null); },
+    lchown(path, uid, gid, callback) { callback(null); },
+    truncate(path, length, callback) { callback(null); },
+    link(path, link, callback) { callback(enosys()); },
+    readlink(path, callback) { callback(enosys()); },
+    symlink(path, link, callback) { callback(enosys()); },
+  };
+  if (!globalThis.fs || typeof globalThis.fs !== 'object') globalThis.fs = {};
+  /* Go-WASM toolchains publish the whole fs module as their global:
+   * @astrojs/compiler runs globalThis.fs || Object.defineProperty(globalThis,
+   * 'fs', { value: require('fs') }), and the property is non-configurable, so
+   * it cannot even be replaced later. Overwriting such an object with the
+   * callback-only Go set would take away every sync and promises form for the
+   * rest of the page: astro's fdir walker calls readdir(path, { withFileTypes
+   * }, cb) and died with "callback is not a function". A real fs module is a
+   * callback-compatible superset of what the Go service reads, so it is kept
+   * as-is and only the fd-0/1/2 protocol methods are installed on it, with
+   * every other fd routed to the object's own original methods. */
+  const fullFs = typeof globalThis.fs.readdirSync === 'function' && typeof globalThis.fs.readFileSync === 'function' && typeof globalThis.fs.statSync === 'function';
+  if (!goFsOriginals.has(globalThis.fs)) goFsOriginals.set(globalThis.fs, { read: globalThis.fs.read, write: globalThis.fs.write, writeSync: globalThis.fs.writeSync });
+  const originals = goFsOriginals.get(globalThis.fs);
+  /* fd 1 is the esbuild service protocol channel when the service runs
+   * in-process: its own writeSync pipes frames to the JS API. fd 2 carries
+   * diagnostics and must reach the console, or a service crash is a silent
+   * hang. So fd 1 delegates to whatever writeSync is installed (esbuild's
+   * protocol writer after the service starts), fd 2 always logs. */
+  const priorWriteSync = typeof globalThis.fs.writeSync === 'function' && !globalThis.fs.writeSync.__beownir ? globalThis.fs.writeSync : null;
+  /* fd 0 is the service's stdin: with worker:false the esbuild request
+   * protocol itself flows through globalThis.fs.read(fd 0, ...). Delegating
+   * fd 0 to the installed reader keeps the protocol alive while every other
+   * fd reads from the virtual FS. */
+  const priorRead = typeof globalThis.fs.read === 'function' && !globalThis.fs.read.__beownir ? globalThis.fs.read : null;
+  methods.read = function (fd, buffer, offset, length, position, callback) {
+    if (fd === 0 && priorRead) return priorRead(fd, buffer, offset, length, position, callback);
+    if (fullFs && originals.read) return originals.read.call(globalThis.fs, fd, buffer, offset, length, position, callback);
+    return fileRead(fd, buffer, offset, length, position, callback);
+  };
+  methods.read.__beownir = true;
+  methods.writeSync = function (fd, buf, ...rest) {
+    try {
+      const slice = typeof buf === 'string'
+        ? buf
+        : (buf instanceof Uint8Array
+          ? (typeof rest[0] === 'number' ? buf.subarray(rest[0], typeof rest[1] === 'number' ? rest[0] + rest[1] : undefined) : buf)
+          : new Uint8Array(buf));
+      const byteLength = typeof slice === 'string' ? Buffer.byteLength(slice) : slice.length;
+      if (fd === 2) { console.error((typeof slice === 'string' ? slice : new TextDecoder().decode(slice)).replace(/\n$/, '')); return byteLength; }
+      if (fd === 1 && priorWriteSync) { priorWriteSync(fd, typeof slice === 'string' ? new TextEncoder().encode(slice) : slice); return byteLength; }
+      if (fullFs && originals.writeSync) return originals.writeSync.call(globalThis.fs, fd, buf, ...rest);
+      console.log((typeof slice === 'string' ? slice : new TextDecoder().decode(slice)).replace(/\n$/, ''));
+      return byteLength;
+    } catch (e) {}
+    return typeof buf === 'string' ? Buffer.byteLength(buf) : buf.length;
+  };
+  methods.writeSync.__beownir = true;
+  /* fd 1 and 2 are the service protocol and diagnostics channels, never
+   * virtual files: Go sends its response frames with fs.write(1, ...), so
+   * those must go through the protocol-aware writeSync above, not the fs
+   * module's own write (which would swallow them as virtual stdout). */
+  methods.write = function (fd, buf, offset, length, position, callback) {
+    const cb = typeof callback === 'function' ? callback : [offset, length, position].find(x => typeof x === 'function');
+    if (fd === 1 || fd === 2) {
+      const chunk = typeof offset === 'number' && buf instanceof Uint8Array
+        ? buf.subarray(offset, typeof length === 'number' ? offset + length : undefined)
+        : buf;
+      const writer = this && typeof this.writeSync === 'function' ? this.writeSync : methods.writeSync;
+      const written = writer.call(this || globalThis.fs, fd, chunk);
+      if (cb) cb(null, written, buf);
+      return;
+    }
+    if (fullFs && originals.write) return originals.write.apply(globalThis.fs, arguments);
+    const written = this.writeSync(fd, buf); if (cb) cb(null, written, buf);
+  };
+  if (fullFs) {
+    /* Fill only the gaps: a real fs module lacks a few calls the Go service
+     * makes (fsync, fchmod, ...), and a missing function wedges the service
+     * mid-syscall; everything it does have is better than the Go stand-in. */
+    const gaps = {};
+    for (const name of Object.keys(methods)) if (typeof globalThis.fs[name] !== 'function') gaps[name] = methods[name];
+    Object.assign(globalThis.fs, gaps, { read: methods.read, write: methods.write, writeSync: methods.writeSync });
+  }
+  else Object.assign(globalThis.fs, methods);
+  globalThis.__beownirGoFs = globalThis.fs;
+  /* Go's fs layer resolves every opened path through globalThis.path.resolve. */
+  if (!globalThis.path || typeof globalThis.path.resolve !== 'function') {
+    globalThis.path = {
+      resolve: (...args) => {
+        let base = (typeof CWD === 'string' && CWD) || '/project';
+        let resolved = base;
+        for (const arg of args) { const value = String(arg); if (value.startsWith('/')) resolved = value; else resolved = resolved.replace(/\/$/, '') + '/' + value; }
+        const parts = []; for (const piece of resolved.split('/')) { if (!piece || piece === '.') continue; if (piece === '..') parts.pop(); else parts.push(piece); }
+        return '/' + parts.join('/');
+      },
+    };
+  }
+  if (!globalThis.process || typeof globalThis.process.cwd !== 'function') {
+    globalThis.process = {
+      getuid() { return 0; }, getgid() { return 0; }, geteuid() { return 0; }, getegid() { return 0; },
+      pid: 1, ppid: 0, umask() { return 0o22; },
+      cwd() { return (typeof CWD === 'string' && CWD) || '/project'; },
+      chdir() {},
+    };
+  }
+}
 const ESBUILD_SHIM_SOURCE = `"use strict";
 const api = require("/.beownir/runtime/esbuild.js");
 /* Initialization is shared with the runtime's own embedded esbuild (see
@@ -5752,32 +6095,98 @@ const ensure = () => {
    * callers in the same worker always await the one initialization. */
   if (!globalThis.__beownirEsbuildInit) {
     globalThis.__beownirEsbuildInit = (async () => {
+      /* The Go service reads syscalls from globalThis.fs; give it the virtual FS. */
+      if (typeof installEsbuildGoFs === 'function') installEsbuildGoFs();
       const wasmModule = await WebAssembly.compile(require("fs").readFileSync("/.beownir/runtime/esbuild.wasm"));
       await api.initialize({ wasmModule, worker: false });
+      /* The in-process service start clobbers fs.read/.writeSync with stdin
+       * protocol stubs; put the real file I/O back on the same object. */
+      if (typeof installEsbuildGoFs === 'function') installEsbuildGoFs();
       return api;
     })().catch(error => { globalThis.__beownirEsbuildInit = null; throw error; });
   }
   return globalThis.__beownirEsbuildInit;
 };
-const later = name => (...args) => ensure().then(() => api[name](...args));
+/* In-flight service calls. The wasm esbuild API resolves on real macrotasks
+ * that no handle registry sees, so a node build-tool entry would be declared
+ * done while its bundling is still running. The counter keeps the entry (and
+ * the page) alive until every call settles. */
+const track = (promise) => { globalThis.__beownirEsbuildJobs = (globalThis.__beownirEsbuildJobs || 0) + 1; return Promise.resolve(promise).then((value) => { globalThis.__beownirEsbuildJobs--; return value; }, (error) => { globalThis.__beownirEsbuildJobs--; throw error; }); };
+const workingDirFor = (name, args) => {
+  /* The embedded browser build hardcodes defaultWD "/" (a URL root), so
+   * metafile paths come back relative to the wrong base and tools that
+   * compare them against cwd-relative paths break. Node esbuild uses
+   * process.cwd() as the working directory; mirror that when the caller
+   * did not choose one. Only build and context take a working directory;
+   * transform would reject the unknown flag. */
+  if ((name === "build" || name === "context") && args[0] && typeof args[0] === "object" && !("absWorkingDir" in args[0])) args[0] = Object.assign({}, args[0], { absWorkingDir: require("process").cwd() });
+};
+const later = name => (...args) => track(ensure().then(() => {
+  workingDirFor(name, args);
+  return api[name](...args);
+}));
 const synchronous = name => () => { throw new Error("esbuild." + name + " needs the native binary; use the async API instead"); };
-module.exports = Object.assign({}, api, {
-  version: api.version,
-  initialize: () => ensure(),
-  transform: later("transform"), build: later("build"), context: later("context"),
-  formatMessages: later("formatMessages"), analyzeMetafile: later("analyzeMetafile"),
-  transformSync: synchronous("transformSync"), buildSync: synchronous("buildSync"), formatMessagesSync: synchronous("formatMessagesSync")
+/* esbuild's terminal-pretty printer needs a real TTY, which the Go-in-WASM
+ * service refuses ("only works in node"). Tools like Remix call it to format
+ * diagnostics; a plain one-line-per-message formatter is an honest substitute. */
+const plainFormatMessages = (messages, options) => (Array.isArray(messages) ? messages : []).map((message) => {
+  const where = message.location ? message.location.file + ':' + message.location.line + ':' + message.location.column : '';
+  const severity = message.severity || (options && options.kind === 'warning' ? 'warning' : 'error');
+  return severity + ': ' + (message.text || '') + (where ? ' ' + where : '');
 });
+const shim = Object.assign({}, api, {
+  version: api.version,
+  initialize: () => track(ensure()),
+  transform: later("transform"), build: later("build"),
+  context: (...args) => track(ensure().then(() => { workingDirFor("context", args); return api.context(...args); }).then((context) => {
+    for (const key of Object.getOwnPropertyNames(context)) {
+      const value = context[key];
+      if (typeof value === 'function') context[key] = (...a) => track(Promise.resolve(value.apply(context, a)));
+    }
+    return context;
+  })),
+  formatMessages: async (...args) => { try { return await later("formatMessages")(...args); } catch (error) { return plainFormatMessages(args[0], args[1]); } },
+  analyzeMetafile: later("analyzeMetafile"),
+  transformSync: synchronous("transformSync"), buildSync: synchronous("buildSync"),
+  formatMessagesSync: plainFormatMessages
+});
+/* CJS consumers that interop through require("esbuild").default (Remix's
+ * compiler does) must land on the same shims, not the raw lib copy. */
+if (api.default && typeof api.default === 'object') {
+  shim.default = Object.assign({}, api.default, {
+    initialize: () => ensure(),
+    transform: later("transform"), build: later("build"), context: later("context"),
+    formatMessages: async (...args) => { try { return await later("formatMessages")(...args); } catch (error) { return plainFormatMessages(args[0], args[1]); } },
+    analyzeMetafile: later("analyzeMetafile"),
+    formatMessagesSync: plainFormatMessages
+  });
+}
+module.exports = shim;
 `;
 function resolveModule(spec, fromFile){
   // Keep the spelling for error messages: stripping 'node:' before reporting
   // made require('node:sqlite') suggest `npm install sqlite`.
   const requested = spec;
   if (spec.startsWith('node:')) spec = spec.slice(5);
+  // import(pathToFileURL(x)) is how Next and ts-node load configs and plugins;
+  // the file URL names the same virtual file as its decoded path.
+  if (spec.startsWith('file://')) {
+    try { spec = decodeURIComponent(new URL(spec).pathname); }
+    catch { spec = decodeURIComponent(spec.slice('file://'.length)); }
+  }
   if (Object.prototype.hasOwnProperty.call(CORE,spec)) return {core:spec};
   if (spec === 'esbuild') return {file:'/.beownir/runtime/esbuild-shim.js'};
   if (spec === '@tailwindcss/oxide') return {file:'/.beownir/runtime/compat/oxide.cjs'};
   if (spec === 'lightningcss') return {file:'/.beownir/runtime/compat/lightningcss.cjs'};
+  /* A bare native-binding package (Next.js requires @next/swc-<platform>-<arch>
+   * and, when it is missing, tries to download the binary with execSync, which
+   * no page can do): when its JS/WASM twin is installed, resolve the twin. The
+   * .node load path covers the case where the binding itself is installed. */
+  if (!spec.startsWith('.') && !spec.startsWith('/') && !spec.startsWith('#')
+      && spec === (spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0])) {
+    const twin = nativeFallbackFor(spec);
+    if (twin && twin !== spec) { try { return resolveModule(twin, fromFile); } catch (e) { /* fall through to the normal path */ } }
+  }
   if (spec.startsWith('#')) return {file:resolvePackageImport(spec, fromFile)};
   if (spec.startsWith('.') || spec.startsWith('/')){
     const f = tryFiles(normalize(resolve(dirname(fromFile), spec)));
@@ -5812,7 +6221,7 @@ function writeStdinModule(source) {
   if (!FS['/.beownir/run']) FS['/.beownir/run'] = { d: true, m: Date.now() };
   const file = '/.beownir/run/stdin.js';
   FS[file] = { c: String(source), m: Date.now() };
-  delete cache[file];
+  delete activeModuleCache()[file];
   return file;
 }
 function resolveBrowserModule(spec,fromFile){if(spec.startsWith('node:'))spec=spec.slice(5);if(Object.prototype.hasOwnProperty.call(CORE,spec))return{core:spec};if(spec.startsWith('.')||spec.startsWith('/'))return resolveModule(spec,fromFile);const root=spec.startsWith('@')?spec.split('/').slice(0,2).join('/'):spec.split('/')[0];if(spec===root){let dir=dirname(fromFile);while(true){const pkgPath=normalize(dir+'/node_modules/'+root),pj=pkgPath+'/package.json';if(FS[pkgPath]?.d&&FS[pj]){try{const j=JSON.parse(readFileSync(pj,'utf8')),ex=j.exports&&j.exports['.'],entry=(typeof j.browser==='string'?j.browser:null)||j.module||(ex&&(ex.browser||ex.import||ex.default||ex.require))||j.main;if(entry){const f=tryFiles(normalize(pkgPath+'/'+entry));if(f)return{file:f};}}catch(e){}break;}if(dir==='/'||!dir)break;dir=dirname(dir);}}return resolveModule(spec,fromFile);}
@@ -5833,7 +6242,7 @@ function makeRequire(fromFile){
   const req = (spec)=>{
     const r = resolveRequest(spec, fromFile);
     if (r.core) return CORE[r.core];
-    return loadFile(r.file, cache[fromFile] || null);
+    return loadFile(r.file, activeModuleCache()[fromFile] || null);
   };
   req.resolve = s => {
     const r = resolveRequest(s, fromFile);
@@ -5855,6 +6264,9 @@ function makeRequire(fromFile){
     return paths;
   };
   req.cache = cache;
+  // Node: require.extensions is Module._extensions (Next's TS config hook,
+  // ts-node and babel register all read it through the require function).
+  Object.defineProperty(req, 'extensions', { get: () => CORE.module._extensions, set: value => { CORE.module._extensions = value; }, enumerable: true, configurable: true });
   // require.main is live: it only becomes the entry module once `node file` runs.
   Object.defineProperty(req, 'main', { get: () => MAIN_MODULE || null, enumerable: true, configurable: true });
   return req;
@@ -5963,6 +6375,19 @@ function esmTokens(src) {
 
 const ESM_IDENTIFIER = /^[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*$/;
 
+/* A word that starts a statement cannot follow a token that still expects an
+ * operand. An export const whose value is a doc-commented anonymous function
+ * on a later line (mdast-util-from-markdown and much of the unist ecosystem)
+ * is one statement: the function EXPRESSION continues the assignment; treating
+ * it as a new statement split the declaration and left an unnamed `function`
+ * at statement position. */
+const ESM_OPERAND_KEYWORDS = new Set(['typeof', 'new', 'delete', 'void', 'in', 'of', 'case', 'yield', 'await', 'instanceof']);
+function esmExpectsOperand(previous) {
+  if (!previous) return true;
+  if (previous.type === 'punct') return ![')', ']', '}', ';'].includes(previous.value);
+  if (previous.type === 'word') return ESM_OPERAND_KEYWORDS.has(previous.value);
+  return false;
+}
 function esmStatementEnd(src, tokens, index) {
   let level = 0;
   let previous = tokens[index - 1] || null;
@@ -5973,7 +6398,7 @@ function esmStatementEnd(src, tokens, index) {
       else if ([')', ']', '}'].includes(token.value)) level = Math.max(0, level - 1);
       else if (token.value === ';' && level === 0) return token.end;
     }
-    if (previous && level === 0 && token.start > previous.end && src.slice(previous.end, token.start).includes('\n') && token.type === 'word' && ESM_STATEMENT_STARTERS.has(token.value)) return previous.end;
+    if (previous && level === 0 && token.start > previous.end && src.slice(previous.end, token.start).includes('\n') && token.type === 'word' && ESM_STATEMENT_STARTERS.has(token.value) && !esmExpectsOperand(previous)) return previous.end;
     previous = token;
   }
   return previous ? previous.end : src.length;
@@ -6041,6 +6466,7 @@ const ESM_IMPORT = '__beownirImport';
 const ESM_STAR = '__beownirExportStar';
 const ESM_DYNAMIC = '__beownirDynamicImport';
 const ESM_META = '__beownirImportMeta';
+const ESM_WATCH = '__beownirWatch';
 
 /* Import attributes ("with { type: 'json' }", the old "assert {...}") follow
  * the specifier. They are loader hints, so the rewrite consumes them. */
@@ -6059,13 +6485,65 @@ function esmSkipImportAttributes(tokens, cursor) {
   }
   return cursor;
 }
-function transformEsm(source, file) {
+function esmHoistedFunctions(source, tokens) {
+  const names = new Set();
+  let depth = 0;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.type === 'punct') {
+      if (token.value === '{') depth++;
+      else if (token.value === '}') depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth !== 0 || token.type !== 'word' || token.value !== 'function') continue;
+    const prev0 = tokens[index - 1];
+    const hasAsync = prev0?.type === 'word' && prev0.value === 'async' && !source.slice(prev0.end, token.start).includes('\n');
+    const startToken = hasAsync ? prev0 : token;
+    const prevIdx = hasAsync ? index - 2 : index - 1;
+    const prev = tokens[prevIdx];
+    const isDecl = !prev
+      || prev.value === ';'
+      || prev.value === '}'
+      || prev.value === 'export'
+      || (prev.value === 'default' && tokens[prevIdx - 1]?.value === 'export')
+      || (!esmExpectsOperand(prev) && prev.value !== 'return' && source.slice(prev.end, startToken.start).includes('\n'));
+    if (!isDecl) continue;
+    let nameIdx = index + 1;
+    if (tokens[nameIdx]?.value === '*') nameIdx++;
+    const nameToken = tokens[nameIdx];
+    if (nameToken?.type === 'word' && ESM_IDENTIFIER.test(nameToken.value)) names.add(nameToken.value);
+  }
+  return names;
+}
+function esmDirectivePrologueEnd(source, tokens) {
+  let end = 0;
+  let i = 0;
+  while (i < tokens.length && tokens[i].type === 'string') {
+    const nextTok = tokens[i + 1];
+    if (nextTok && nextTok.type === 'punct' && nextTok.value === ';') {
+      end = nextTok.end;
+      i += 2;
+    } else if (!nextTok || source.slice(tokens[i].end, nextTok.start).includes('\n')) {
+      end = tokens[i].end;
+      i += 1;
+    } else {
+      break;
+    }
+  }
+  return end;
+}
+function transformEsm(source, file, asyncImports) {
   const tokens = esmTokens(source);
+  const hoistedFns = esmHoistedFunctions(source, tokens);
+  const directiveEnd = esmDirectivePrologueEnd(source, tokens);
   const edits = [];
   const inserts = [];
+  const hoisted = [];
   let counter = 0;
   const add = (start, end, text) => edits.push({ start, end, text });
-  const getter = (position, exported, expression) => inserts.push({ position, text: '\nObject.defineProperty(' + ESM_EXPORTS + ', ' + JSON.stringify(exported) + ', { enumerable: true, get: () => ' + expression + ' });' });
+  const getterCode = (exported, expression) => 'Object.defineProperty(' + ESM_EXPORTS + ', ' + JSON.stringify(exported) + ', { enumerable: true, configurable: true, get: () => ' + expression + ' });';
+  const getter = (position, exported, expression) => inserts.push({ position, text: '\n' + getterCode(exported, expression) });
+  const hoistGetter = (exported, expression) => hoisted.push(getterCode(exported, expression));
 
   let depth = 0;
   for (let index = 0; index < tokens.length; index++) {
@@ -6105,6 +6583,10 @@ function transformEsm(source, file) {
           if (tokens[cursor]?.value === '}') cursor++;
         }
         while (cursor < tokens.length && tokens[cursor].value !== 'from') cursor++;
+        /* A clause without `from` before end-of-stream means the tokenizer
+         * desynced (minified bundles with regexes can do it); leave the
+         * statement untouched instead of indexing past the last token. */
+        if (cursor >= tokens.length) continue;
         cursor++;
         if (tokens[cursor]?.type === 'string') clause.source = tokens[cursor].value;
         cursor++;
@@ -6112,11 +6594,18 @@ function transformEsm(source, file) {
       cursor = esmSkipImportAttributes(tokens, cursor);
       if (tokens[cursor]?.value === ';') cursor++;
       const declarationEndToken = tokens[cursor - 1];
+      if (!declarationEndToken) continue;
       const variable = '__esm' + counter++;
-      const lines = [`const ${variable} = ${ESM_IMPORT}(${JSON.stringify(clause.source)}, ${JSON.stringify(file)});`];
-      if (clause.defaultName) lines.push(`const ${clause.defaultName} = ${variable}.default;`);
+      const lines = [`const ${variable} = ${asyncImports ? 'await ' : ''}${ESM_IMPORT}(${JSON.stringify(clause.source)}, ${JSON.stringify(file)});`];
+      const updates = [];
+      if (clause.defaultName) { lines.push(`let ${clause.defaultName} = ${variable}.default;`); updates.push(`${clause.defaultName} = ${variable}.default;`); }
       if (clause.namespace) lines.push(`const ${clause.namespace} = ${variable};`);
-      for (const { imported, local } of clause.named) lines.push(`const ${local} = ${variable}[${JSON.stringify(imported)}];`);
+      for (const { imported, local } of clause.named) {
+        const expr = `${variable}[${JSON.stringify(imported)}]`;
+        lines.push(`let ${local} = ${expr};`);
+        updates.push(`${local} = ${expr};`);
+      }
+      if (updates.length) lines.push(`if (${ESM_WATCH}(${variable})) ${ESM_WATCH}(${variable}, () => { ${updates.join(' ')} });`);
       add(token.start, declarationEndToken.end, lines.join(' '));
       index = cursor - 1;
       continue;
@@ -6135,11 +6624,12 @@ function transformEsm(source, file) {
           if (tokens[index + 3]?.value === '*') { name = tokens[index + 4]?.value; declared = !!name; }
           else if (tokens[index + 3]?.type === 'word' && tokens[index + 3].value !== 'extends') { name = tokens[index + 3].value; declared = true; }
         } else if (value.type === 'word' && value.value === 'async' && tokens[index + 3]?.value === 'function') {
-          name = tokens[index + 4]?.value; declared = !!name;
+          name = tokens[index + 4]?.value === '*' ? tokens[index + 5]?.value : tokens[index + 4]?.value; declared = !!name;
         }
         if (declared) {
           add(token.start, value.start, '');
-          getter(esmDeclarationEnd(tokens, index + 2), 'default', name);
+          if (value.value === 'function' || value.value === 'async') hoistGetter('default', name);
+          else getter(esmDeclarationEnd(tokens, index + 2), 'default', name);
           continue;
         }
         const end = esmStatementEnd(source, tokens, index + 2);
@@ -6161,10 +6651,10 @@ function transformEsm(source, file) {
         const end = tokens[cursor - 1].end;
         const variable = '__esm' + counter++;
         if (namespace) {
-          add(token.start, end, `const ${variable} = ${ESM_IMPORT}(${JSON.stringify(sourceToken.value)}, ${JSON.stringify(file)});`);
+          add(token.start, end, `const ${variable} = ${asyncImports ? 'await ' : ''}${ESM_IMPORT}(${JSON.stringify(sourceToken.value)}, ${JSON.stringify(file)});`);
           getter(end, namespace, variable);
         } else {
-          add(token.start, end, `${ESM_STAR}(${ESM_EXPORTS}, ${ESM_IMPORT}(${JSON.stringify(sourceToken.value)}, ${JSON.stringify(file)}));`);
+          add(token.start, end, `${asyncImports ? 'await ' : ''}${ESM_STAR}(${ESM_EXPORTS}, ${asyncImports ? 'await ' : ''}${ESM_IMPORT}(${JSON.stringify(sourceToken.value)}, ${JSON.stringify(file)}));`);
         }
         index = cursor - 1;
         continue;
@@ -6191,11 +6681,14 @@ function transformEsm(source, file) {
         const end = tokens[cursor - 1].end;
         if (sourceValue) {
           const variable = '__esm' + counter++;
-          add(token.start, end, `const ${variable} = ${ESM_IMPORT}(${JSON.stringify(sourceValue)}, ${JSON.stringify(file)});`);
+          add(token.start, end, `const ${variable} = ${asyncImports ? 'await ' : ''}${ESM_IMPORT}(${JSON.stringify(sourceValue)}, ${JSON.stringify(file)});`);
           for (const { local, exported } of bindings) getter(end, exported, `${variable}[${JSON.stringify(local)}]`);
         } else {
           add(token.start, end, '');
-          for (const { local, exported } of bindings) getter(end, exported, local);
+          for (const { local, exported } of bindings) {
+            if (hoistedFns.has(local)) hoistGetter(exported, local);
+            else getter(end, exported, local);
+          }
         }
         index = cursor - 1;
         continue;
@@ -6218,7 +6711,8 @@ function transformEsm(source, file) {
         if (!nameToken || nameToken.type !== 'word' || !ESM_IDENTIFIER.test(nameToken.value)) continue;
         const end = esmDeclarationEnd(tokens, declarationStart);
         add(token.start, following.start, '');
-        getter(end, nameToken.value, nameToken.value);
+        if (following.value === 'function' || following.value === 'async') hoistGetter(nameToken.value, nameToken.value);
+        else getter(end, nameToken.value, nameToken.value);
         continue;
       }
     }
@@ -6237,8 +6731,11 @@ function transformEsm(source, file) {
 
   const ordered = [...edits].sort((a, b) => a.start - b.start || a.end - b.end);
   const pending = [...inserts].sort((a, b) => a.position - b.position);
-  let output = '';
-  let cursor = 0;
+  const hoistedPrefix = hoisted.length
+    ? (directiveEnd > 0 && source[directiveEnd - 1] !== ';' ? '; ' : (directiveEnd > 0 ? ' ' : '')) + hoisted.join(' ') + ' '
+    : '';
+  let output = source.slice(0, directiveEnd) + hoistedPrefix;
+  let cursor = directiveEnd;
   let editIndex = 0;
   let insertIndex = 0;
   while (editIndex < ordered.length || insertIndex < pending.length) {
@@ -6362,7 +6859,9 @@ function packageEntry(pkgDir, subpath) {
     if (subpath !== '.') return null; // "exports" is authoritative for subpaths
   }
   if (subpath !== '.') return tryFiles(normalize(pkgDir + '/' + subpath));
-  const main = (typeof json.browser === 'string' ? json.browser : null) || json.main || json.module || 'index.js';
+  /* See the makeRequire comment: main outranks the legacy browser field in a
+   * Node-like worker. */
+  const main = json.main || (typeof json.browser === 'string' ? json.browser : null) || json.module || 'index.js';
   return tryFiles(normalize(pkgDir + '/' + main));
 }
 
@@ -6391,12 +6890,43 @@ function interopNamespace(exportsObject) {
   }
   return namespace;
 }
-function exportStar(target, namespace) {
+const esmLoadingSet = new Set();
+const esmCycleTainted = new Set();
+const esmPendingWatches = [];
+function watchEsmBinding(namespace, updater) {
+  if (!updater) return esmLoadingSet.has(namespace) || (esmLoadingSet.size > 0 && esmCycleTainted.has(namespace));
+  esmPendingWatches.push(updater);
+}
+function recordEsmCycle(namespace) {
+  if (esmLoadingSet.has(namespace)) {
+    for (const active of esmLoadingSet) esmCycleTainted.add(active);
+  }
+}
+function flushEsmWatches() {
+  if (esmPendingWatches.length) {
+    const snapshot = esmPendingWatches.slice();
+    for (let i = 0; i < snapshot.length; i++) snapshot[i]();
+    if (esmLoadingSet.size === 0) {
+      if (snapshot.length > 1) {
+        for (let i = 0; i < snapshot.length; i++) snapshot[i]();
+      }
+      esmPendingWatches.length = 0;
+    }
+  }
+  if (esmLoadingSet.size === 0) esmCycleTainted.clear();
+}
+function copyExportStar(target, namespace) {
   for (const key of Object.keys(namespace)) {
     if (key === 'default' || key === '__esModule' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-    Object.defineProperty(target, key, { enumerable: true, get: () => namespace[key] });
+    /* configurable: an explicit `export { X } from …` in the same module wins
+     * over a star export of the same name (spec precedence); @nestjs/core's
+     * internal.js re-exports RuntimeException both ways. */
+    Object.defineProperty(target, key, { enumerable: true, configurable: true, get: () => namespace[key] });
   }
-  return target;
+}
+function exportStar(target, namespace) {
+  copyExportStar(target, namespace);
+  if (watchEsmBinding(namespace)) watchEsmBinding(namespace, () => copyExportStar(target, namespace));
 }
 function importModule(spec, fromFile) {
   const resolved = resolveModule(spec, fromFile);
@@ -6404,11 +6934,37 @@ function importModule(spec, fromFile) {
   const exportsObject = loadFile(resolved.file);
   // import() always sees the ES module namespace, even when require() got the
   // 'module.exports' binding instead.
-  const record = cache[resolved.file];
-  return interopNamespace(record && record.namespace ? record.namespace : exportsObject);
+  const record = activeModuleCache()[resolved.file];
+  const ns = interopNamespace(record && record.namespace ? record.namespace : exportsObject);
+  recordEsmCycle(ns);
+  return ns;
 }
 function importEsm(spec, fromFile) { return importModule(spec, fromFile); }
-function dynamicImportEsm(spec, fromFile) { return Promise.resolve().then(() => importModule(spec, fromFile)); }
+async function importEsmAsync(spec, fromFile) {
+  const resolved = resolveModule(spec, fromFile);
+  if (resolved.core) return interopNamespace(CORE[resolved.core]);
+  let exportsObject;
+  try { exportsObject = loadFile(resolved.file); }
+  catch (error) {
+    // The dependency uses top-level await; the async ESM loader can evaluate it.
+    if (error && error.code === 'ERR_REQUIRE_ASYNC_MODULE') exportsObject = await loadEsmFileAsync(resolved.file);
+    else throw error;
+  }
+  const record = activeModuleCache()[resolved.file];
+  /* CJS dependencies must go through the same default-import interop as the
+   * sync path: `import colors from 'kleur'` inside an async-loaded module was
+   * reading `.default` off the raw module.exports. */
+  const ns = interopNamespace(record && record.namespace ? record.namespace : exportsObject);
+  recordEsmCycle(ns);
+  return ns;
+}
+async function dynamicImportEsm(spec, fromFile) {
+  try { return importModule(spec, fromFile); }
+  catch (error) {
+    if (error && error.code === 'ERR_REQUIRE_ASYNC_MODULE') return await importEsmAsync(spec, fromFile);
+    throw error;
+  }
+}
 function importMetaFor(file) {
   return {
     url: 'file://' + file,
@@ -6421,36 +6977,51 @@ function importMetaFor(file) {
 /** Loads an ES module and returns its namespace (Node 22 require(esm) shape). */
 function loadEsmFile(file) {
   const mod = { exports: {}, id: file, filename: file, loaded: false, children: [], paths: [], esm: true };
-  cache[file] = mod;
+  activeModuleCache()[file] = mod;
   const namespace = mod.exports;
   Object.defineProperty(namespace, '__esModule', { value: true });
   Object.defineProperty(namespace, Symbol.toStringTag, { value: 'Module' });
   let source = readFileSync(file, 'utf8').replace(/^#![^\n]*(?:\n|$)/, '');
   const prepared = preparedModules.get(file);
   if (prepared && prepared.source === source) source = prepared.code;
-  const code = transformEsm(source);
-  const wrapper = '(function(__beownirExports, __beownirRequire, __beownirModule, __beownirImport, __beownirExportStar, __beownirDynamicImport, __beownirImportMeta){' + code + '\n})';
+  const code = transformEsm(source, file);
+  const wrapper = '(function(__beownirExports, __beownirRequire, __beownirModule, __beownirImport, __beownirExportStar, __beownirDynamicImport, __beownirImportMeta, __beownirWatch){' + code + '\n})';
   let fn;
   try { fn = (0, eval)(wrapper + '\n//# sourceURL=' + file); }
   catch (error) {
-    delete cache[file];
-    if (/await|async/i.test(String(error && error.message))) {
+    delete activeModuleCache()[file];
+    /* A plain-function wrapper cannot parse top-level await, and V8 reports it
+     * in roundabout ways ("await is only valid in async functions", or the
+     * awaited identifier itself, e.g. svelte-kit's `await import_peer(...)`).
+     * Re-parse with an async wrapper: if that parses, the module needs
+     * top-level await rather than being genuinely malformed. */
+    let asyncParses = false;
+    try { (0, eval)(wrapper.replace('(function(', '(async function(') + '\n//# sourceURL=' + file); asyncParses = true; } catch (e) {}
+    if (asyncParses) {
       const failure = new Error("require() of the ES module '" + file + "' failed: it uses top-level await, which cannot be loaded synchronously. Import it with import() instead.");
       failure.code = 'ERR_REQUIRE_ASYNC_MODULE';
       throw failure;
     }
     throw new SyntaxError(file + ': ' + (error && error.message));
   }
+  esmLoadingSet.add(namespace);
   try {
     fn.call(namespace, namespace, makeRequire(file), mod,
-      spec => importEsm(spec, file), exportStar, spec => dynamicImportEsm(spec, file), importMetaFor(file));
-  } catch (error) { delete cache[file]; throw error; }
+      spec => importEsm(spec, file), exportStar, spec => dynamicImportEsm(spec, file), importMetaFor(file), watchEsmBinding);
+  } catch (error) {
+    delete activeModuleCache()[file];
+    esmLoadingSet.delete(namespace);
+    if (esmLoadingSet.size === 0) { esmPendingWatches.length = 0; esmCycleTainted.clear(); }
+    throw error;
+  }
+  esmLoadingSet.delete(namespace);
   mod.loaded = true;
   /* Node's require(esm) interop: a module that exports a binding literally named
    * 'module.exports' hands that value to require(), while import() still sees the
    * namespace. yargs 18 (and other ESM packages) rely on it. */
   if (Object.prototype.hasOwnProperty.call(namespace, 'module.exports')) mod.exports = namespace['module.exports'];
   mod.namespace = namespace;
+  flushEsmWatches();
   return mod.exports;
 }
 
@@ -6459,25 +7030,33 @@ function loadEsmFile(file) {
  * loaded through an async wrapper instead of refusing to run the program. */
 async function loadEsmFileAsync(file) {
   const mod = { exports: {}, id: file, filename: file, loaded: false, children: [], paths: [], esm: true };
-  cache[file] = mod;
+  activeModuleCache()[file] = mod;
   const namespace = mod.exports;
   Object.defineProperty(namespace, '__esModule', { value: true });
   Object.defineProperty(namespace, Symbol.toStringTag, { value: 'Module' });
   let source = readFileSync(file, 'utf8').replace(/^#![^\n]*(?:\n|$)/, '');
   const prepared = preparedModules.get(file);
   if (prepared && prepared.source === source) source = prepared.code;
-  const code = transformEsm(source);
-  const wrapper = '(async function(__beownirExports, __beownirRequire, __beownirModule, __beownirImport, __beownirExportStar, __beownirDynamicImport, __beownirImportMeta){' + code + '\n})';
+  const code = transformEsm(source, file, true);
+  const wrapper = '(async function(__beownirExports, __beownirRequire, __beownirModule, __beownirImport, __beownirExportStar, __beownirDynamicImport, __beownirImportMeta, __beownirWatch){' + code + '\n})';
   let fn;
   try { fn = (0, eval)(wrapper + '\n//# sourceURL=' + file); }
-  catch (error) { delete cache[file]; throw new SyntaxError(file + ': ' + (error && error.message)); }
+  catch (error) { delete activeModuleCache()[file]; throw new SyntaxError(file + ': ' + (error && error.message)); }
+  esmLoadingSet.add(namespace);
   try {
     await fn.call(namespace, namespace, makeRequire(file), mod,
-      spec => importEsm(spec, file), exportStar, spec => dynamicImportEsm(spec, file), importMetaFor(file));
-  } catch (error) { delete cache[file]; throw error; }
+      spec => importEsmAsync(spec, file), exportStar, spec => dynamicImportEsm(spec, file), importMetaFor(file), watchEsmBinding);
+  } catch (error) {
+    delete activeModuleCache()[file];
+    esmLoadingSet.delete(namespace);
+    if (esmLoadingSet.size === 0) { esmPendingWatches.length = 0; esmCycleTainted.clear(); }
+    throw error;
+  }
+  esmLoadingSet.delete(namespace);
   mod.loaded = true;
   if (Object.prototype.hasOwnProperty.call(namespace, 'module.exports')) mod.exports = namespace['module.exports'];
   mod.namespace = namespace;
+  flushEsmWatches();
   return mod.exports;
 }
 
@@ -6486,7 +7065,7 @@ async function loadEsmFileAsync(file) {
 let MAIN_MODULE = null, MAIN_FILE = null;
 function setMainModule(file) {
   MAIN_FILE = file ? resolve(file) : null;
-  const entry = MAIN_FILE ? cache[MAIN_FILE] : null;
+  const entry = MAIN_FILE ? activeModuleCache()[MAIN_FILE] : null;
   MAIN_MODULE = entry || (MAIN_FILE ? { exports: {}, id: '.', filename: MAIN_FILE, loaded: false, children: [], parent: null, paths: [] } : null);
   if (MAIN_MODULE) { MAIN_MODULE.id = '.'; MAIN_MODULE.parent = null; Object.defineProperty(MAIN_MODULE, 'main', { value: true, enumerable: false, configurable: true }); }
   return MAIN_MODULE;
@@ -6497,14 +7076,24 @@ const MODULE_WRAPPER = '(function(exports, require, module, __filename, __dirnam
 function loadFile(file, parent){
   // Rollup's native.js picks a per-platform binary; the WASM build serves the same API here.
   if (/\/node_modules\/rollup\/dist\/native\.js$/.test(file)) file = '/.beownir/runtime/rollup/native.js';
-  if (cache[file]) return cache[file].exports;
-  if (file.endsWith('.wasm')){ const exports=loadWasmModule(file); cache[file]={exports,loaded:true}; return exports; }
-  if(file.endsWith('.node')){const wasm=wasmCompanion(file);if(wasm){const exports=loadWasmModule(wasm);cache[file]={exports,loaded:true};return exports;}throw new Error("Native Node addon '"+file+"' cannot execute in a browser worker. Provide a matching .wasm companion with a JS/WASM-compatible interface.");}
+  if (activeModuleCache()[file]) return activeModuleCache()[file].exports;
+  if (file.endsWith('.wasm')){ const exports=loadWasmModule(file); activeModuleCache()[file]={exports,loaded:true}; return exports; }
+  if(file.endsWith('.node')){
+    const wasm=wasmCompanion(file);
+    if(wasm){const exports=loadWasmModule(wasm);activeModuleCache()[file]={exports,loaded:true};return exports;}
+    const js=loadNativeFallback(file);
+    if(js){activeModuleCache()[file]={exports:js,loaded:true};return js;}
+    const owner=owningPackage(file),fallback=nativeFallbackFor(owner);
+    const e=fallback
+      ?new Error("Native Node addon '"+owner+"' cannot execute in a browser worker, and its JS-only fallback package '"+fallback+"' is not installed. Install it with: npm install "+fallback+(String(owner).startsWith('@next/swc-')?"@<the exact next version>":""))
+      :new Error("Native Node addon '"+(owner||file)+"' cannot execute in a browser worker. There is no known JS/WASM build of this package; provide a matching .wasm companion with a JS/WASM-compatible interface, or map one with BEOWNIR_NATIVE_FALLBACK='{\""+(owner||'package')+"\":\"js-build-package\"}'.");
+    e.code='ENOSYS';throw e;
+  }
   if (moduleFormat(file) === 'esm') return loadEsmFile(file);
   let src = readFileSync(file, 'utf8');
   const isMain = file === MAIN_FILE;
   const mod = { exports:{}, id:isMain?'.':file, filename:file, loaded:false, children:[], parent:isMain?null:(parent||null), paths:[] };
-  cache[file] = mod;
+  activeModuleCache()[file] = mod;
   if (parent && Array.isArray(parent.children)) parent.children.push(mod);
   if (isMain) MAIN_MODULE = mod;
   if (file.endsWith('.json')){ mod.exports = JSON.parse(src); mod.loaded=true; return mod.exports; }
@@ -6514,11 +7103,11 @@ function loadFile(file, parent){
   const wrapper = MODULE_WRAPPER + src + '\n})';
   let fn;
   try { fn = (0,eval)(wrapper + '\n//# sourceURL=' + file); }
-  catch(e){ delete cache[file]; throw new SyntaxError(file+': '+e.message); }
+  catch(e){ delete activeModuleCache()[file]; throw new SyntaxError(file+': '+e.message); }
   const h = (t,p,...c)=>{ const R = tryReact(file); return R? R.createElement(t,p,...c) : {type:t,props:{...p,children:c}}; };
   const Frag = (p)=>p.children;
   try { fn.call(mod.exports, mod.exports, makeRequire(file), mod, file, dirname(file), h, Frag, spec => dynamicImportEsm(spec, file), importMetaFor(file)); }
-  catch(e){ delete cache[file]; throw e; }
+  catch(e){ delete activeModuleCache()[file]; throw e; }
   mod.loaded = true;
   return mod.exports;
 }
@@ -6976,10 +7565,10 @@ function mkConsole(){
         out('\x1b[90m│\x1b[0m'+cols.map((c,i)=>' '+c.padEnd(w[i]-1)).join('\x1b[90m│\x1b[0m')+'\x1b[90m│\x1b[0m\n');
         rows.forEach(r=>out('\x1b[90m│\x1b[0m'+cols.map((c,i)=>' '+String((r&&r[c])??'').padEnd(w[i]-1)).join('\x1b[90m│\x1b[0m')+'\x1b[90m│\x1b[0m\n'));
         out('\x1b[90m└'+w.map(x=>'─'.repeat(x)).join('┴')+'┘\x1b[0m\n'); }catch(e){ mk('log')(d); } },
-    group:mk('log'), groupEnd:()=>{}, assert:(c,...a)=>{ if(!c) mk('error')('Assertion failed:',...a); },
+    group:mk('log'), groupCollapsed:mk('log'), groupEnd:()=>{}, assert:(c,...a)=>{ if(!c) mk('error')('Assertion failed:',...a); },
     count:(l='default')=>{ counts[l]=(counts[l]||0)+1; mk('log')(l+': '+counts[l]); },
     countReset:(l='default')=>{ delete counts[l]; },
-    time:(l='default')=>{ timers[l]=performance.now(); }, timeEnd:(l='default')=>{ mk('log')(l+': '+(performance.now()-(timers[l]||0)).toFixed(2)+'ms'); },
+    time:(l='default')=>{ timers[l]=performance.now(); }, timeEnd:(l='default')=>{ mk('log')(l+': '+(performance.now()-(timers[l]||0)).toFixed(2)+'ms'); }, timeLog:(l='default',...a)=>{ mk('log')(l+': '+(performance.now()-(timers[l]||0)).toFixed(2)+'ms'+(a.length?' '+UTIL.format.apply(UTIL,a):'')); },
     clear:()=>post({type:'clear'}) });
   return Console.attach(instance);
 }
@@ -7033,7 +7622,7 @@ self.onunhandledrejection = (ev)=>{ errOut('\x1b[31mUnhandledPromiseRejection: '
    * ------------------------------------------------------------------ */
   function toBytes(value) {
     if (value instanceof Uint8Array) return value;
-    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (isArrayBufferLike(value)) return new Uint8Array(value);
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     if (typeof value === 'string') return new TextEncoder().encode(value);
     throw new TypeError('Expected binary data');
@@ -8254,7 +8843,7 @@ function createDependencyReader() {
   };
 }
 async function restoreDependencyCheckpoint(input) {
-  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const bytes = input instanceof Uint8Array ? input : ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : new Uint8Array(input);
   if (!bytes.length || bytes.length > DEPS_LIMITS.compressed) throw new Error('Dependency checkpoint is empty or too large.');
   const pako = pakoApi(), reader = createDependencyReader(), inflate = new pako.Inflate({ chunkSize: 64 * 1024 });
   let expanded = 0;
@@ -8297,14 +8886,15 @@ function staticResponse(urlPath){
 }
 function mime(file){return ({html:'text/html; charset=utf-8',htm:'text/html; charset=utf-8',js:'text/javascript',mjs:'text/javascript',jsx:'text/javascript',ts:'text/javascript',tsx:'text/javascript',css:'text/css',json:'application/json',svg:'image/svg+xml',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',avif:'image/avif',ico:'image/x-icon',woff:'font/woff',woff2:'font/woff2',ttf:'font/ttf',txt:'text/plain',wasm:'application/wasm',mp3:'audio/mpeg',mp4:'video/mp4'})[extname(file).slice(1).toLowerCase()]||'application/octet-stream';}
 function syncBack(){
-  if(holdSync||!dirty.size)return;const files=Object.create(null),versions=Object.create(null);
+  if(holdSync||!dirty.size)return false;const files=Object.create(null),versions=Object.create(null);
   for(const path of dirty){
     // Dependency trees and runtime scratch space are machine output. They live in
     // the worker and in the compressed dependency checkpoint, never in the editor's
     // source workspace budget.
     if(path==='/project/node_modules'||path.startsWith('/project/node_modules/')||path.startsWith('/project/.beownir/'))continue;
     if(!path.startsWith('/project/')&&path!=='/project'&&!path.startsWith('/tmp/')&&path!=='/tmp')continue;const entry=FS[path];files[path]=entry?(entry.d?{d:true}:{c:typeof entry.c==='string'?entry.c:'__BEOWNIR_WASM64__:'+Buffer.from(entry.c).toString('base64')}):null;versions[path]=baseRevisions[path]||0;}
-  dirty.clear();if(Object.keys(files).length)post({type:'fssync',files,versions});
+  dirty.clear();if(Object.keys(files).length){post({type:'fssync',files,versions});return true;}
+  return false;
 }
 let commandQueue=Promise.resolve();
 self.onmessage=async ev=>{
@@ -9374,6 +9964,22 @@ async function prepareModules(file, seen = new Set()) {
   }
 }
 let EVAL_SOURCE;
+/* Work a `node script.js` entry can still have in flight after its module
+ * function returned: fs bridge jobs, pending kernel calls, referenced timers,
+ * child workers and file watchers. Servers, stdio and IPC are deliberately not
+ * counted - they are the "may remain active" background surface. */
+function entryWorkPending() {
+  return (globalThis.__beownirEsbuildJobs || 0) || fsJobs || kernelPending.size || [...kernelTimers.values()].some(timer => timer._referenced) ||
+    [...kernelChildren].some(child => child._referenced && !child._closed) ||
+    [...fsWatchers].some(watcher => !watcher.closed && watcher._beownirRef !== false) ||
+    [...fsWatchFile.values()].some(set => [...set].some(watcher => watcher._beownirRef !== false));
+}
+async function settleEntryWork() {
+  for (;;) {
+    await new Promise(resolve => runtimeNativeSetTimeout(resolve, 0));
+    if (processExitRequested || kernelExiting || !entryWorkPending()) return;
+  }
+}
 async function runNode(args) {
   if (args[0] === '-v' || args[0] === '--version') { out('v' + String(processObj.versions.node) + '\n'); return 0; }
   if (args[0] === '--beownir') { out('Beownir 2.1 · Node-compatible worker runtime in a browser (not native Node.js) · reports v' + String(processObj.versions.node) + '\n'); return 0; }
@@ -9411,6 +10017,7 @@ async function runNode(args) {
   for (const key of Object.keys(cache)) if (!key.startsWith('/.beownir/')) delete cache[key];
   setMainModule(file);
   processObj.exitCode = undefined;
+  processExitRequested = false;
   const start = performance.now();
   await prepareModules(file);
   kernelReadyForInput();
@@ -9435,6 +10042,14 @@ async function runNode(args) {
       return 1;
     }
   }
+  /* Node keeps a script's process alive while its event loop has work, and it
+   * always drains the microtask queue before reporting anything. A CJS entry
+   * usually returns while its real work has only started - `main().catch(...)`
+   * is the shape of every bin wrapper - and this runtime's sync-backed fs
+   * promises continue on the microtask queue, with bridge jobs and timers
+   * needing further turns. Wait for that work before reporting the exit code;
+   * servers stay backgrounded, exactly as the notice below says. */
+  await settleEntryWork();
   // A terminal nicety, not program output: `notice` is rendered dim by the
   // terminal and is invisible to pipes, redirections and captured stdout, so
   // `node app.js > out.txt` and `node app.js | grep x` stay byte-identical to
@@ -9544,7 +10159,8 @@ async function runViteCLI(args) {
   return 0;
 }
 async function runNpx(args) {
-  const [tool, ...rest] = args;
+  let [tool, ...rest] = args;
+  const requestedName = tool;
   if (tool === 'esbuild') { await runEsbuild(rest); return 0; }
   if (tool === 'vite' && packageRecord('/project/node_modules/vite')) return runViteCLI(rest);
   if (['serve', 'http-server', 'vite'].includes(tool)) {
@@ -9552,9 +10168,24 @@ async function runNpx(args) {
     devServer(tool, rest); return 0;
   }
   if (!validPackageName(tool)) throw new Error('Usage: npx <installed-package> [args]. No implicit remote execution.');
-  const pkg = packageRecord('/project/node_modules/' + tool);
+  let pkg = packageRecord('/project/node_modules/' + tool);
+  /* `npx svelte-kit`, `npx nest`: the requested name is a bin that belongs to
+   * a scoped package (@sveltejs/kit, @nestjs/cli), not a package name. Search
+   * one level of node_modules for a package whose bin map owns the name. */
+  if (!pkg) {
+    const binName = tool.includes('/') ? tool.split('/').pop() : tool;
+    for (const name of Object.keys(FS)) {
+      if (!name.startsWith('/project/node_modules/') || !name.endsWith('/package.json')) continue;
+      const candidate = name.slice(0, -'/package.json'.length);
+      if (candidate.slice('/project/node_modules/'.length).split('/').length > 2) continue;
+      const record = packageRecord(candidate);
+      if (!record || !record.bin) continue;
+      const bins = typeof record.bin === 'string' ? { [candidate.split('/').pop()]: record.bin } : record.bin;
+      if (Object.prototype.hasOwnProperty.call(bins, binName)) { pkg = record; tool = candidate.slice('/project/node_modules/'.length); break; }
+    }
+  }
   if (!pkg) throw new Error(tool + ' is not installed. Run npm install ' + tool + ' first.');
-  const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.[tool.split('/').pop()] || Object.values(pkg.bin || {})[0];
+  const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.[requestedName] || Object.values(pkg.bin || {})[0];
   if (!bin) throw new Error('No CLI entry in ' + tool);
   const path = normalize('/project/node_modules/' + tool + '/' + bin);
   if (!path.startsWith('/project/node_modules/' + tool + '/')) throw new Error('Invalid package CLI path.');
@@ -9575,7 +10206,7 @@ git/file/URL aliases, native executables, and native .node addons are unsupporte
 
 let esbuildApiPromise = null;
 async function getEsbuildApi(){
- if(!esbuildApiPromise)esbuildApiPromise=(async()=>{ const api=loadFile('/.beownir/runtime/esbuild.js'); if(!globalThis.__beownirEsbuildInit){ globalThis.__beownirEsbuildInit=(async()=>{ const wasmModule=await WebAssembly.compile(readFileSync('/.beownir/runtime/esbuild.wasm')); await api.initialize({wasmModule,worker:false}); return api; })().catch(error=>{ globalThis.__beownirEsbuildInit=null; throw error; }); } return globalThis.__beownirEsbuildInit; })();
+ if(!esbuildApiPromise)esbuildApiPromise=(async()=>{ const api=loadFile('/.beownir/runtime/esbuild.js'); if(!globalThis.__beownirEsbuildInit){ globalThis.__beownirEsbuildInit=(async()=>{ installEsbuildGoFs(); const wasmModule=await WebAssembly.compile(readFileSync('/.beownir/runtime/esbuild.wasm')); await api.initialize({wasmModule,worker:false}); installEsbuildGoFs(); return api; })().catch(error=>{ globalThis.__beownirEsbuildInit=null; throw error; }); } return globalThis.__beownirEsbuildInit; })();
  return esbuildApiPromise;
 }
 function compileVueSfc(file,source){
@@ -9706,7 +10337,9 @@ const runtimeNativeSetTimeout = self.setTimeout.bind(self);
 const runtimeNativeClearTimeout = self.clearTimeout.bind(self);
 const runtimeNativeSetInterval = self.setInterval.bind(self);
 const runtimeNativeClearInterval = self.clearInterval.bind(self);
-let kernelInfo = { pid: 1, ppid: 0, ipc: false }, kernelCounter = 0, kernelTable = [], kernelEntryRunning = false, kernelExiting = false, kernelIdleTimer, kernelInternalDepth = 0, fsJobs = 0, beforeExitSent = false;
+let kernelInfo = { pid: 1, ppid: 0, ipc: false }, kernelCounter = 0, kernelTable = [], kernelEntryRunning = false, kernelExiting = false, kernelIdleTimer, kernelInternalDepth = 0, fsJobs = 0, beforeExitSent = false, kernelEpoch = null, kernelRefreshNeeded = false;
+/* Set by process.exit so a settling entry stops waiting for work its unwound stack abandoned. */
+let processExitRequested = false;
 let kernelInputReady = false; const kernelDeferredInput = [];
 function kernelReadyForInput() { if (kernelInputReady) return; kernelInputReady = true; for (const message of kernelDeferredInput.splice(0)) queueMicrotask(() => self.onmessage({ data: message })); }
 const kernelPending = new Map(), kernelChildren = new Set(), kernelChildrenByPID = new Map(), kernelTimers = new Map();
@@ -9720,7 +10353,7 @@ function kernelCall(op, data = {}) {
   });
 }
 function kernelHasHandles() {
-  return kernelEntryRunning || fsJobs || kernelPending.size || [...kernelTimers.values()].some(t => t._referenced) ||
+  return kernelEntryRunning || fsJobs || (globalThis.__beownirEsbuildJobs || 0) || kernelPending.size || [...kernelTimers.values()].some(t => t._referenced) ||
     [...kernelChildren].some(c => c._referenced && !c._closed) || [...SERVERS.values()].some(s => !s._beownirUnref) || NET_SERVERS.size ||
     [...fsWatchers].some(w => !w.closed && w._beownirRef !== false) || [...fsWatchFile.values()].some(set => [...set].some(w => w._beownirRef !== false)) ||
     pendingQuestion || !processObj.stdin._ended && (processObj.stdin.listenerCount('data') || processObj.stdin.listenerCount('readable')) ||
@@ -9799,34 +10432,59 @@ function applyKernelFiles(incoming, incomingVersions = {}, replace = false) {
     if (changed) { delete cache[path]; notifyFilesystem(path); }
   }
 }
-async function kernelRefresh() {
-  await kernelFlush(); const snapshot = await kernelCall('fs-snapshot'); applyKernelFiles(snapshot.files, snapshot.versions, true); return { epoch: snapshot.epoch };
+async function kernelRefresh(force = true) {
+  if (holdSync) throw virtualError('EBUSY', 'A filesystem transaction is in progress; wait for it before flushing.');
+  const flushed = syncBack();
+  const barrier = await kernelCall('barrier');
+  if (!force && !kernelRefreshNeeded && !flushed && kernelEpoch !== null && typeof barrier?.epoch === 'number' && barrier.epoch === kernelEpoch) {
+    return { epoch: kernelEpoch };
+  }
+  const snapshot = await kernelCall('fs-snapshot');
+  applyKernelFiles(snapshot.files, snapshot.versions, true);
+  if (typeof snapshot?.epoch === 'number') kernelEpoch = snapshot.epoch;
+  kernelRefreshNeeded = false;
+  return { epoch: snapshot.epoch };
 }
 let kernelFsQueue = Promise.resolve();
-function kernelFsTask(fn) {
+function kernelFsTask(fn, mutates = true) {
   fsJobs++;
-  const task = kernelFsQueue.then(async () => { await kernelRefresh(); const result = await fn(); await kernelFlush(); return result; });
+  const task = kernelFsQueue.then(async () => {
+    const singleProcess = kernelInfo.pid === 1 && !kernelChildren.size && kernelTable.length <= 1 && !kernelRefreshNeeded;
+    if (singleProcess) {
+      const result = await fn();
+      if (mutates && syncBack()) await kernelCall('barrier');
+      return result;
+    }
+    await kernelRefresh(false);
+    const result = await fn();
+    if (mutates || dirty.size) await kernelFlush();
+    return result;
+  });
   kernelFsQueue = task.catch(() => {});
   return task.finally(() => { fsJobs--; kernelMaybeIdle(); });
 }
+const KERNEL_FS_READONLY = new Set(['readFile', 'readdir', 'stat', 'lstat', 'access', 'realpath', 'close', 'fstat']);
+const openFlagsMutate = flags => typeof flags === 'number' ? !!(flags & (1 | 2 | 64 | 512 | 1024)) : (typeof flags === 'string' && /[wa+]/.test(flags));
 for (const name of ['readFile', 'writeFile', 'readdir', 'mkdir', 'stat', 'lstat', 'unlink', 'rm', 'rmdir', 'appendFile', 'copyFile', 'rename', 'access', 'realpath', 'open', 'close', 'fstat', 'ftruncate']) {
   const sync = FSMOD[name + 'Sync'];
+  const fixedMutates = name === 'open' ? null : !KERNEL_FS_READONLY.has(name);
   FSMOD[name] = (...args) => {
     const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
     if (!callback) return sync(...args);
-    kernelFsTask(() => sync(...args)).then(result => callback(null, result), failure => callback(failure));
+    const mutates = fixedMutates === null ? openFlagsMutate(args[1]) : fixedMutates;
+    kernelFsTask(() => sync(...args), mutates).then(result => callback(null, result), failure => callback(failure));
   };
-  if (!['open', 'close', 'fstat', 'ftruncate'].includes(name)) FSMOD.promises[name] = (...args) => kernelFsTask(() => sync(...args));
+  if (!['open', 'close', 'fstat', 'ftruncate'].includes(name)) FSMOD.promises[name] = (...args) => kernelFsTask(() => sync(...args), fixedMutates);
 }
-FSMOD.read = (fd, buffer, offset, length, position, callback) => kernelFsTask(() => readSync(fd, buffer, offset, length, position)).then(n => callback(null, n, buffer), e => callback(e));
-FSMOD.write = (fd, data, ...args) => { const callback = args.pop(); kernelFsTask(() => writeSync(fd, data, ...args)).then(n => callback(null, n, data), e => callback(e)); };
+FSMOD.read = (fd, buffer, offset, length, position, callback) => kernelFsTask(() => readSync(fd, buffer, offset, length, position), false).then(n => callback && callback(null, n, buffer), e => callback && callback(e));
+FSMOD.write = (fd, data, ...args) => { const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null; kernelFsTask(() => writeSync(fd, data, ...args), true).then(n => callback && callback(null, n, data), e => callback && callback(e)); };
 FSMOD.promises.open = (path, flags = 'r') => kernelFsTask(() => {
   const fd = openSync(path, flags);
-  return { fd, read: (buffer, offset = 0, length = buffer.length - offset, position = null) => kernelFsTask(() => ({ bytesRead: readSync(fd, buffer, offset, length, position), buffer })),
-    write: (data, ...args) => kernelFsTask(() => ({ bytesWritten: writeSync(fd, data, ...args), buffer: data })),
+  return { fd, read: (buffer, offset = 0, length = buffer.length - offset, position = null) => kernelFsTask(() => ({ bytesRead: readSync(fd, buffer, offset, length, position), buffer }), false),
+    write: (data, ...args) => kernelFsTask(() => ({ bytesWritten: writeSync(fd, data, ...args), buffer: data }), true),
     readFile: options => FSMOD.promises.readFile(fdEntry(fd).path, options), writeFile: data => FSMOD.promises.writeFile(fdEntry(fd).path, data),
-    stat: () => kernelFsTask(() => statOf(fdEntry(fd).path)), truncate: (length = 0) => kernelFsTask(() => FSMOD.ftruncateSync(fd, length)), close: () => kernelFsTask(() => closeSync(fd)) };
-});
+    stat: () => kernelFsTask(() => statOf(fdEntry(fd).path), false), truncate: (length = 0) => kernelFsTask(() => FSMOD.ftruncateSync(fd, length), true), close: () => kernelFsTask(() => closeSync(fd), false) };
+}, openFlagsMutate(flags));
 FSMOD.watch = (path, options, callback) => { const w = watchFs(path, options, callback); w._beownirRef = options?.persistent !== false; w.ref = () => { w._beownirRef = true; return w; }; w.unref = () => { w._beownirRef = false; kernelMaybeIdle(); return w; }; const close = w.close; w.close = () => { close(); kernelMaybeIdle(); }; return w; };
 FSMOD.watchFile = (path, options, callback) => { const w = watchFile(path, options, callback); w._beownirRef = options?.persistent !== false; w.ref = () => { w._beownirRef = true; return w; }; w.unref = () => { w._beownirRef = false; kernelMaybeIdle(); return w; }; return w; };
 
@@ -9881,7 +10539,7 @@ class WorkerChildProcess extends EventEmitter {
     this.stdout = modes[1] === 'pipe' ? new Readable() : null; this.stderr = modes[2] === 'pipe' ? new Readable() : null;
     this.stdin = modes[0] === 'pipe' ? new Writable({ write: (chunk, encoding, done) => { this.stdin._chunks.length = 0; this._ready.then(() => kernelCall('stdin', { pid: this.pid, bytes: Buffer.from(chunk, encoding) })).then(() => done(), done); } }) : null;
     this.stdin?.once('finish', () => { this._ready.then(() => kernelCall('stdin', { pid: this.pid, end: true })).catch(e => { if (!this._closed) this.stdin.emit('error', e); }); });
-    this.stdio = [this.stdin, this.stdout, this.stderr]; kernelChildren.add(this);
+    this.stdio = [this.stdin, this.stdout, this.stderr]; kernelChildren.add(this); kernelRefreshNeeded = true;
     this._ready = (async () => {
       const cwd = resolve(options.cwd || CWD), env = Object.fromEntries(Object.entries(options.env || processObj.env).filter(([, value]) => value !== undefined).map(([key, value]) => [key, String(value)]));
       if (kernelChildren.size > 32) throw virtualError('EAGAIN', 'Too many pending child processes.');
@@ -9991,10 +10649,14 @@ function kernelStdio(kind) {
   stream.writable = true; stream.writableEnded = false; stream.isTTY = kernelInfo.pid === 1 || kernelInfo.stdio?.[kind === 'stdout' ? 1 : 2] === 'inherit'; stream.columns = 80;
   // The same TTY surface the default stdout has: mocha and other reporters call these.
   stream.rows = 24; stream.getWindowSize = () => [stream.columns, stream.rows]; stream.hasColors = () => true; stream.getColorDepth = () => 8;
+  // TTY cursor control for progress spinners (vite build, ora, ...).
+  stream.clearLine = dir => { stream.write(dir === 1 ? '\u001b[1K' : dir === -1 ? '\u001b[2K\r' : '\u001b[2K'); return true; };
+  stream.cursorTo = x => { stream.write('\u001b[' + (Number(x) + 1) + 'G'); return true; };
+  stream.moveCursor = (dx, dy) => { if (Number(dx)) stream.write(Number(dx) > 0 ? '\u001b[' + Number(dx) + 'C' : '\u001b[' + (-Number(dx)) + 'D'); if (Number(dy)) stream.write(Number(dy) > 0 ? '\u001b[' + Number(dy) + 'B' : '\u001b[' + (-Number(dy)) + 'A'); return true; };
   stream.write = (chunk, encoding, callback) => {
     if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
     if (!stream.writable) throw virtualError('ERR_STREAM_WRITE_AFTER_END', 'write after end');
-    if (typeof chunk !== 'string' && !(chunk instanceof Uint8Array)) throw new TypeError('stdout/stderr require a string, Buffer or Uint8Array.');
+    if (typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) throw new TypeError('stdout/stderr require a string, Buffer or Uint8Array.');
     const bytes = Buffer.from(chunk, encoding);
     if (kernelInfo.pid === 1) { (kind === 'stdout' ? out : errOut)(bytes.toString()); callback?.(null); return true; }
     if (pendingBytes + bytes.length > 8 * 1024 * 1024) throw virtualError('ERR_CHILD_PROCESS_STDIO_MAXBUFFER', 'Pending virtual output exceeds 8 MiB. Respect stream backpressure.');
@@ -10011,6 +10673,7 @@ self.onmessage = async event => {
   try {
     if (message.type === 'init') {
       kernelInfo = message.kernel || kernelInfo; CWD = kernelInfo.cwd || '/project';
+      kernelEpoch = typeof kernelInfo.epoch === 'number' ? kernelInfo.epoch : null; kernelRefreshNeeded = false;
       processObj.env = { ...(kernelInfo.pid === 1 ? processObj.env : {}), ...(kernelInfo.env || {}), PWD: CWD }; processObj.connected = !!kernelInfo.ipc;
       processObj.stdout = kernelStdio('stdout'); processObj.stderr = kernelStdio('stderr');
       if (processObj.connected) {
@@ -10020,7 +10683,7 @@ self.onmessage = async event => {
       for (const [path, prepared] of kernelInfo.prepared || []) preparedModules.set(path, prepared);
       return await originalWorkerMessage(event);
     }
-    if (message.type === 'setfiles') { applyKernelFiles(message.files || {}, message.versions); return; }
+    if (message.type === 'setfiles') { applyKernelFiles(message.files || {}, message.versions); if (typeof message.kernelEpoch === 'number') kernelEpoch = message.kernelEpoch; return; }
     if (message.type === 'kernel-reply') {
       const pending = kernelPending.get(message.id); if (!pending) return; kernelPending.delete(message.id); runtimeNativeClearTimeout(pending.timer);
       if (message.error) pending.reject(virtualError(message.error.code, message.error.message)); else pending.resolve(message.result); kernelMaybeIdle(); return;
@@ -10048,7 +10711,7 @@ self.onmessage = async event => {
       else if (message.event === 'disconnect') { child.connected = false; child.emit('disconnect'); }
       else if (message.event === 'exit') {
         child._closed = true; child.connected = false; child.exitCode = message.code; child.signalCode = message.signal;
-        child.stdout?.push(null); child.stderr?.push(null); kernelChildren.delete(child); kernelChildrenByPID.delete(child.pid);
+        child.stdout?.push(null); child.stderr?.push(null); kernelChildren.delete(child); kernelChildrenByPID.delete(child.pid); kernelRefreshNeeded = true;
         if (message.error) child.emit('error', virtualError(message.error.code, message.error.message));
         child.emit('exit', message.code, message.signal); queueMicrotask(() => child.emit('close', message.code, message.signal)); kernelMaybeIdle();
       }

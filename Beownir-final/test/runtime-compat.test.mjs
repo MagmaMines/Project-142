@@ -418,3 +418,31 @@ test('events, timers, async_hooks, buffer and process fill their Node surfaces',
   assert.throws(() => process.assert(false, 'boom'), error => error.code === 'ERR_ASSERTION');
   assert.equal(typeof process.browser, 'undefined', 'Node does not define process.browser (typescript checks it)');
 });
+
+test('cross-realm ArrayBuffers and TypedArrays work with Buffer.from and util.types', async () => {
+  const { sandbox, evaluate } = loadRuntime();
+  sandbox.__hostTestAb = await new Response('astro-html').arrayBuffer();
+  sandbox.__hostTestU8 = new TextEncoder().encode('host-bytes');
+  try {
+    const result = evaluate(`(() => {
+      const { types } = require('util');
+      return {
+        abIsArrayBuffer: types.isArrayBuffer(__hostTestAb),
+        abIsAnyArrayBuffer: types.isAnyArrayBuffer(__hostTestAb),
+        abText: Buffer.from(__hostTestAb).toString('utf8'),
+        u8IsUint8Array: types.isUint8Array(__hostTestU8),
+        u8Text: Buffer.from(__hostTestU8).toString('utf8'),
+      };
+    })()`);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(result)), {
+      abIsArrayBuffer: true,
+      abIsAnyArrayBuffer: true,
+      abText: 'astro-html',
+      u8IsUint8Array: true,
+      u8Text: 'host-bytes',
+    });
+  } finally {
+    delete sandbox.__hostTestAb;
+    delete sandbox.__hostTestU8;
+  }
+});

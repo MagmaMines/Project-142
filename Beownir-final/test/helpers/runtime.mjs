@@ -147,6 +147,7 @@ export function loadRuntime(options = {}) {
         // contents the way the host does for the wire.
         for (const [path, entry] of Object.entries(internal.getFS())) {
           if (path.startsWith('/.beownir')) continue;
+          if (path === '/project/node_modules' || path.startsWith('/project/node_modules/') || path.startsWith('/project/.beownir/')) continue;
           const content = entry?.c;
           const packed = typeof content === 'string' || content === undefined ? (content ?? '') : '__BEOWNIR_WASM64__:' + Buffer.from(content).toString('base64');
           files[path] = entry && entry.d ? { d: true } : { c: packed };
@@ -185,7 +186,7 @@ export function loadRuntime(options = {}) {
  * embedded pako, esbuild JS and (decompressed) esbuild WASM, and the worker mounts them
  * under /.beownir/runtime/ together with the esbuild shim and the Rollup WASM build.
  */
-export async function initToolchain(rt) {
+export async function initToolchain(rt, options = {}) {
   const { readSite, scriptById } = await import('./embedded.mjs');
   const zlib = await import('node:zlib');
   const site = readSite();
@@ -194,6 +195,10 @@ export async function initToolchain(rt) {
       type: 'init',
       files: {},
       versions: {},
+      /* The floor budget matches a worker that never learned its origin quota.
+       * Heavy framework rows pass a realistic one here, exactly like a hosted
+       * page with a multi-gigabyte storage quota would. */
+      limits: options.limits || {},
       embeddedPako: scriptById(site, 'pakoSource'),
       embeddedEsbuildBrowser: Buffer.from(scriptById(site, 'esbuildBrowser').trim(), 'base64').toString('utf8'),
       embeddedEsbuildWasm: new Uint8Array(zlib.gunzipSync(Buffer.from(scriptById(site, 'esbuildWasm').trim(), 'base64')))

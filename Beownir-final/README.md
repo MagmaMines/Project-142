@@ -394,12 +394,12 @@ stream.pipe(req);            // body streaming, exactly as http-proxy-middleware
 req.on('response', res => res.pipe(process.stdout));
 ```
 
-Node semantics covered by `test/http-loopback.test.mjs` (14 cases): header
+Node semantics covered by `test/http-loopback.test.mjs` (15 cases): header
 get/set/remove helpers, `auth` → Basic, `path`/`pathname`/`search` precedence,
 `'finish'` before `'response'`, stream piping into the request, custom status
 messages, `'timeout'` without an implicit destroy, `abort()` → `ECONNRESET`,
-`ECONNREFUSED` for closed ports, and `https.request` over the same virtual
-transport. When the target port belongs to **another** virtual process (the
+`ECONNREFUSED` for closed ports, `https.request` over the same virtual
+transport, and `ServerResponse.assignSocket()`/`detachSocket()`. When the target port belongs to **another** virtual process (the
 usual case for `npm run dev`, where Vite runs in a child worker), the request is
 relayed through the kernel instead of failing, so a proxy in one process reaches
 a server in another. Non-loopback `https` still uses the browser stack, and the module now
@@ -412,55 +412,66 @@ platform's WHATWG `WebSocket` classes when present.
 `npm run matrix` installs real frameworks from the npm registry into the virtual
 filesystem, boots them inside the worker runtime and records what happened. These
 are not mock packages: the tarballs, dependency trees and integrity metadata come
-from registry.npmjs.org, and each row runs the framework's own API.
+from registry.npmjs.org, and each row runs the framework's own API. The latest
+run passes **42 / 43** checks across 2,291 installed packages (see
+[FRAMEWORK_COMPATIBILITY_REPORT.md](FRAMEWORK_COMPATIBILITY_REPORT.md) for the
+verbatim table and notes):
 
-| Framework | Version | What the smoke test does |
+| Framework / check | Version | What the smoke test does |
 |---|---|---|
 | express | 5.3.0 | `app.listen()` + `app.get()` route answered through the virtual HTTP client (query parsing included) |
-| koa | 3.2.1 | `app.callback()` mounted on `http.createServer`, JSON body via `ctx.body` |
-| fastify | 5.12.7 | `fastify.listen()`, route plugin loading, `fastify.close()` |
-| hono | 4.13.14 | `app.fetch(new Request(...))` with routing and `c.json()` |
+| koa | 3.3.0 | `app.callback()` mounted on `http.createServer`, JSON body via `ctx.body` |
+| fastify | 5.12.8 | `fastify.listen()`, route plugin loading, `fastify.close()` |
+| hono | 4.13.21 | `app.fetch(new Request(...))` with routing and `c.json()` |
+| nestjs | 12.6.0 | `@nestjs/core` + `@nestjs/platform-express` serving HTTP 200 on loopback |
 | react | 19.3.1 | `react-dom/server` `renderToString()` |
-| vue | 3.5.44 | `createSSRApp()` + `@vue/server-renderer` |
-| preact | 11.1.0 | `preact-render-to-string` — preact 11 is **ESM only** |
-| svelte | 5.57.3 | `svelte/compiler` compiles a component — ESM only, reached through a subpath export |
-| vite | 6.4.6 | bounded Vite 6 coverage: Node API dev serving/HMR/React tests plus `vite build` CLI compatibility path bundling a `.ts` entry with embedded WASM Rollup/esbuild; not full CLI/plugin/browser conformance |
-| hapi | 21.4.12 | `Hapi.server()` + `server.start()` answering a real request through the virtual HTTP client |
+| vue | 3.5.46 | `createSSRApp()` + `@vue/server-renderer` |
+| preact | 11.2.0 | `preact-render-to-string` — preact 11 is **ESM only** |
+| svelte | 5.59.1 | `svelte/compiler` compiles a component — ESM only, reached through a subpath export |
+| angular | 22.3.0 | `@angular/platform-server` `renderApplication()` SSR of a standalone component |
+| astro | 5.18.2 | static build emitting `dist/index.html` via Vite + esbuild WASM + Astro compiler (Astro 6 needs Node `>=22.23.4`) |
+| sveltekit | 2.70.4 | `svelte-kit sync` + Vite 7.3.8 + `@sveltejs/adapter-node` build (SvelteKit 3 / Rolldown thread pools excluded) |
+| remix | 2.17.5 | Remix v2 esbuild server build (`@remix-run/dev`) emitting the server bundle |
+| next | 15.5.29 | loads `next` and resolves native `@next/swc-linux-x64-gnu` to `@next/swc-wasm-nodejs` via the native-fallback map, compiling JSX via `transformSync` |
+| nuxt | 4.4.8 | **FAIL (honest timeout)**: `loadNuxt` + `nuxt.ready()` bind loopback, but the first Nitro SSR request times out (`>90 s`); Nuxt `>=4.5.0` needs Rolldown worker threads |
+| vite (+ 8 vite-* rows) | 6.4.6 | bounded Vite 6 coverage: Node API dev transform/serving, React dev/build, CLI `vite build`, and HMR WebSocket/invalidation using embedded WASM Rollup/esbuild |
+| esbuild | 0.28.2 / 0.25.12 WASM | embedded Go-WASM `esbuild` transforms TypeScript/JS through the bridged `fs` |
+| tailwind-4 / tailwind-3 | 4.3.5 / 3.4.19 | compiles CSS utilities (`@tailwindcss/postcss` and v3 PostCSS plugin) |
+| mocha, stylelint, chokidar, prettier, eslint | latest | test runner, CSS/JS linters, directory watcher, code formatter |
+| hapi | 21.4.13 | `Hapi.server()` + `server.start()` answering a real request through the virtual HTTP client |
 | socket.io | 4.8.4 | Engine.IO polling handshake (`/socket.io/?EIO=4&transport=polling`) returns a session id |
-| graphql | 17.0.2 | `buildSchema()` + `graphql()` executes `{ hello }` |
+| graphql | 17.1.0 | `buildSchema()` + `graphql()` executes `{ hello }` |
 | zod | 4.6.7 | schema parse accepts a valid payload and rejects an invalid one |
-| typescript | 5.9.3 | `transpileModule()` compiles TypeScript (typescript 7 is the native compiler and only exposes its version, so the row pins `^5`) |
-| babel | 8.0.9 | `@babel/core` + `@babel/preset-react` transform JSX into `createElement` calls |
-| postcss | 8.5.32 | a plugin pipeline rewrites a declaration |
-| sass | 1.107.0 | `compileString()` compiles SCSS |
+| typescript | 5.9.3 | `transpileModule()` compiles TypeScript (typescript 7 is native-only, so the row pins `^5`) |
+| babel | 8.1.3 | `@babel/core` + `@babel/preset-react` transform JSX into `createElement` calls |
+| postcss | 8.5.33 | a plugin pipeline rewrites a declaration |
+| sass | 1.108.2 | `compileString()` compiles SCSS |
 | yargs | 18.2.0 | a real CLI parses `--port`/`--name` with type coercion |
 | chalk | 6.0.1 | ESM default export, resolved through the package's `#ansi-styles` **imports** map |
-| dotenv | 18.0.9 | reads a `.env` file into `process.env` |
+| dotenv | 18.0.10 | reads a `.env` file into `process.env` |
 
 The result of the last run is committed to `o/compat/framework-matrix.json`
 (version, package count, what ran and the exact error when it fails), and
 `npm run matrix:check` fails if a framework that used to work stops working.
-Getting there closed five real gaps: `http.ClientRequest` over the virtual
-loopback, `process`/`global` missing as globals, `url.Url` being the WHATWG class
-(so `parseurl` threw), socket objects without `writable`/`readyState`
-frameworks read before sending a body, and `ServerResponse.assignSocket()` /
-`detachSocket()` — the pair `@hapi/shot` uses to attach its fake connection
-before injecting a request.
+When a package attempts to load a `.node` native addon, the resolver consults
+its native-fallback map (and `BEOWNIR_NATIVE_FALLBACK` overrides) to redirect
+known binaries (such as `@next/swc-*` → `@next/swc-wasm-nodejs`) to an
+installed JS/WASM twin, or fails honestly with `ENOSYS` (`test/native-fallback.test.mjs`).
 
 Known limits, measured rather than hidden:
 
 - **Vite support is real but bounded.** The framework matrix runs Vite 6's
-  Node API with embedded WASM Rollup/esbuild providers: dev HTTP, TypeScript
-  transforms, a production fixture build, React integration, and virtual HMR
-  transport/invalidation pass. `vite build` now runs through a tested CLI
-  compatibility path for a TypeScript entry and emits a production bundle.
-  Common options in that adapter are intentionally limited; arbitrary CLI
-  options, plugins, optimizeDeps and large projects are not established.
-  Unsupported options fail explicitly instead of being ignored. Browser DOM HMR
-  has been verified for one fixture (Vite 6, one CSS+SVG module graph, loopback
-  service-worker preview): an edit reaches `import.meta.hot` and updates the DOM
-  with no reload. Plugin fast-refresh (React/Vue), multi-module update graphs and
-  other frameworks' HMR clients remain unverified.
+  Node API (plus Vite 7.3.8 under SvelteKit) with embedded WASM Rollup/esbuild
+  providers: dev HTTP, TypeScript transforms, a production fixture build, React
+  integration, and virtual HMR transport/invalidation pass. `vite build` now
+  runs through a tested CLI compatibility path for a TypeScript entry and emits
+  a production bundle. Common options in that adapter are intentionally
+  limited; arbitrary CLI options, plugins, optimizeDeps and large projects are
+  not established. Unsupported options fail explicitly instead of being ignored.
+  Browser DOM HMR has been verified for one fixture (Vite 6, one CSS+SVG module
+  graph, loopback service-worker preview): an edit reaches `import.meta.hot` and
+  updates the DOM with no reload. Plugin fast-refresh (React/Vue), multi-module
+  update graphs and other frameworks' HMR clients remain unverified.
 - **`http` upgrade / WebSocket handshakes work on the virtual loopback, not
   across a real socket.** An in-process duplex stands in for the TCP pair: the
   client writes an RFC 6455 handshake, the server sees `'upgrade'` with one half
@@ -469,9 +480,9 @@ Known limits, measured rather than hidden:
   socket. What is missing is an OS socket: `getsockname()`/`remoteAddress` are
   synthesized, backpressure and half-close are approximated, and a library that
   needs the real descriptor will notice.
-- native addons (SWC, lightningcss, Turbopack) still need the WASM/native
-  profile, and frameworks that gate on `process.versions.node >= 20` see the
-  disclosed `v20.11.0-beownir` version string.
+- unmapped native addons (lightningcss native binaries, Turbopack, Rolldown WASI
+  thread pools) cannot run in the single-threaded worker runtime, and packages
+  checking the Node version see the disclosed `v22.22.3-beownir` string.
 
 ## ES modules
 
@@ -497,10 +508,12 @@ What the transform supports, all covered by `test/esm-loader.test.mjs`:
   ESM interop in both directions, and circular graphs.
 
 Exported bindings are live through getters, so `export let counter` updates when
-the module mutates it. Two deliberate limits: top-level `await` is rejected with
-Node's `ERR_REQUIRE_ASYNC_MODULE` code (there is no synchronous way to wait), and
-values imported from a module in a cycle are snapshotted at import time rather
-than tracked as live bindings.
+the module mutates it, and load-time circular graphs (`export function`
+hoisting, bottom exports, `export *` re-exports) resolve once exports settle.
+Two deliberate limits: top-level `await` is rejected with Node's
+`ERR_REQUIRE_ASYNC_MODULE` code (there is no synchronous way to wait), and
+post-evaluation `export let` reassignments in a cycle update namespace objects
+but remain snapshotted for destructured named imports taken during loading.
 
 ## Offline shell
 
