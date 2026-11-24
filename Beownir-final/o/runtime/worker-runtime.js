@@ -6265,8 +6265,15 @@ let pendingQuestion = null;
     }
     if (privObj.type !== 'private') throw rsaKeyError('The "privateKey" argument must be a private key', 'ERR_CRYPTO_INVALID_KEYTYPE');
     if (pubObj.type !== 'public' && pubObj.type !== 'private') throw rsaKeyError('The "publicKey" argument must be a public key', 'ERR_CRYPTO_INVALID_KEYTYPE');
+    if (isX25519Handle(privObj._handle) && isX25519Handle(pubObj._handle)) {
+      const secret = x25519SharedSecret(privObj._handle.privBytes, pubObj._handle.pubBytes);
+      let nonZero = 0;
+      for (let i = 0; i < secret.length; i++) nonZero |= secret[i];
+      if (nonZero === 0) throw rsaKeyError('failed during derivation', 'ERR_OSSL_FAILED_DURING_DERIVATION');
+      return secret;
+    }
     if (!isEcHandle(privObj._handle) || !isEcHandle(pubObj._handle)) {
-      throw rsaKeyError('crypto.diffieHellman() requires EC key objects in this runtime', 'ERR_CRYPTO_INVALID_KEYTYPE');
+      throw rsaKeyError('crypto.diffieHellman() requires EC or X25519 key objects in this runtime', 'ERR_CRYPTO_INVALID_KEYTYPE');
     }
     if (privObj._handle.namedCurve !== pubObj._handle.namedCurve) {
       throw rsaKeyError('Incompatible EC curves for diffieHellman: ' + privObj._handle.namedCurve + ' vs ' + pubObj._handle.namedCurve, 'ERR_CRYPTO_INVALID_KEYTYPE');
@@ -6289,6 +6296,7 @@ let pendingQuestion = null;
     get asymmetricKeyType() { return this.type === 'secret' ? undefined : (this._handle?.keyType || 'rsa'); }
     get asymmetricKeyDetails() {
       if (this.type === 'secret') return undefined;
+      if (isOkpHandle(this._handle)) return {};
       if (isEcHandle(this._handle) || (this._handle?.spki && !isRsaHandle(this._handle))) {
         return this._handle.namedCurve ? { namedCurve: this._handle.namedCurve } : {};
       }
@@ -6299,6 +6307,7 @@ let pendingQuestion = null;
     export(options = {}) {
       if (typeof options === 'string') options = { type: options };
       if (this.type !== 'secret') {
+        if (isOkpHandle(this._handle)) return exportOkp(this, options);
         if (isEcHandle(this._handle)) return exportEc(this, options);
         if (this._handle?.spki && !isRsaHandle(this._handle)) {
           const format = options.format || 'pem';
@@ -6316,6 +6325,11 @@ let pendingQuestion = null;
     }
     equals(other) {
       if (!(other instanceof KeyObject) || this.type !== other.type) return false;
+      if (isOkpHandle(this._handle)) {
+        if (!isOkpHandle(other._handle) || this._handle.keyType !== other._handle.keyType) return false;
+        if (this.type === 'private') return Buffer.from(this._handle.privBytes).equals(Buffer.from(other._handle.privBytes));
+        return Buffer.from(this._handle.pubBytes).equals(Buffer.from(other._handle.pubBytes));
+      }
       if (isEcHandle(this._handle)) {
         if (!isEcHandle(other._handle) || this._handle.namedCurve !== other._handle.namedCurve) return false;
         if (this.type === 'private') return this._handle.d === other._handle.d;
@@ -7130,6 +7144,254 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
     throw rsaKeyError('Unsupported export format "' + format + '"', 'ERR_CRYPTO_INVALID_KEYTYPE');
   }
 
+  const X25519_OID = '1.3.101.110';
+  const ED25519_OID = '1.3.101.112';
+  const OKP_OID_BYTES = {
+    x25519: Buffer.from('06032b656e', 'hex'),
+    ed25519: Buffer.from('06032b6570', 'hex'),
+  };
+  const P25519 = (1n << 255n) - 19n;
+  const L25519 = (1n << 252n) + 27742317777372353535851937790883648493n;
+  const modP25519 = x => { const r = x % P25519; return r < 0n ? r + P25519 : r; };
+  const modL25519 = x => { const r = x % L25519; return r < 0n ? r + L25519 : r; };
+  function modPowP25519(base, exp) {
+    let res = 1n, b = modP25519(base), e = exp;
+    while (e > 0n) { if (e & 1n) res = (res * b) % P25519; b = (b * b) % P25519; e >>= 1n; }
+    return res;
+  }
+  const invP25519 = x => modPowP25519(x, P25519 - 2n);
+  const ED_D = modP25519(-121665n * invP25519(121666n));
+  const ED_SQRT_M1 = modPowP25519(2n, (P25519 - 1n) / 4n);
+  function edRecoverX(y, sign) {
+    const u = modP25519(y * y - 1n);
+    const v = modP25519(ED_D * y * y + 1n);
+    const v3 = modP25519(v * v * v);
+    const v7 = modP25519(v3 * v3 * v);
+    let x = modP25519(u * v3 * modPowP25519(modP25519(u * v7), (P25519 - 5n) / 8n));
+    const vx2 = modP25519(v * x * x);
+    if (vx2 !== u) {
+      if (vx2 === modP25519(-u)) x = modP25519(x * ED_SQRT_M1);
+      else return null;
+    }
+    if (x === 0n && sign === 1) return null;
+    if (Number(x & 1n) !== sign) x = P25519 - x;
+    return x;
+  }
+  const ED_GY = modP25519(4n * invP25519(5n));
+  const ED_GX = edRecoverX(ED_GY, 0);
+  const ED_BASE = [ED_GX, ED_GY, 1n, modP25519(ED_GX * ED_GY)];
+  const ED_ZERO = [0n, 1n, 1n, 0n];
+  function edAdd(p1, p2) {
+    const [X1, Y1, Z1, T1] = p1;
+    const [X2, Y2, Z2, T2] = p2;
+    const A = modP25519((Y1 - X1) * (Y2 - X2));
+    const B = modP25519((Y1 + X1) * (Y2 + X2));
+    const C = modP25519(2n * ED_D * T1 * T2);
+    const D = modP25519(2n * Z1 * Z2);
+    const E = modP25519(B - A);
+    const F = modP25519(D - C);
+    const G = modP25519(D + C);
+    const H = modP25519(B + A);
+    return [modP25519(E * F), modP25519(G * H), modP25519(F * G), modP25519(E * H)];
+  }
+  function edSub(p1, p2) {
+    return edAdd(p1, [modP25519(-p2[0]), p2[1], p2[2], modP25519(-p2[3])]);
+  }
+  function edMul(p, scalar) {
+    let acc = ED_ZERO, cur = p, k = scalar;
+    while (k > 0n) {
+      if (k & 1n) acc = edAdd(acc, cur);
+      cur = edAdd(cur, cur);
+      k >>= 1n;
+    }
+    return acc;
+  }
+  function decodeLE256(buf) {
+    let n = 0n;
+    for (let i = buf.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(buf[i]);
+    return n;
+  }
+  function encodeLE32(n) {
+    const out = Buffer.alloc(32);
+    let v = n;
+    for (let i = 0; i < 32; i++) { out[i] = Number(v & 0xffn); v >>= 8n; }
+    return out;
+  }
+  function edEncodePoint(pt) {
+    const iz = invP25519(pt[2]);
+    const x = modP25519(pt[0] * iz);
+    const y = modP25519(pt[1] * iz);
+    const out = encodeLE32(y);
+    out[31] |= Number(x & 1n) << 7;
+    return out;
+  }
+  function edDecodePoint(buf) {
+    if (!buf || buf.length !== 32) return null;
+    const sign = (buf[31] >> 7) & 1;
+    const copy = Buffer.from(buf);
+    copy[31] &= 0x7f;
+    const y = decodeLE256(copy);
+    if (y >= P25519) return null;
+    const x = edRecoverX(y, sign);
+    if (x === null) return null;
+    return [x, y, 1n, modP25519(x * y)];
+  }
+  function edExpandSeed(seed) {
+    const h = CRYPTO.createHash('sha512').update(seed).digest();
+    const sBuf = Buffer.from(h.subarray(0, 32));
+    sBuf[0] &= 248; sBuf[31] &= 63; sBuf[31] |= 64;
+    const s = decodeLE256(sBuf);
+    const pub = edEncodePoint(edMul(ED_BASE, s));
+    return { s, prefix: Buffer.from(h.subarray(32, 64)), pub };
+  }
+  function ed25519Sign(handle, data) {
+    const seed = Buffer.from(handle.privBytes);
+    const { s, prefix, pub } = edExpandSeed(seed);
+    const msg = Buffer.from(data);
+    const r = modL25519(decodeLE256(CRYPTO.createHash('sha512').update(prefix).update(msg).digest()));
+    const R = edEncodePoint(edMul(ED_BASE, r));
+    const k = modL25519(decodeLE256(CRYPTO.createHash('sha512').update(R).update(pub).update(msg).digest()));
+    const S = modL25519(r + k * s);
+    return Buffer.concat([R, encodeLE32(S)]);
+  }
+  function ed25519Verify(handle, data, signature) {
+    const sig = Buffer.from(signature);
+    if (sig.length !== 64) return false;
+    const pub = Buffer.from(handle.pubBytes);
+    const A = edDecodePoint(pub);
+    const Rbuf = sig.subarray(0, 32);
+    const R = edDecodePoint(Rbuf);
+    const S = decodeLE256(sig.subarray(32, 64));
+    if (!A || !R || S >= L25519) return false;
+    const msg = Buffer.from(data);
+    const k = modL25519(decodeLE256(CRYPTO.createHash('sha512').update(Rbuf).update(pub).update(msg).digest()));
+    const diff = edMul(edSub(edMul(ED_BASE, S), edAdd(R, edMul(A, k))), 8n);
+    return diff[0] === 0n && modP25519(diff[1] - diff[2]) === 0n;
+  }
+  function x25519SharedSecret(priv32, pub32) {
+    const kBytes = Buffer.from(priv32);
+    kBytes[0] &= 248; kBytes[31] &= 127; kBytes[31] |= 64;
+    const uBytes = Buffer.from(pub32);
+    uBytes[31] &= 127;
+    const k = decodeLE256(kBytes), u = decodeLE256(uBytes);
+    let x1 = u, x2 = 1n, z2 = 0n, x3 = u, z3 = 1n, swap = 0n;
+    for (let t = 254; t >= 0; t--) {
+      const kt = (k >> BigInt(t)) & 1n;
+      if ((swap ^ kt) === 1n) { [x2, x3] = [x3, x2]; [z2, z3] = [z3, z2]; }
+      swap = kt;
+      const A = modP25519(x2 + z2), AA = modP25519(A * A);
+      const B = modP25519(x2 - z2), BB = modP25519(B * B);
+      const E = modP25519(AA - BB);
+      const C = modP25519(x3 + z3), D = modP25519(x3 - z3);
+      const DA = modP25519(D * A), CB = modP25519(C * B);
+      x3 = modP25519((DA + CB) * (DA + CB));
+      z3 = modP25519(x1 * modP25519((DA - CB) * (DA - CB)));
+      x2 = modP25519(AA * BB);
+      z2 = modP25519(E * modP25519(AA + 121665n * E));
+    }
+    if (swap === 1n) { [x2, z2] = [x3, z3]; }
+    return encodeLE32(modP25519(x2 * invP25519(z2)));
+  }
+  function x25519PublicFromPrivate(priv32) {
+    const base9 = Buffer.alloc(32);
+    base9[0] = 9;
+    return x25519SharedSecret(priv32, base9);
+  }
+  function isOkpHandle(handle) {
+    return Boolean(handle) && typeof handle === 'object' && (handle.keyType === 'ed25519' || handle.keyType === 'x25519') && (Boolean(handle.pubBytes) || Boolean(handle.privBytes));
+  }
+  function isEd25519Handle(handle) {
+    return isOkpHandle(handle) && handle.keyType === 'ed25519';
+  }
+  function isX25519Handle(handle) {
+    return isOkpHandle(handle) && handle.keyType === 'x25519';
+  }
+  function readOkpPublic(der) {
+    const root = DER.read(der, 0);
+    const parts = DER.children(der, root);
+    if (parts.length < 2 || parts[0].tag !== 0x30 || parts[1].tag !== 0x03) {
+      throw rsaKeyError('Unsupported OKP public key encoding', 'ERR_OSSL_UNSUPPORTED');
+    }
+    const algChildren = DER.children(der, parts[0]);
+    const algOid = algChildren[0]?.tag === 0x06 ? DER.oid(der, algChildren[0]) : '';
+    const keyType = algOid === ED25519_OID ? 'ed25519' : (algOid === X25519_OID ? 'x25519' : '');
+    if (!keyType) throw rsaKeyError('Unsupported OKP OID ' + algOid, 'ERR_OSSL_UNSUPPORTED');
+    const pubBytes = Buffer.from(der.subarray(parts[1].start + 1, parts[1].end));
+    if (pubBytes.length !== 32) throw rsaKeyError('Invalid OKP public key length: ' + pubBytes.length, 'ERR_CRYPTO_INVALID_KEYTYPE');
+    return { keyType, pubBytes };
+  }
+  function readOkpPrivate(der) {
+    const root = DER.read(der, 0);
+    const parts = DER.children(der, root);
+    if (parts.length < 3 || parts[0].tag !== 0x02 || parts[1].tag !== 0x30 || parts[2].tag !== 0x04) {
+      throw rsaKeyError('Unsupported OKP private key format', 'ERR_OSSL_UNSUPPORTED');
+    }
+    const algChildren = DER.children(der, parts[1]);
+    const algOid = algChildren[0]?.tag === 0x06 ? DER.oid(der, algChildren[0]) : '';
+    const keyType = algOid === ED25519_OID ? 'ed25519' : (algOid === X25519_OID ? 'x25519' : '');
+    if (!keyType) throw rsaKeyError('Unsupported OKP OID ' + algOid, 'ERR_OSSL_UNSUPPORTED');
+    const outer = der.subarray(parts[2].start, parts[2].end);
+    let rawKey;
+    if (outer.length === 34 && outer[0] === 0x04 && outer[1] === 0x20) rawKey = outer.subarray(2);
+    else if (outer.length === 32) rawKey = outer;
+    else {
+      const inner = DER.read(outer, 0);
+      if (inner.tag !== 0x04) throw rsaKeyError('Unsupported OKP private key inner encoding', 'ERR_OSSL_UNSUPPORTED');
+      rawKey = outer.subarray(inner.start, inner.end);
+    }
+    if (rawKey.length !== 32) throw rsaKeyError('Invalid OKP private key length: ' + rawKey.length, 'ERR_CRYPTO_INVALID_KEYTYPE');
+    const privBytes = Buffer.from(rawKey);
+    const pubBytes = keyType === 'ed25519' ? edExpandSeed(privBytes).pub : x25519PublicFromPrivate(privBytes);
+    return { keyType, privBytes, pubBytes };
+  }
+  function okpFromJwk(jwk) {
+    if (!jwk || jwk.kty !== 'OKP' || (jwk.crv !== 'Ed25519' && jwk.crv !== 'X25519')) {
+      throw rsaKeyError('Invalid JWK OKP key', 'ERR_CRYPTO_INVALID_JWK');
+    }
+    const keyType = jwk.crv === 'Ed25519' ? 'ed25519' : 'x25519';
+    if (jwk.d) {
+      const privBytes = Buffer.from(String(jwk.d), 'base64url');
+      if (privBytes.length !== 32) throw rsaKeyError('Invalid JWK OKP private key length', 'ERR_CRYPTO_INVALID_JWK');
+      const pubBytes = keyType === 'ed25519' ? edExpandSeed(privBytes).pub : x25519PublicFromPrivate(privBytes);
+      if (jwk.x) {
+        const expectedX = Buffer.from(String(jwk.x), 'base64url');
+        if (!expectedX.equals(pubBytes)) throw rsaKeyError('JWK OKP public key does not match private key', 'ERR_CRYPTO_INVALID_JWK');
+      }
+      return new KeyObject('private', { keyType, privBytes, pubBytes });
+    }
+    if (!jwk.x) throw rsaKeyError('JWK OKP public key requires "x"', 'ERR_CRYPTO_INVALID_JWK');
+    const pubBytes = Buffer.from(String(jwk.x), 'base64url');
+    if (pubBytes.length !== 32) throw rsaKeyError('Invalid JWK OKP public key length', 'ERR_CRYPTO_INVALID_JWK');
+    return new KeyObject('public', { keyType, pubBytes });
+  }
+  function exportOkp(keyObject, options = {}) {
+    if (options.cipher) throw rsaKeyError('Encrypted private key export is not supported by this runtime', 'ERR_OSSL_UNSUPPORTED');
+    const handle = keyObject._handle;
+    const format = options.format || 'pem';
+    const crv = handle.keyType === 'ed25519' ? 'Ed25519' : 'X25519';
+    if (format === 'jwk') {
+      const jwk = { crv, x: Buffer.from(handle.pubBytes).toString('base64url'), kty: 'OKP' };
+      if (keyObject.type === 'private') jwk.d = Buffer.from(handle.privBytes).toString('base64url');
+      return jwk;
+    }
+    const type = options.type || (keyObject.type === 'private' ? 'pkcs8' : 'spki');
+    const alg = derSequence(OKP_OID_BYTES[handle.keyType]);
+    let der;
+    if (keyObject.type === 'private') {
+      if (type !== 'pkcs8') throw rsaKeyError('Unsupported export type "' + type + '" for an OKP private key', 'ERR_CRYPTO_INVALID_KEYTYPE');
+      der = derSequence(derInteger(0n), alg, derOctetString(derOctetString(Buffer.from(handle.privBytes))));
+    } else {
+      if (type !== 'spki') throw rsaKeyError('Unsupported export type "' + type + '" for an OKP public key', 'ERR_CRYPTO_INVALID_KEYTYPE');
+      der = derSequence(alg, derBitString(Buffer.from(handle.pubBytes)));
+    }
+    if (format === 'der') return der;
+    if (format === 'pem') {
+      const label = keyObject.type === 'private' ? 'PRIVATE KEY' : 'PUBLIC KEY';
+      const body = der.toString('base64').replace(/(.{64})/g, '$1\n').trimEnd();
+      return '-----BEGIN ' + label + '-----\n' + body + '\n-----END ' + label + '-----\n';
+    }
+    throw rsaKeyError('Unsupported export format "' + format + '"', 'ERR_CRYPTO_INVALID_KEYTYPE');
+  }
   function pemDecode(input) {
     const text = typeof input === 'string' ? input : Buffer.from(input).toString('latin1');
     const match = /-----BEGIN ([A-Z0-9 ]+)-----([\s\S]*?)-----END \1-----/.exec(text);
@@ -7168,6 +7430,7 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       const algChildren = DER.children(der, parts[1]);
       const algOid = algChildren[0]?.tag === 0x06 ? DER.oid(der, algChildren[0]) : '';
       if (algOid === '1.2.840.10045.2.1') return readEcPrivate(der);
+      if (algOid === ED25519_OID || algOid === X25519_OID) return readOkpPrivate(der);
       return readRsaPrivate(der);
     }
     if (parts.length >= 2 && parts[0].tag === 0x02 && parts[1].tag === 0x04) return readEcPrivate(der);
@@ -7181,19 +7444,21 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       const algChildren = DER.children(der, parts[0]);
       const algOid = algChildren[0]?.tag === 0x06 ? DER.oid(der, algChildren[0]) : '';
       if (algOid === '1.2.840.10045.2.1') return readEcPublic(der);
+      if (algOid === ED25519_OID || algOid === X25519_OID) return readOkpPublic(der);
       return readRsaPublic(der);
     }
     throw rsaKeyError('Unsupported public key encoding', 'ERR_OSSL_UNSUPPORTED');
   }
   const isRsaHandle = handle => Boolean(handle) && typeof handle === 'object' && Buffer.isBuffer(handle) === false && typeof handle.n === 'bigint';
   function fromJwk(jwk) {
+    if (jwk && jwk.kty === 'OKP') return okpFromJwk(jwk);
     if (jwk && jwk.kty === 'EC') return ecFromJwk(jwk);
     return rsaFromJwk(jwk);
   }
   function keyObjectFrom(input) {
     if (input instanceof KeyObject) return input;
     if (input && typeof input === 'object' && !Buffer.isBuffer(input) && !ArrayBuffer.isView(input) && input.key !== undefined) {
-      if (input.format === 'jwk' || (input.key && typeof input.key === 'object' && !Buffer.isBuffer(input.key) && !ArrayBuffer.isView(input.key) && (input.key.kty === 'RSA' || input.key.kty === 'EC'))) return fromJwk(input.key);
+      if (input.format === 'jwk' || (input.key && typeof input.key === 'object' && !Buffer.isBuffer(input.key) && !ArrayBuffer.isView(input.key) && (input.key.kty === 'RSA' || input.key.kty === 'EC' || input.key.kty === 'OKP'))) return fromJwk(input.key);
       if (input.format === 'der' && (Buffer.isBuffer(input.key) || ArrayBuffer.isView(input.key) || isArrayBufferLike(input.key))) {
         const der = Buffer.from(input.key);
         if (input.type === 'pkcs8') return new KeyObject('private', readPkcs8Private(der));
@@ -7208,10 +7473,10 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       }
       return keyObjectFrom(input.key);
     }
-    if (input && typeof input === 'object' && !Buffer.isBuffer(input) && !ArrayBuffer.isView(input) && (input.kty === 'RSA' || input.kty === 'EC')) return fromJwk(input);
+    if (input && typeof input === 'object' && !Buffer.isBuffer(input) && !ArrayBuffer.isView(input) && (input.kty === 'RSA' || input.kty === 'EC' || input.kty === 'OKP')) return fromJwk(input);
     if (input && typeof input === 'object' && !Buffer.isBuffer(input) && !ArrayBuffer.isView(input) && typeof input.publicKey === 'object' && input instanceof X509Certificate) return input.publicKey;
     const text = typeof input === 'string' ? input : Buffer.from(input).toString('latin1');
-    if (text.trim().startsWith('{')) { try { const parsed = JSON.parse(text); if (parsed && (parsed.kty === 'RSA' || parsed.kty === 'EC')) return fromJwk(parsed); } catch {} }
+    if (text.trim().startsWith('{')) { try { const parsed = JSON.parse(text); if (parsed && (parsed.kty === 'RSA' || parsed.kty === 'EC' || parsed.kty === 'OKP')) return fromJwk(parsed); } catch {} }
     const pem = pemDecode(input);
     if (!pem) throw rsaKeyError('The key must be a PEM string, a DER Buffer, or a KeyObject (encrypted PEM and PKCS#12 are not supported)', 'ERR_OSSL_UNSUPPORTED');
     if (/^ENCRYPTED /.test(pem.label)) throw rsaKeyError('Encrypted PEM keys are not supported by this runtime', 'ERR_OSSL_UNSUPPORTED');
@@ -7472,8 +7737,14 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
   function signWithKey(key, hash, data, options) {
     const keyObject = keyObjectFrom(key);
     if (keyObject.type !== 'private') throw rsaKeyError('A private key is required to sign', 'ERR_CRYPTO_INVALID_KEYTYPE');
+    if (isEd25519Handle(keyObject._handle)) {
+      if (hash !== null) throw Object.assign(new Error('invalid digest for Ed25519'), { code: 'ERR_OSSL_INVALID_DIGEST' });
+      return ed25519Sign(keyObject._handle, data);
+    }
+    if (isX25519Handle(keyObject._handle)) throw rsaKeyError('X25519 keys cannot sign messages', 'ERR_CRYPTO_INVALID_KEYTYPE');
+    if (hash === null) hash = normaliseHash(null);
     if (isEcHandle(keyObject._handle)) return ecdsaSign(keyObject._handle, hash, data, options);
-    if (keyObject._handle.n === undefined) throw rsaKeyError('Only RSA and EC keys are supported for signing in this runtime', 'ERR_CRYPTO_INVALID_KEYTYPE');
+    if (keyObject._handle.n === undefined) throw rsaKeyError('Only RSA, EC, and Ed25519 keys are supported for signing in this runtime', 'ERR_CRYPTO_INVALID_KEYTYPE');
     const padding = paddingFrom(options);
     const modBits = keyObject._handle.n.toString(2).length;
     const size = Math.ceil(modBits / 8);
@@ -7489,9 +7760,15 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
   }
   function verifyWithKey(key, hash, data, signature, options) {
     const keyObject = keyObjectFrom(key);
+    if (isEd25519Handle(keyObject._handle)) {
+      if (hash !== null) throw Object.assign(new Error('invalid digest for Ed25519'), { code: 'ERR_OSSL_INVALID_DIGEST' });
+      return ed25519Verify(keyObject._handle, data, signature);
+    }
+    if (isX25519Handle(keyObject._handle)) throw rsaKeyError('X25519 keys cannot verify signatures', 'ERR_CRYPTO_INVALID_KEYTYPE');
+    if (hash === null) hash = normaliseHash(null);
     if (isEcHandle(keyObject._handle)) return ecdsaVerify(keyObject._handle, hash, data, signature, options);
     const publicKey = keyObject.type === 'private' ? { n: keyObject._handle.n, e: keyObject._handle.e } : keyObject._handle;
-    if (publicKey.n === undefined) throw rsaKeyError('Only RSA and EC keys are supported for verification in this runtime', 'ERR_CRYPTO_INVALID_KEYTYPE');
+    if (publicKey.n === undefined) throw rsaKeyError('Only RSA, EC, and Ed25519 keys are supported for verification in this runtime', 'ERR_CRYPTO_INVALID_KEYTYPE');
     const padding = paddingFrom(options);
     const modBits = publicKey.n.toString(2).length;
     const size = Math.ceil(modBits / 8);
@@ -7611,6 +7888,7 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
   CRYPTO.createPublicKey = key => {
     const keyObject = keyObjectFrom(key);
     if (keyObject.type === 'private') {
+      if (isOkpHandle(keyObject._handle)) return new KeyObject('public', { keyType: keyObject._handle.keyType, pubBytes: Buffer.from(keyObject._handle.pubBytes) });
       if (isEcHandle(keyObject._handle)) return new KeyObject('public', { keyType: 'ec', namedCurve: keyObject._handle.namedCurve, point: keyObject._handle.point });
       return new KeyObject('public', { n: keyObject._handle.n, e: keyObject._handle.e });
     }
@@ -7646,13 +7924,15 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
   const keyAndOptions = key => (key && typeof key === 'object' && !(key instanceof KeyObject) && !Buffer.isBuffer(key) && !ArrayBuffer.isView(key) && key.key !== undefined ? { key: key.key, options: key } : { key, options: undefined });
   CRYPTO.sign = (algorithm, data, key, callback) => {
     const resolved = keyAndOptions(key);
-    const signature = signWithKey(resolved.key, normaliseHash(algorithm), Buffer.from(data), resolved.options);
+    const hash = (algorithm === null || algorithm === undefined) ? null : normaliseHash(algorithm);
+    const signature = signWithKey(resolved.key, hash, Buffer.from(data), resolved.options);
     if (typeof callback === 'function') { queueMicrotask(() => callback(null, signature)); return undefined; }
     return signature;
   };
   CRYPTO.verify = (algorithm, data, key, signature, callback) => {
     const resolved = keyAndOptions(key);
-    const result = verifyWithKey(resolved.key, normaliseHash(algorithm), Buffer.from(data), signature, resolved.options);
+    const hash = (algorithm === null || algorithm === undefined) ? null : normaliseHash(algorithm);
+    const result = verifyWithKey(resolved.key, hash, Buffer.from(data), signature, resolved.options);
     if (typeof callback === 'function') { queueMicrotask(() => callback(null, result)); return undefined; }
     return result;
   };
@@ -7841,7 +8121,13 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
         return new KeyObject('public', { spki: Buffer.from(spkiBytes), keyType: 'ec', namedCurve: X509_EC_CURVES[curveOid] || curveOid || undefined });
       }
     }
-    if (algOid === '1.3.101.112') return new KeyObject('public', { spki: Buffer.from(spkiBytes), keyType: 'ed25519' });
+    if (algOid === '1.3.101.112' || algOid === '1.3.101.110') {
+      try {
+        return new KeyObject('public', Object.assign(readOkpPublic(spkiBytes), { spki: Buffer.from(spkiBytes) }));
+      } catch {
+        return new KeyObject('public', { spki: Buffer.from(spkiBytes), keyType: algOid === '1.3.101.110' ? 'x25519' : 'ed25519' });
+      }
+    }
     return new KeyObject('public', { spki: Buffer.from(spkiBytes), keyType: 'rsa' });
   }
   class X509Certificate {
@@ -8069,9 +8355,12 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       return CRYPTO.createPublicKey(keyObj).equals(this.publicKey);
     }
     verify(publicKey) {
+      const ko = keyObjectFrom(publicKey);
+      if (this._x509.sigAlgOid === ED25519_OID) {
+        return verifyWithKey(ko, null, this._x509.tbsBytes, this._x509.sigBytes);
+      }
       const hash = X509_SIG_HASHES[this._x509.sigAlgOid];
       if (!hash) throw notImplemented('X509Certificate.verify does not support signature OID ' + this._x509.sigAlgOid, 'ERR_CRYPTO_OPERATION_FAILED');
-      const ko = keyObjectFrom(publicKey);
       return verifyWithKey(ko, hash, this._x509.tbsBytes, this._x509.sigBytes, isEcHandle(ko._handle) ? undefined : { padding: 1 });
     }
     toLegacyObject() {
@@ -8181,6 +8470,14 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       privateKey: new KeyObject('private', { keyType: 'ec', namedCurve, d, point }),
     };
   }
+  function generateOkpKeyPairObjects(keyType) {
+    const privBytes = Buffer.from(CRYPTO.randomBytes(32));
+    const pubBytes = keyType === 'ed25519' ? edExpandSeed(privBytes).pub : x25519PublicFromPrivate(privBytes);
+    return {
+      publicKey: new KeyObject('public', { keyType, pubBytes }),
+      privateKey: new KeyObject('private', { keyType, privBytes, pubBytes }),
+    };
+  }
   function publicExponentBytes(exp) {
     let v = exp === undefined ? 0x10001 : exp;
     if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
@@ -8193,6 +8490,13 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
   }
   define(CRYPTO, 'generateKeyPairSync', (type, options = {}) => {
     const t = String(type || '').toLowerCase();
+    if (t === 'ed25519' || t === 'x25519') {
+      const pair = generateOkpKeyPairObjects(t);
+      return {
+        publicKey: formatGeneratedKey(pair.publicKey, options.publicKeyEncoding),
+        privateKey: formatGeneratedKey(pair.privateKey, options.privateKeyEncoding),
+      };
+    }
     if (t === 'ec') {
       const pair = generateEcKeyPairObjects(options);
       return {
@@ -8208,6 +8512,13 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
       throw Object.assign(new TypeError('The "callback" argument must be of type function'), { code: 'ERR_INVALID_ARG_TYPE' });
     }
     const t = String(type || '').toLowerCase();
+    if (t === 'ed25519' || t === 'x25519') {
+      Promise.resolve().then(() => {
+        const pair = generateOkpKeyPairObjects(t);
+        callback(null, formatGeneratedKey(pair.publicKey, options.publicKeyEncoding), formatGeneratedKey(pair.privateKey, options.privateKeyEncoding));
+      }).catch(err => callback(err));
+      return undefined;
+    }
     if (t === 'ec') {
       Promise.resolve().then(() => {
         const pair = generateEcKeyPairObjects(options);
@@ -8543,18 +8854,19 @@ function installEsbuildGoFs() {
    * stdin/stdout protocol stubs ("Bad read"). Re-running this installer
    * restores real file I/O on the same object the Go runtime already holds. */
   const vfs = CORE.fs;
-  const S_IFDIR = 16384, S_IFREG = 32768;
+  const S_IFDIR = 16384, S_IFREG = 32768, S_IFLNK = 40960;
   const fail = e => { const error = e instanceof Error ? e : new Error(String(e && e.message || e)); if (!error.code) error.code = 'ENOENT'; return error; };
-  const enosys = () => { const error = new Error('not implemented'); error.code = 'ENOSYS'; return error; };
-  const statOf = path => {
-    const st = vfs.statSync(path);
-    const isDir = typeof st.isDirectory === 'function' ? st.isDirectory() : false;
+  const statOf = (path, useLstat = false) => {
+    const st = useLstat && typeof vfs.lstatSync === 'function' ? vfs.lstatSync(path) : vfs.statSync(path);
+    const isLink = typeof st.isSymbolicLink === 'function' ? st.isSymbolicLink() : false;
+    const isDir = !isLink && typeof st.isDirectory === 'function' ? st.isDirectory() : false;
     const size = st.size || 0;
     const ms = st.mtimeMs || Date.now();
     const time = new Date(ms);
+    const mode = isLink ? (S_IFLNK | 0o777) : (isDir ? (S_IFDIR | 0o555) : (S_IFREG | 0o444));
     /* Go's wasm setStat reads atimeMs/mtimeMs/ctimeMs as numbers; older toolchains
      * call getTime() on Date fields, so both shapes are provided. */
-    return { dev: 1, ino: 1, mode: isDir ? S_IFDIR | 0o555 : S_IFREG | 0o444, nlink: 1, uid: 0, gid: 0, rdev: 0, size, blksize: 4096, blocks: Math.ceil(size / 512), atimeMs: ms, mtimeMs: ms, ctimeMs: ms, atime: time, mtime: time, ctime: time, isDirectory: () => isDir, isFile: () => !isDir };
+    return { dev: 1, ino: 1, mode, nlink: 1, uid: 0, gid: 0, rdev: 0, size, blksize: 4096, blocks: Math.ceil(size / 512), atimeMs: ms, mtimeMs: ms, ctimeMs: ms, atime: time, mtime: time, ctime: time, isDirectory: () => isDir, isFile: () => !isDir && !isLink, isSymbolicLink: () => isLink };
   };
   let nextFd = 100;
   const fds = new Map();
@@ -8598,8 +8910,8 @@ function installEsbuildGoFs() {
       callback(null, { dev: 1, ino: 1, mode: isDir ? S_IFDIR | 0o555 : S_IFREG | 0o444, nlink: 1, uid: 0, gid: 0, rdev: 0, size, blksize: 4096, blocks: Math.ceil(size / 512), atimeMs: ms, mtimeMs: ms, ctimeMs: ms, atime: new Date(ms), mtime: new Date(ms), ctime: new Date(ms), isDirectory: () => isDir, isFile: () => !isDir });
     },
     readdir(path, callback) { try { callback(null, vfs.readdirSync(String(path))); } catch (e) { callback(fail(e)); } },
-    stat(path, callback) { try { callback(null, statOf(String(path))); } catch (e) { callback(fail(e)); } },
-    lstat(path, callback) { try { callback(null, statOf(String(path))); } catch (e) { callback(fail(e)); } },
+    stat(path, callback) { try { callback(null, statOf(String(path), false)); } catch (e) { callback(fail(e)); } },
+    lstat(path, callback) { try { callback(null, statOf(String(path), true)); } catch (e) { callback(fail(e)); } },
     realpath(path, callback) { try { callback(null, typeof vfs.realpathSync === 'function' ? vfs.realpathSync(String(path)) : String(path)); } catch (e) { callback(fail(e)); } },
     mkdir(path, perm, callback) { try { vfs.mkdirSync(String(path), { recursive: true }); callback(null); } catch (e) { callback(fail(e)); } },
     rmdir(path, callback) { try { vfs.rmdirSync(String(path)); callback(null); } catch (e) { callback(fail(e)); } },
@@ -8613,9 +8925,9 @@ function installEsbuildGoFs() {
     ftruncate(fd, length, callback) { callback(null); },
     lchown(path, uid, gid, callback) { callback(null); },
     truncate(path, length, callback) { callback(null); },
-    link(path, link, callback) { callback(enosys()); },
-    readlink(path, callback) { callback(enosys()); },
-    symlink(path, link, callback) { callback(enosys()); },
+    link(path, link, callback) { try { vfs.linkSync(String(path), String(link)); callback(null); } catch (e) { callback(fail(e)); } },
+    readlink(path, callback) { try { callback(null, vfs.readlinkSync(String(path))); } catch (e) { callback(fail(e)); } },
+    symlink(path, link, callback) { try { vfs.symlinkSync(String(path), String(link)); callback(null); } catch (e) { callback(fail(e)); } },
   };
   if (!globalThis.fs || typeof globalThis.fs !== 'object') globalThis.fs = {};
   /* Go-WASM toolchains publish the whole fs module as their global:

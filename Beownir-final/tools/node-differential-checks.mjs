@@ -454,6 +454,40 @@ export const checks = [
       alice.privateKey.equals(rt),
     ];
   })()`],
+  ['ed25519-sign-verify-jwk', `(() => {
+    const crypto = require('crypto');
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const msg = Buffer.from('ed25519-diff-msg');
+    const sig = crypto.sign(null, msg, privateKey);
+    const rtPriv = crypto.createPrivateKey({ key: privateKey.export({ format: 'jwk' }), format: 'jwk' });
+    const rtPub = crypto.createPublicKey({ key: publicKey.export({ format: 'jwk' }), format: 'jwk' });
+    return [
+      privateKey.asymmetricKeyType,
+      privateKey.asymmetricKeyDetails,
+      sig.length,
+      crypto.verify(null, msg, publicKey, sig),
+      crypto.verify(null, msg, rtPub, sig),
+      crypto.verify(null, Buffer.from('tamper'), rtPub, sig),
+      privateKey.equals(rtPriv),
+      publicKey.equals(rtPub),
+    ];
+  })()`],
+  ['x25519-diffie-hellman', `(() => {
+    const crypto = require('crypto');
+    const alice = crypto.generateKeyPairSync('x25519');
+    const bob = crypto.generateKeyPairSync('x25519');
+    const s1 = crypto.diffieHellman({ privateKey: alice.privateKey, publicKey: bob.publicKey });
+    const s2 = crypto.diffieHellman({ privateKey: bob.privateKey, publicKey: alice.publicKey });
+    const jwk = alice.privateKey.export({ format: 'jwk' });
+    return [
+      alice.privateKey.asymmetricKeyType,
+      alice.privateKey.asymmetricKeyDetails,
+      jwk.kty,
+      jwk.crv,
+      s1.length,
+      s1.equals(s2),
+    ];
+  })()`],
   ['vm-context-isolation', `(() => {
     const vm = require('vm');
     const c = vm.createContext({ x: 5 });

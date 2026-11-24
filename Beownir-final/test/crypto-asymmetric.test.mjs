@@ -584,3 +584,130 @@ test('Certificate verifies OpenSSL SPKAC and extracts challenge and public key',
   assert.equal(actual.pubPem, publicPem);
   assert.equal(actual.instPubPem, publicPem);
 });
+
+test('Ed25519 keys, deterministic signatures, X.509 certificates, and X25519 diffieHellman match OpenSSL', async t => {
+  const edPair = crypto.generateKeyPairSync('ed25519');
+  const payload = Buffer.from('beownir-ed25519-rfc8032-vector');
+  const nodeEdSig = crypto.sign(null, payload, edPair.privateKey);
+  const edPrivPem = edPair.privateKey.export({ format: 'pem', type: 'pkcs8' });
+  const edPubPem = edPair.publicKey.export({ format: 'pem', type: 'spki' });
+  const edPrivJwk = edPair.privateKey.export({ format: 'jwk' });
+  const edPubJwk = edPair.publicKey.export({ format: 'jwk' });
+
+  const xNodeA = crypto.generateKeyPairSync('x25519');
+  const xNodeAPubDerHex = xNodeA.publicKey.export({ format: 'der', type: 'spki' }).toString('hex');
+
+  let edCertPem = '';
+  let edCertKeyPem = '';
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-x509-ed-'));
+  try {
+    execFileSync('openssl', ['version'], { stdio: 'ignore' });
+    const keyPath = path.join(tmp, 'ed.pem');
+    const certPath = path.join(tmp, 'ed-cert.pem');
+    execFileSync('openssl', ['genpkey', '-algorithm', 'Ed25519', '-out', keyPath]);
+    execFileSync('openssl', ['req', '-x509', '-new', '-key', keyPath, '-subj', '/CN=ed25519.example.test', '-days', '30', '-out', certPath]);
+    edCertKeyPem = fs.readFileSync(keyPath, 'utf8');
+    edCertPem = fs.readFileSync(certPath, 'utf8');
+  } catch {
+    edCertPem = '';
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const runtime = loadRuntime();
+  const actual = await run(runtime, `(async () => {
+    const crypto = require('crypto');
+    const util = require('util');
+
+    // Node Ed25519 -> Beownir verification & deterministic byte-for-byte signing
+    const privFromPem = crypto.createPrivateKey(${JSON.stringify(edPrivPem)});
+    const pubFromPem = crypto.createPublicKey(${JSON.stringify(edPubPem)});
+    const privFromJwk = crypto.createPrivateKey({ key: ${JSON.stringify(edPrivJwk)}, format: 'jwk' });
+    const pubFromJwk = crypto.createPublicKey({ key: ${JSON.stringify(edPubJwk)}, format: 'jwk' });
+    const rtSigHex = crypto.sign(null, Buffer.from(${JSON.stringify(payload.toString('hex'))}, 'hex'), privFromPem).toString('hex');
+
+    let badDigestCode = null;
+    try { crypto.sign('sha256', Buffer.from('x'), privFromPem); } catch (e) { badDigestCode = e.code; }
+
+    // Native Ed25519 generation (sync + async promisify)
+    const genSync = crypto.generateKeyPairSync('ed25519');
+    const genAsync = await util.promisify(crypto.generateKeyPair)('ed25519');
+    const genSig = crypto.sign(undefined, Buffer.from('async-okp'), genAsync.privateKey);
+
+    // X25519 diffieHellman against Node key + self-roundtrip + all-zero low-order rejection
+    const xB = crypto.generateKeyPairSync('x25519');
+    const xAPub = crypto.createPublicKey({ key: Buffer.from(${JSON.stringify(xNodeAPubDerHex)}, 'hex'), format: 'der', type: 'spki' });
+    const sharedWithNode = crypto.diffieHellman({ privateKey: xB.privateKey, publicKey: xAPub });
+    const xC = await util.promisify(crypto.generateKeyPair)('x25519');
+    const self1 = crypto.diffieHellman({ privateKey: xB.privateKey, publicKey: xC.publicKey });
+    const self2 = crypto.diffieHellman({ privateKey: xC.privateKey, publicKey: xB.publicKey });
+    let lowOrderCode = null;
+    try {
+      const zeroPub = crypto.createPublicKey({ key: Buffer.from('302a300506032b656e032100' + '00'.repeat(32), 'hex'), format: 'der', type: 'spki' });
+      crypto.diffieHellman({ privateKey: xB.privateKey, publicKey: zeroPub });
+    } catch (e) { lowOrderCode = e.code; }
+
+    let x509Check = null;
+    if (${JSON.stringify(Boolean(edCertPem))}) {
+      const cert = new crypto.X509Certificate(${JSON.stringify(edCertPem)});
+      const certPriv = crypto.createPrivateKey(${JSON.stringify(edCertKeyPem)});
+      const badCert = crypto.generateKeyPairSync('ed25519').publicKey;
+      x509Check = {
+        keyType: cert.publicKey.asymmetricKeyType,
+        verified: cert.verify(cert.publicKey),
+        wrongKeyVerified: cert.verify(badCert),
+        checkPriv: cert.checkPrivateKey(certPriv),
+        hostHit: cert.checkHost('ed25519.example.test'),
+      };
+    }
+
+    return {
+      asymmetricKeyType: privFromPem.asymmetricKeyType,
+      details: privFromPem.asymmetricKeyDetails,
+      jwkRoundtripEq: privFromJwk.equals(privFromPem) && pubFromJwk.equals(pubFromPem),
+      exportJwk: genSync.privateKey.export({ format: 'jwk' }),
+      rtSigHex,
+      verifyNodeSig: crypto.verify(null, Buffer.from(${JSON.stringify(payload.toString('hex'))}, 'hex'), pubFromJwk, Buffer.from(${JSON.stringify(nodeEdSig.toString('hex'))}, 'hex')),
+      rejectTamper: crypto.verify(null, Buffer.from('tamper'), pubFromPem, Buffer.from(${JSON.stringify(nodeEdSig.toString('hex'))}, 'hex')),
+      verifyAsyncGen: crypto.verify(null, Buffer.from('async-okp'), genAsync.publicKey, genSig),
+      badDigestCode,
+      xBType: xB.privateKey.asymmetricKeyType,
+      xBPubDerHex: xB.publicKey.export({ format: 'der', type: 'spki' }).toString('hex'),
+      sharedWithNodeHex: sharedWithNode.toString('hex'),
+      selfMatch: self1.equals(self2),
+      lowOrderCode,
+      x509Check,
+    };
+  })()`);
+
+  assert.equal(actual.asymmetricKeyType, 'ed25519');
+  assert.deepEqual(plain(actual.details), {});
+  assert.equal(actual.jwkRoundtripEq, true);
+  assert.equal(actual.exportJwk.kty, 'OKP');
+  assert.equal(actual.exportJwk.crv, 'Ed25519');
+  // RFC 8032 signatures are strictly deterministic: exact byte-for-byte match with OpenSSL.
+  assert.equal(actual.rtSigHex, nodeEdSig.toString('hex'));
+  assert.equal(actual.verifyNodeSig, true);
+  assert.equal(actual.rejectTamper, false);
+  assert.equal(actual.verifyAsyncGen, true);
+  assert.equal(actual.badDigestCode, 'ERR_OSSL_INVALID_DIGEST');
+  assert.equal(actual.xBType, 'x25519');
+  assert.equal(actual.selfMatch, true);
+  assert.equal(actual.lowOrderCode, 'ERR_OSSL_FAILED_DURING_DERIVATION');
+
+  const nodeXBPub = crypto.createPublicKey({ key: Buffer.from(actual.xBPubDerHex, 'hex'), format: 'der', type: 'spki' });
+  const nodeExpectedShared = crypto.diffieHellman({ privateKey: xNodeA.privateKey, publicKey: nodeXBPub }).toString('hex');
+  assert.equal(actual.sharedWithNodeHex, nodeExpectedShared);
+
+  if (edCertPem) {
+    assert.deepEqual(plain(actual.x509Check), {
+      keyType: 'ed25519',
+      verified: true,
+      wrongKeyVerified: false,
+      checkPriv: true,
+      hostHit: 'ed25519.example.test',
+    });
+  } else {
+    t.diagnostic('openssl ed25519 cert generation unavailable; skipped x509 sub-assert');
+  }
+});

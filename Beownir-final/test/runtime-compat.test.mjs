@@ -683,3 +683,45 @@ test('Writable cork/_writev, vm context isolation, and recursive node:test runne
   assert.deepEqual(result.onlyRun, { passed: 1, failed: 0, skipped: 0 });
   assert.deepEqual(result.onlyTrace, ['yes']);
 });
+
+test('installEsbuildGoFs exposes lstat, readlink, symlink, and link over the virtual FS', async () => {
+  const runtime = loadRuntime();
+  const res = JSON.parse(await runtime.evaluate(`(async () => {
+    const fs = CORE.fs;
+    installEsbuildGoFs();
+    fs.mkdirSync('/project/go-fs', { recursive: true });
+    fs.writeFileSync('/project/go-fs/origin.txt', 'go-symlink-data');
+    return JSON.stringify(await new Promise((resolve, reject) => {
+      globalThis.fs.symlink('/project/go-fs/origin.txt', '/project/go-fs/link.txt', err => {
+        if (err) return reject(err);
+        globalThis.fs.readlink('/project/go-fs/link.txt', (e2, target) => {
+          if (e2) return reject(e2);
+          globalThis.fs.lstat('/project/go-fs/link.txt', (e3, lst) => {
+            if (e3) return reject(e3);
+            globalThis.fs.stat('/project/go-fs/link.txt', (e4, st) => {
+              if (e4) return reject(e4);
+              globalThis.fs.link('/project/go-fs/origin.txt', '/project/go-fs/hard.txt', e5 => {
+                if (e5) return reject(e5);
+                resolve({
+                  target,
+                  lstatSym: lst.isSymbolicLink(),
+                  lstatFile: lst.isFile(),
+                  statSym: st.isSymbolicLink(),
+                  statFile: st.isFile(),
+                  hardContent: fs.readFileSync('/project/go-fs/hard.txt', 'utf8'),
+                });
+              });
+            });
+          });
+        });
+      });
+    }));
+  })()`));
+
+  assert.equal(res.target, '/project/go-fs/origin.txt');
+  assert.equal(res.lstatSym, true);
+  assert.equal(res.lstatFile, false);
+  assert.equal(res.statSym, false);
+  assert.equal(res.statFile, true);
+  assert.equal(res.hardContent, 'go-symlink-data');
+});
