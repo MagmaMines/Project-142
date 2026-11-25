@@ -103,6 +103,16 @@ test('the three-origin configure step keeps the artifact verifiable', async () =
     assert.deepEqual(verifyArtifact(patched).problems, [], 'the patched page still verifies against its own manifest');
     const headers = fs.readFileSync(path.join(dir, 'site', '_headers'), 'utf8');
     assert.match(headers, /cross-origin-isolated=\(self "https:\/\/runtime\.example\.com" "https:\/\/preview\.example\.com"\)/);
+
+    // Multi-block files (e.g. both /* and a sub-path) must have every allowlist updated.
+    const extraToml = fs.readFileSync(configFile, 'utf8') + '\n[[headers]]\n  for = "/alt/*"\n  [headers.values]\n    Permissions-Policy = \'cross-origin-isolated=*\'\n';
+    const extraHeaders = fs.readFileSync(path.join(deployDir, '_headers'), 'utf8') + '\n/alt/*\n  Permissions-Policy: cross-origin-isolated=*\n';
+    fs.writeFileSync(path.join(dir, 'netlify.toml'), extraToml);
+    fs.writeFileSync(path.join(dir, 'site', '_headers'), extraHeaders);
+    execFileSync(process.execPath, ['deploy/configure.mjs', '--runtime', 'https://rt.example.com', '--preview', 'https://pv.example.com'], { cwd: dir, stdio: 'pipe' });
+    const re = /cross-origin-isolated=\(self "https:\/\/rt\.example\.com" "https:\/\/pv\.example\.com"\)/g;
+    assert.equal((fs.readFileSync(path.join(dir, 'netlify.toml'), 'utf8').match(re) || []).length, 2, 'every block in netlify.toml is updated');
+    assert.equal((fs.readFileSync(path.join(dir, 'site', '_headers'), 'utf8').match(re) || []).length, 2, 'every block in _headers is updated');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

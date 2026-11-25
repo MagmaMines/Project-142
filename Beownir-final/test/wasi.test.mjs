@@ -378,8 +378,90 @@ test('poll_oneoff handles FD_WRITE, FD_READ, BADF, CLOCK timers, and 0-subscript
   assert.equal(r.badfErr, 8);
   assert.equal(r.clkRc, 0);
   assert.ok(r.dt >= 8, 'expected clock poll to wait ~12ms, waited ' + r.dt.toFixed(1) + 'ms');
-  assert.equal(r.clkCount, 1);
+    assert.equal(r.clkCount, 1);
   assert.equal(r.clkUser, 404);
   assert.equal(r.clkType, 0);
   assert.equal(r.invalRc, 28);
+});
+
+test('WASI symlinks, dangling links, fd_renumber(self) on sockets, path_open TRUNC on dir, and filestat_set_times flags behave per spec', () => {
+  const r = JSON.parse(rt.evaluate(`(() => {
+    const req = CORE.module.createRequire('/project/index.js');
+    const fs = req('fs');
+    const { WASI } = req('wasi');
+    fs.rmSync('/project/wasi-sym', { recursive: true, force: true });
+    fs.mkdirSync('/project/wasi-sym/sub', { recursive: true });
+    fs.writeFileSync('/project/wasi-sym/real.txt', 'hello');
+    fs.symlinkSync('real.txt', '/project/wasi-sym/good-link');
+    fs.symlinkSync('missing-target', '/project/wasi-sym/dangling-link');
+
+    const wasi = new WASI({ version: 'preview1', preopens: { '/work': '/project/wasi-sym' } });
+    const memory = new WebAssembly.Memory({ initial: 2 });
+    wasi.initialize({ exports: { memory } });
+    const imp = wasi.wasiImport;
+    const view = new DataView(memory.buffer);
+    const bytes = new Uint8Array(memory.buffer);
+    const put = (ptr, str) => { const b = Buffer.from(str); bytes.set(b, ptr); return b.length; };
+
+    // fd_readdir handles dangling symlinks and emits FILETYPE.SYMBOLIC_LINK (7)
+    const dirRc = imp.fd_readdir(3, 1024, 4096, 0n, 100);
+    const dirUsed = view.getUint32(100, true);
+    const entries = {};
+    let off = 1024;
+    while (off + 24 <= 1024 + dirUsed) {
+      const nameLen = view.getUint32(off + 16, true);
+      const ftype = view.getUint8(off + 20);
+      const name = Buffer.from(bytes.subarray(off + 24, off + 24 + nameLen)).toString('utf8');
+      entries[name] = ftype;
+      off += 24 + nameLen;
+    }
+
+    // path_filestat_get emits SYMBOLIC_LINK (7) with flags=0 and REGULAR_FILE (4) with SYMLINK_FOLLOW (1)
+    const linkLen = put(200, 'good-link');
+    const nofollowRc = imp.path_filestat_get(3, 0, 200, linkLen, 300);
+    const nofollowType = view.getUint8(300 + 16);
+    const followRc = imp.path_filestat_get(3, 1, 200, linkLen, 380);
+    const followType = view.getUint8(380 + 16);
+
+    // path_filestat_set_times respects SYMLINK_FOLLOW (flags=1) vs nofollow (flags=0) without throwing on dangling links
+    const dangLen = put(240, 'dangling-link');
+    const setFollowRc = imp.path_filestat_set_times(3, 1, 200, linkLen, 1700000100000000000n, 1700000100000000000n, 1 | 4);
+    const setNofollowRc = imp.path_filestat_set_times(3, 0, 240, dangLen, 1700000200000000000n, 1700000200000000000n, 1 | 4);
+
+    // path_open with OFLAGS.TRUNC (8) on a directory returns EISDIR (31)
+    const subLen = put(270, 'sub');
+    const truncDirRc = imp.path_open(3, 0, 270, subLen, 8, 0n, 0n, 0, 460);
+
+    // fd_renumber(fd, fd) keeps a socket pair open and readable
+    const [s1, s2] = wasi.openSocketPair();
+    const renumRc = imp.fd_renumber(s1, s1);
+    put(500, 'hi');
+    view.setUint32(520, 500, true);
+    view.setUint32(524, 2, true);
+    const sendRc = imp.sock_send(s2, 520, 1, 0, 540);
+    view.setUint32(550, 600, true);
+    view.setUint32(554, 16, true);
+    const recvRc = imp.sock_recv(s1, 550, 1, 0, 570, 574);
+    const recvText = Buffer.from(bytes.subarray(600, 600 + view.getUint32(570, true))).toString('utf8');
+
+    wasi.close();
+    return JSON.stringify({ dirRc, entries, nofollowRc, nofollowType, followRc, followType, setFollowRc, setNofollowRc, truncDirRc, renumRc, sendRc, recvRc, recvText });
+  })()`));
+
+  assert.equal(r.dirRc, 0);
+  assert.equal(r.entries['real.txt'], 4);
+  assert.equal(r.entries['sub'], 3);
+  assert.equal(r.entries['good-link'], 7);
+  assert.equal(r.entries['dangling-link'], 7);
+  assert.equal(r.nofollowRc, 0);
+  assert.equal(r.nofollowType, 7);
+  assert.equal(r.followRc, 0);
+  assert.equal(r.followType, 4);
+  assert.equal(r.setFollowRc, 0);
+  assert.equal(r.setNofollowRc, 0);
+  assert.equal(r.truncDirRc, 31);
+  assert.equal(r.renumRc, 0);
+  assert.equal(r.sendRc, 0);
+  assert.equal(r.recvRc, 0);
+  assert.equal(r.recvText, 'hi');
 });

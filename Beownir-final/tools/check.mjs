@@ -202,6 +202,18 @@ try {
   fail('embed check failed: ' + error.message);
 }
 
+try {
+  const nativeBrowserDir = path.join(root, 'o', 'native');
+  const nativeMjsFiles = fs.readdirSync(nativeBrowserDir)
+    .filter(name => name.endsWith('.mjs'))
+    .map(name => fs.readFileSync(path.join(nativeBrowserDir, name), 'utf8'));
+  const nativeFloor = floorIn(nativeMjsFiles);
+  if (nativeFloor.length) fail('the native browser workers use features newer than the browser floor: ' + nativeFloor.join('; '));
+  else notes.push('native browser workers respect the browser floor (' + nativeMjsFiles.length + ' files)');
+} catch (error) {
+  fail('native browser floor check failed: ' + error.message);
+}
+
 for (const note of notes) console.log('  ok  ' + note);
 for (const message of failures) console.error('FAIL  ' + message);
 if (failures.length) {

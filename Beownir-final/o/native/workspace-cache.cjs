@@ -122,7 +122,7 @@ function pack(file) {
       meta.type = 'link';
       meta.target = fs.readlinkSync(full);
       const resolved = path.resolve(path.dirname(full), meta.target);
-      if (!resolved.startsWith(ROOT + path.sep)) throw Error('Checkpoint symlink escapes the workspace: ' + name);
+      if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) throw Error('Checkpoint symlink escapes the workspace: ' + name);
     } else if (stat.isDirectory()) meta.type = 'dir';
     else if (stat.isFile()) {
       if (stat.size > MAX_FILE) throw Error('Checkpoint file budget exceeded (' + MAX_FILE + ' bytes): ' + name);
@@ -179,7 +179,7 @@ function restore(file, expected) {
     } else if (meta.type === 'link') {
       if (typeof meta.target !== 'string' || meta.target.length > 4096 || meta.target.includes('\0')) throw Error('Invalid checkpoint link');
       const resolved = path.resolve(path.dirname(path.join(ROOT, meta.path)), meta.target);
-      if (!resolved.startsWith(ROOT + path.sep)) throw Error('Checkpoint link escapes the workspace');
+      if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) throw Error('Checkpoint link escapes the workspace');
     } else if (meta.type !== 'dir') throw Error('Unknown checkpoint entry type');
     if (!covered(meta.path)) { skipped.add(rootOf(meta.path)); continue; }
     roots.add(rootOf(meta.path));

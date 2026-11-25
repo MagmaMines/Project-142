@@ -172,6 +172,24 @@
     return "out.txt === 'SYNCED'";
   });
 
+  add('writeFileBytes preserves high bytes, removeFile deletes directories, and setFiles clears omitted files', async () => {
+    await kernel.writeFileBytes('bytes.bin', new Uint8Array([0x00, 0x80, 0xff, 0xfe, 0x41]));
+    const checkBytes = await kernel.run('node -e "const b=require(\'fs\').readFileSync(\'/project/bytes.bin\');console.log(Array.from(b).join(\',\'))"');
+    if (checkBytes.code !== 0 || checkBytes.stdout.trim() !== '0,128,255,254,65') {
+      throw new Error('binary mismatch: ' + JSON.stringify(checkBytes));
+    }
+    await kernel.writeFile('prune/sub/leaf.txt', 'leaf');
+    await kernel.removeFile('prune');
+    if (kernel.exists('prune') || kernel.exists('prune/sub/leaf.txt')) throw new Error('prune remained in client mirror');
+    const checkRm = await kernel.run('node -e "console.log(require(\'fs\').existsSync(\'/project/prune\'),require(\'fs\').existsSync(\'/project/prune/sub/leaf.txt\'))"');
+    if (checkRm.code !== 0 || checkRm.stdout.trim() !== 'false false') throw new Error('prune remained in kernel: ' + JSON.stringify(checkRm));
+
+    await kernel.setFiles({ '/project/replaced.txt': 'only-file' });
+    const checkSet = await kernel.run('node -e "const fs=require(\'fs\');console.log(fs.existsSync(\'/project/bytes.bin\'),fs.readFileSync(\'/project/replaced.txt\',\'utf8\'))"');
+    if (checkSet.code !== 0 || checkSet.stdout.trim() !== 'false only-file') throw new Error('setFiles leak: ' + JSON.stringify(checkSet));
+    return 'binary [0,128,255,254,65], removeFile dir, setFiles clean';
+  });
+
   add('boots without DecompressionStream (pako iframe fallback)', async () => {
     const native = window.DecompressionStream;
     delete window.DecompressionStream; // Firefox < 113 / Safari < 16.4 path

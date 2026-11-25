@@ -74,3 +74,79 @@ test('a WebSocket to a port nobody listens on reports an error and closes', asyn
   assert.ok(kinds.includes('error'), 'an error event must be sent');
   assert.equal(kinds[kinds.length - 1], 'close');
 });
+
+test('preview VirtualWebSocket handles Blob, ArrayBuffer, primitives, and FIFO close ordering', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const vm = await import('node:vm');
+  const { fileURLToPath } = await import('node:url');
+  const bridgePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'o', 'runtime', 'preview-bridge.js');
+  const source = fs.readFileSync(bridgePath, 'utf8');
+
+  const sent = [];
+  const listeners = new Map();
+  let portRef = null;
+  const fakeWindow = {
+    __BEOWNIR_PREVIEW_CONFIG__: { port: 5173, path: '/', token: 'tok' },
+    addEventListener(type, fn) { (listeners.get(type) || listeners.set(type, new Set()).get(type)).add(fn); },
+    removeEventListener(type, fn) { listeners.get(type)?.delete(fn); },
+    history: { pushState() {}, replaceState() {} },
+    location: { href: 'http://localhost:5173/', pathname: '/', search: '', hash: '' },
+    document: { readyState: 'complete', addEventListener() {}, querySelectorAll: () => [] },
+    XMLHttpRequest: function() {},
+    WebSocket: function() {},
+  };
+  const fakePort = {
+    start() {},
+    postMessage(msg) { sent.push(msg); },
+    onmessage: null,
+  };
+  const context = {
+    window: fakeWindow,
+    parent: fakeWindow,
+    document: fakeWindow.document,
+    location: fakeWindow.location,
+    history: fakeWindow.history,
+    console: { log() {}, info() {}, warn() {}, error() {}, debug() {} },
+    URL,
+    Blob,
+    Request,
+    Response,
+    Headers,
+    DOMException,
+    EventTarget,
+    Event: typeof Event !== 'undefined' ? Event : class Event { constructor(t) { this.type = t; } },
+    MessageEvent: typeof MessageEvent !== 'undefined' ? MessageEvent : class MessageEvent { constructor(t, o) { this.type = t; Object.assign(this, o); } },
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    setTimeout,
+    clearTimeout,
+    Promise,
+  };
+  vm.runInNewContext(source, context, { filename: 'preview-bridge.js' });
+  for (const fn of listeners.get('message') || []) {
+    fn({ source: fakeWindow, data: { type: 'beownir-preview', token: 'tok' }, ports: [fakePort] });
+  }
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  const ws = new fakeWindow.WebSocket('ws://localhost:5173/ws');
+  await new Promise(resolve => setTimeout(resolve, 10));
+  fakePort.onmessage({ data: { type: 'wsevent', id: ws.id, event: 'open', protocol: '' } });
+
+  ws.send(new Blob([new Uint8Array([0xde, 0xad, 0xbe, 0xef])]));
+  ws.send(12345);
+  ws.send(new Uint8Array([1, 2, 3, 4]).subarray(1, 3).buffer.slice(1, 3));
+  ws.close(1000, 'bye');
+
+  await new Promise(resolve => setTimeout(resolve, 40));
+  const wsMsgs = sent.filter(m => m.type === 'ws');
+  assert.deepEqual(wsMsgs.map(m => m.op), ['open', 'send', 'send', 'send', 'close']);
+  assert.equal(wsMsgs[1].binary, true);
+  assert.deepEqual(Array.from(wsMsgs[1].data), [0xde, 0xad, 0xbe, 0xef]);
+  assert.equal(wsMsgs[2].binary, false);
+  assert.equal(wsMsgs[2].data, '12345');
+  assert.equal(wsMsgs[3].binary, true);
+  assert.deepEqual(Array.from(wsMsgs[3].data), [2, 3]);
+  assert.equal(wsMsgs[4].code, 1000);
+});

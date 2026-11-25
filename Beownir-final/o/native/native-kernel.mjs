@@ -28,7 +28,7 @@ async function storageReport(){
  try{if(typeof navigator.storage?.estimate!=='function')return null;const estimate=await navigator.storage.estimate();let persisted=false;try{persisted=await navigator.storage.persisted()}catch{}return describeStorage(estimate,persisted)}catch{return null}
 }
 async function guestGc(){
- try{const out=await internalNode(['.beownir/workspace-cache.cjs','gc']);if(out.exitCode!==0)return null;const lines=out.stdout.text().trim().split('\n');return JSON.parse(lines.at(-1))}catch{return null}
+ try{const out=await internalNode(['.beownir/workspace-cache.cjs','gc']);if(out.exitCode!==0)return null;const lines=out.stdout.text().trim().split('\n');return JSON.parse(lines[lines.length-1])}catch{return null}
 }
 function reportLine(report){
  if(!report)return 'Storage: this browser does not expose usage information.';
@@ -136,7 +136,7 @@ async function checkpoint(){
   const detail=out.stderr.text()||out.stdout.text();
   throw Error(isQuotaError(detail)?quotaHint.trim():'Checkpoint failed: '+detail);
  }
- const lines=out.stdout.text().trim().split('\n'),info=JSON.parse(lines.at(-1)),bytes=await sandbox.fs.readFile('.beownir/checkpoint.bin');
+ const lines=out.stdout.text().trim().split('\n'),info=JSON.parse(lines[lines.length-1]),bytes=await sandbox.fs.readFile('.beownir/checkpoint.bin');
  const id='checkpoint-'+(++checkpointSequence);
  await new Promise((resolve,reject)=>{
   const timer=setTimeout(()=>{checkpointPending.delete(id);reject(Error('Checkpoint commit acknowledgement timed out'))},90000);
@@ -145,7 +145,7 @@ async function checkpoint(){
  try{await sandbox.fs.remove('.beownir/cache-dirty')}catch{}
 }
 async function verifyInstallReceipt(){
- const program="const fs=require('node:fs'),p='/workspace/.beownir/install-materialized.json';const r=JSON.parse(fs.readFileSync(p,'utf8'));if(!Number.isInteger(r.directDependencies)||r.directDependencies<0||!fs.statSync('/workspace/node_modules').isDirectory())throw Error('install receipt or materialized node_modules is invalid');process.stdout.write('install-receipt-ok')";
+ const program="const fs=require('node:fs'),p='/workspace/.beownir/install-materialized.json';const r=JSON.parse(fs.readFileSync(p,'utf8'));if(!Number.isInteger(r.directDependencies)||r.directDependencies<0||(r.directDependencies>0&&!fs.statSync('/workspace/node_modules').isDirectory()))throw Error('install receipt or materialized node_modules is invalid');process.stdout.write('install-receipt-ok')";
  const out=await internalNode(['-e',program]);
  if(out.exitCode!==0||!out.stdout.text().includes('install-receipt-ok'))throw Error('Install exited without a verified filesystem materialization receipt: '+(out.stderr.text()||out.stdout.text()||'no output'));
 }
@@ -179,7 +179,7 @@ async function initialize(files,versions,config,cache){
  // the browser compatibility layer do not count as native Node evidence.
  try{
   const nativeProbe=await internalNode(['.beownir/runtime-probe.cjs'],{NODE_OPTIONS:''});
-  if(nativeProbe.exitCode===0){const lines=nativeProbe.stdout.text().trim().split(/\r?\n/);const capabilities=JSON.parse(lines.at(-1));send({type:'native-capabilities',capabilities})}
+  if(nativeProbe.exitCode===0){const lines=nativeProbe.stdout.text().trim().split(/\r?\n/);const capabilities=JSON.parse(lines[lines.length-1]);send({type:'native-capabilities',capabilities})}
   else send({type:'native-capabilities',capabilities:{nodeVersion:null,probeError:(nativeProbe.stderr.text()||nativeProbe.stdout.text()||'native probe exited '+nativeProbe.exitCode).slice(0,500)}});
  }catch(error){send({type:'native-capabilities',capabilities:{nodeVersion:null,probeError:String(error?.message||error).slice(0,500)}})}
  metadataToken=Array.from(crypto.getRandomValues(new Uint8Array(24)),x=>x.toString(16).padStart(2,'0')).join('');
@@ -244,7 +244,7 @@ onmessage=({data:m})=>{
  if(m.type==='setfiles'){writing=initialization.then(()=>fileTask(()=>putFiles(m.files,m.versions))).catch(e=>send({type:'stderr',data:'[filesystem] '+fail(e)+'\n'}));return}
  if(m.type==='cmd'){void execute(String(m.line),m.id).catch(e=>{send({type:'stderr',data:fail(e)+'\n'});send({type:'done',id:m.id,code:1});send({type:'engine-exit',code:1})});return}
  if(m.type==='input'){void foreground?.process.stdin?.write(m.data);return}if(m.type==='terminate'){void rpc.shutdown();return}
- if(m.type==='rpc'){if(!Object.hasOwn(rpc,m.method)){send({type:'rpc-response',id:m.id,error:'Unsupported engine operation'});return}Promise.resolve().then(()=>rpc[m.method](...(m.args||[]))).then(value=>send({type:'rpc-response',id:m.id,value}),e=>send({type:'rpc-response',id:m.id,error:fail(e)}))}
+ if(m.type==='rpc'){if(!Object.prototype.hasOwnProperty.call(rpc,m.method)){send({type:'rpc-response',id:m.id,error:'Unsupported engine operation'});return}Promise.resolve().then(()=>rpc[m.method](...(m.args||[]))).then(value=>send({type:'rpc-response',id:m.id,value}),e=>send({type:'rpc-response',id:m.id,error:fail(e)}))}
 };
 
 self.addEventListener('unhandledrejection',event=>{event.preventDefault();if(!closed)send({type:'fatal',message:'Execution-group unhandled rejection: '+fail(event.reason)})});

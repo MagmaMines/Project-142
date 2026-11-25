@@ -167,20 +167,55 @@
       this.url = target.href; this.readyState = 0; this.protocol = ''; this.extensions = ''; this.binaryType = 'blob'; this.bufferedAmount = 0;
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
       this.id = 'ws-' + (++socketSequence);
+      this._sendQueue = Promise.resolve();
+      this._queued = 0;
       sockets.set(this.id, this);
       send({ type: 'ws', op: 'open', id: this.id, port: target.port, url: target.path, protocols: protocols ? [].concat(protocols).map(String) : [] })
         .catch(error => dispatchWsEvent({ id: this.id, event: 'error', message: error.message }));
     }
+    _enqueue(fn) {
+      this._queued++;
+      this._sendQueue = this._sendQueue.then(fn, fn).finally(() => {
+        this._queued = Math.max(0, this._queued - 1);
+      });
+    }
     send(data) {
       if (this.readyState !== 1) throw new DOMException('WebSocket is not open yet', 'InvalidStateError');
-      const binary = typeof data !== 'string';
-      const payload = !binary ? data : new Uint8Array(ArrayBuffer.isView(data) ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data);
-      send({ type: 'ws', op: 'send', id: this.id, data: payload, binary }).catch(() => {});
+      if (typeof data === 'string') {
+        const dispatch = () => send({ type: 'ws', op: 'send', id: this.id, data, binary: false }).catch(() => {});
+        if (this._queued === 0) dispatch();
+        else this._enqueue(dispatch);
+        return;
+      }
+      if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        this._enqueue(async () => {
+          const buffer = await data.arrayBuffer();
+          if (this.readyState <= 2) {
+            await send({ type: 'ws', op: 'send', id: this.id, data: new Uint8Array(buffer), binary: true }).catch(() => {});
+          }
+        });
+        return;
+      }
+      let payload, binary = false;
+      if (data instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)) {
+        payload = new Uint8Array(data).slice();
+        binary = true;
+      } else if (ArrayBuffer.isView(data)) {
+        payload = new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
+        binary = true;
+      } else {
+        payload = String(data);
+      }
+      const dispatch = () => send({ type: 'ws', op: 'send', id: this.id, data: payload, binary }).catch(() => {});
+      if (this._queued === 0) dispatch();
+      else this._enqueue(dispatch);
     }
     close(code, reason) {
       if (this.readyState >= 2) return;
       this.readyState = 2;
-      send({ type: 'ws', op: 'close', id: this.id, code, reason }).catch(() => {});
+      const finishClose = () => send({ type: 'ws', op: 'close', id: this.id, code, reason }).catch(() => {});
+      if (this._queued === 0) finishClose();
+      else this._enqueue(finishClose);
     }
     _fire(type, init) {
       const event = type === 'message' ? new MessageEvent('message', init) : Object.assign(new Event(type), init);

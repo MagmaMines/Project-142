@@ -144,3 +144,18 @@ test('recursive readdir Dirent, opendir, lstat and dangling symlinks match POSIX
   assert.throws(() => fs.statSync('/project/scratch/tree/dangling-link'), { code: 'ENOENT' });
   assert.throws(() => fs.realpathSync('/project/scratch/tree/dangling-link'), { code: 'ENOENT' });
 }));
+
+test('fs.cp runs its callback asynchronously via microtask', () => withScratch(async () => {
+  fs.writeFileSync('/project/scratch/src.txt', 'copy-me');
+  let firedSync = false;
+  let calledAfter = false;
+  await new Promise((resolve, reject) => {
+    fs.cp('/project/scratch/src.txt', '/project/scratch/dst.txt', error => {
+      calledAfter = true;
+      if (error) reject(error); else resolve();
+    });
+    firedSync = calledAfter;
+  });
+  assert.equal(firedSync, false, 'fs.cp must not invoke its callback synchronously');
+  assert.equal(fs.readFileSync('/project/scratch/dst.txt', 'utf8'), 'copy-me');
+}));

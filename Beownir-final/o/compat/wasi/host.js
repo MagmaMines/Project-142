@@ -42,7 +42,7 @@ const ERRNO = {
   TIMEDOUT: 73,
   NOTCAPABLE: 76,
 };
-const FILETYPE = { UNKNOWN: 0, DIRECTORY: 3, REGULAR_FILE: 4, SOCKET_DGRAM: 5, SOCKET_STREAM: 6 };
+const FILETYPE = { UNKNOWN: 0, DIRECTORY: 3, REGULAR_FILE: 4, SOCKET_DGRAM: 5, SOCKET_STREAM: 6, SYMBOLIC_LINK: 7 };
 const OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 };
 const FDFLAGS = { APPEND: 1, DSYNC: 2, NONBLOCK: 4, RSYNC: 8, SYNC: 16 };
 const FSTFLAGS = { ATIM: 1, ATIM_NOW: 2, MTIM: 4, MTIM_NOW: 8 };
@@ -741,6 +741,7 @@ class WASI {
       fd_renumber(from, to) {
         const entry = this._entry(from);
         if (from < 3 || to < 0) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });
+        if (from === to) return ERRNO.SUCCESS;
         if (this._fds.has(to)) {
           const prev = this._fds.get(to);
           if (prev.kind === 'socket') callsCloseEntry(this, to);
@@ -828,12 +829,18 @@ class WASI {
         let used = 0;
         for (let index = Number(cookie); index < names.length; index++) {
           const name = Buffer.from(names[index]);
-          const child = fs.statSync(nodePath.join(entry.host, names[index]));
+          const childPath = nodePath.join(entry.host, names[index]);
+          const child = typeof fs.lstatSync === 'function' ? fs.lstatSync(childPath) : fs.statSync(childPath);
+          const childType = typeof child.isSymbolicLink === 'function' && child.isSymbolicLink()
+            ? FILETYPE.SYMBOLIC_LINK
+            : child.isDirectory()
+              ? FILETYPE.DIRECTORY
+              : FILETYPE.REGULAR_FILE;
           const header = Buffer.alloc(24);
           header.writeBigUInt64LE(BigInt(index + 1), 0);
           header.writeBigUInt64LE(0n, 8);
           header.writeUInt32LE(name.length, 16);
-          header.writeUInt8(child.isDirectory() ? FILETYPE.DIRECTORY : FILETYPE.REGULAR_FILE, 20);
+          header.writeUInt8(childType, 20);
           const record = Buffer.concat([header, name]);
           const room = Math.max(0, Number(bufLen) - used);
           this._bytes(bufPtr + used, Math.min(room, record.length)).set(record.subarray(0, Math.min(room, record.length)));
@@ -845,7 +852,10 @@ class WASI {
       },
       path_open(dirfd, dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, fdflags, fdPtr) {
         const host = this._resolve(dirfd, this._text(pathPtr, pathLen));
-        const exists = fs.existsSync(host);
+        let exists = fs.existsSync(host);
+        if (!exists && typeof fs.lstatSync === 'function') {
+          try { fs.lstatSync(host); exists = true; } catch {}
+        }
         if (exists && (oflags & OFLAGS.EXCL)) throw Object.assign(new Error('file exists'), { code: 'EEXIST' });
         if (!exists) {
           if (!(oflags & OFLAGS.CREAT)) throw Object.assign(new Error('no such file'), { code: 'ENOENT' });
@@ -854,6 +864,7 @@ class WASI {
         const st = fs.statSync(host);
         let fd;
         if (st.isDirectory()) {
+          if (oflags & OFLAGS.TRUNC) throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });
           fd = this._allocFd({ kind: 'dir', host });
         } else {
           if (oflags & OFLAGS.DIRECTORY) throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });
@@ -867,16 +878,23 @@ class WASI {
       path_filestat_get(dirfd, flags, pathPtr, pathLen, statPtr) {
         const host = this._resolve(dirfd, this._text(pathPtr, pathLen));
         const st = (flags & 1) === 0 && typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);
-        this._writeFilestat(statPtr, st.isDirectory() ? FILETYPE.DIRECTORY : FILETYPE.REGULAR_FILE, st.size, st.mtimeMs);
+        const type = typeof st.isSymbolicLink === 'function' && st.isSymbolicLink()
+          ? FILETYPE.SYMBOLIC_LINK
+          : st.isDirectory()
+            ? FILETYPE.DIRECTORY
+            : FILETYPE.REGULAR_FILE;
+        this._writeFilestat(statPtr, type, st.size, st.mtimeMs);
         return ERRNO.SUCCESS;
       },
       path_filestat_set_times(dirfd, flags, pathPtr, pathLen, atim, mtim, fstFlags) {
         const host = this._resolve(dirfd, this._text(pathPtr, pathLen));
-        const st = fs.statSync(host);
+        const follow = (flags & 1) !== 0;
+        const st = !follow && typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);
         const now = Date.now();
         const atime = (fstFlags & FSTFLAGS.ATIM_NOW) ? now : (fstFlags & FSTFLAGS.ATIM) ? Number(atim) / 1e6 : st.atimeMs;
         const mtime = (fstFlags & FSTFLAGS.MTIM_NOW) ? now : (fstFlags & FSTFLAGS.MTIM) ? Number(mtim) / 1e6 : st.mtimeMs;
-        fs.utimesSync(host, new Date(atime), new Date(mtime));
+        if (!follow && typeof fs.lutimesSync === 'function') fs.lutimesSync(host, new Date(atime), new Date(mtime));
+        else fs.utimesSync(host, new Date(atime), new Date(mtime));
         return ERRNO.SUCCESS;
       },
       path_create_directory(dirfd, pathPtr, pathLen) {

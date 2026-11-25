@@ -147,11 +147,11 @@
       frame.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden';
       const policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"" + SANDBOX_POLICY + "\">";
       frame.srcdoc = '<!doctype html><meta charset="utf-8">' + policy + '<script>' + BUILD.kernel.replace(/<\/script/gi, '<\\/script') + '<\/script>';
-      const bootTimer = setTimeout(() => {
+      this._bootTimer = setTimeout(() => {
         this._fail(new Error('The kernel frame did not report back within 20 s. Sandboxed iframes or blob workers may be blocked on this page.'));
       }, 20000);
       frame.addEventListener('load', () => {
-        if (this._destroyed) return;
+        if (this._destroyed || this._frame !== frame || !frame.contentWindow) return;
         const pair = new MessageChannel();
         this._channel = pair.port1;
         this._channel.onmessage = event => this._receive(event.data);
@@ -161,7 +161,6 @@
           '*',
           [pair.port2],
         );
-        this._bootTimer = bootTimer;
       }, { once: true });
       container.appendChild(frame);
       this._frame = frame;
@@ -181,12 +180,18 @@
 
     /** Stops every process, server and timer, and removes the frame. */
     destroy() {
+      if (this._destroyed) return;
       this._destroyed = true;
+      clearTimeout(this._bootTimer);
+      this._bootTimer = null;
       this._setState('destroyed');
       try { this._channel?.postMessage({ type: 'terminate' }); } catch {}
       try { this._channel?.close(); } catch {}
       try { this._frame?.remove(); } catch {}
-      for (const pending of this._commands.values()) pending.reject(new Error('The kernel was destroyed.'));
+      for (const pending of this._commands.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('The kernel was destroyed.'));
+      }
       this._commands.clear();
       for (const pending of this._pendingHttp.values()) pending.reject(new Error('The kernel was destroyed.'));
       this._pendingHttp.clear();
@@ -233,8 +238,18 @@
     }
 
     _fail(error) {
+      if (this._destroyed) return;
+      clearTimeout(this._bootTimer);
+      this._bootTimer = null;
       this._setState('failed');
       const wrapped = error instanceof Error ? error : new Error(String(error));
+      for (const pending of this._commands.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(wrapped);
+      }
+      this._commands.clear();
+      for (const pending of this._pendingHttp.values()) pending.reject(wrapped);
+      this._pendingHttp.clear();
       this._emit('error', { error: wrapped });
       this._booted.reject(wrapped);
       this._ready.reject(wrapped);
@@ -245,10 +260,18 @@
     /** Replaces the whole virtual filesystem. Paths outside /project and /tmp are rejected. */
     async setFiles(files) {
       const map = toFileMap(files);
-      await this._post({ type: 'setfiles', files: map, versions: {} });
-      this._files = map;
-      this._emit('files', { files: { ...map } });
-      return { files: { ...map } };
+      const next = {};
+      for (const [path, entry] of Object.entries(map)) {
+        if (entry !== null) next[path] = entry;
+      }
+      const patch = { ...next };
+      for (const previous of Object.keys(this._files)) {
+        if (previous !== '/project' && previous !== '/tmp' && !(previous in patch)) patch[previous] = null;
+      }
+      await this._post({ type: 'setfiles', files: patch, versions: {} });
+      this._files = next;
+      this._emit('files', { files: { ...patch } });
+      return { files: { ...next } };
     }
 
     /** Writes one file, creating parent directories. */
@@ -262,12 +285,16 @@
       return { path: target };
     }
 
-    /** Writes binary content (base64 or Uint8Array) as a latin1 string record. */
+    /** Writes binary content (Uint8Array, typed array, ArrayBuffer, or base64 string) as a base64-prefixed record. */
     async writeFileBytes(path, bytes) {
-      const buffer = bytes instanceof Uint8Array ? bytes : Uint8Array.from(atob(String(bytes)), character => character.charCodeAt(0));
+      let buffer;
+      if (bytes instanceof Uint8Array) buffer = bytes;
+      else if (ArrayBuffer.isView(bytes)) buffer = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      else if (bytes instanceof ArrayBuffer) buffer = new Uint8Array(bytes);
+      else buffer = Uint8Array.from(atob(String(bytes)), character => character.charCodeAt(0));
       let text = '';
       for (let index = 0; index < buffer.length; index += 0x8000) text += String.fromCharCode.apply(null, buffer.subarray(index, index + 0x8000));
-      return this.writeFile(path, text);
+      return this.writeFile(path, '__BEOWNIR_WASM64__:' + btoa(text));
     }
 
     /** Current content of a file from the client-side mirror, or null. */
@@ -280,7 +307,7 @@
     /** Whether a path currently exists in the client-side mirror. */
     exists(path) { return Boolean(this._files[normalisePath(path)]); }
 
-    /** Removes one file or directory entry. */
+    /** Removes one file or directory entry (and any descendant paths under it). */
     async removeFile(path) {
       const target = assertWritablePath(normalisePath(path));
       if (target === '/project' || target === '/tmp') {
@@ -288,9 +315,14 @@
         error.code = 'EPERM';
         throw error;
       }
-      await this._post({ type: 'setfiles', files: { [target]: null }, versions: {} });
-      delete this._files[target];
-      this._emit('files', { files: { [target]: null } });
+      const patch = { [target]: null };
+      const prefix = target + '/';
+      for (const existing of Object.keys(this._files)) {
+        if (existing === target || existing.startsWith(prefix)) patch[existing] = null;
+      }
+      await this._post({ type: 'setfiles', files: patch, versions: {} });
+      for (const existing of Object.keys(patch)) delete this._files[existing];
+      this._emit('files', { files: { ...patch } });
       return { path: target };
     }
 

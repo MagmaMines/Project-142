@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createInstallerSandbox, installerSource, loadInstaller } from './helpers/installer-harness.mjs';
+import { loadRuntime } from './helpers/runtime.mjs';
 
 const tarAvailable = (() => {
   try { execFileSync('tar', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
@@ -321,4 +322,12 @@ test('streamPackage resets hash, tar parser and partial files cleanly when a tar
   } finally {
     fs.rmSync(stage, { recursive: true, force: true });
   }
+});
+
+test('npm uninstall accepts flags such as -D without rejecting them as invalid package names', async () => {
+  const rt = loadRuntime();
+  rt.CORE.fs.writeFileSync('/project/package.json', JSON.stringify({ name: 'u', version: '1.0.0', devDependencies: { ms: '^2.1.3' } }));
+  await rt.run('npm uninstall -D ms');
+  const updated = JSON.parse(rt.CORE.fs.readFileSync('/project/package.json', 'utf8'));
+  assert.deepEqual(updated.devDependencies, {});
 });

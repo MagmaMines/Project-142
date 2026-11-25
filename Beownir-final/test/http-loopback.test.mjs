@@ -374,3 +374,24 @@ test('worker_threads Worker forwards workerData and threadId', async () => {
   assert.equal(result.workerData.port, 30000);
   assert.ok(result.threadId > 0);
 });
+
+test('server.listen(cb), listen(null, cb) and multiple listen(0) calls assign distinct ports', async () => {
+  const s1 = http.createServer((req, res) => res.end('one'));
+  const s2 = http.createServer((req, res) => res.end('two'));
+  const s3 = http.createServer((req, res) => res.end('three'));
+  try {
+    await new Promise(resolve => s1.listen(resolve));
+    await new Promise(resolve => s2.listen(null, resolve));
+    await new Promise(resolve => s3.listen(0, resolve));
+    assert.notEqual(s1.port, s2.port);
+    assert.notEqual(s2.port, s3.port);
+    assert.notEqual(s1.port, s3.port);
+    assert.equal((await request({ port: s1.port })).body, 'one');
+    assert.equal((await request({ port: s2.port })).body, 'two');
+    assert.equal((await request({ port: s3.port })).body, 'three');
+  } finally {
+    s1.close();
+    s2.close();
+    s3.close();
+  }
+});

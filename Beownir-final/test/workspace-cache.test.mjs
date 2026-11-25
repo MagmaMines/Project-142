@@ -216,3 +216,94 @@ test('the CLI prints JSON for pack, restore, gc and fingerprint', () => {
     ws.cleanup();
   }
 });
+
+test('symlinks resolving directly to the workspace root pack and restore cleanly', () => {
+  const ws = workspace();
+  try {
+    fs.mkdirSync(path.join(ws.dir, 'node_modules', 'self-link'), { recursive: true });
+    fs.symlinkSync('../..', path.join(ws.dir, 'node_modules', 'self-link', 'root'));
+    const cache = load(ws.dir);
+    const checkpoint = path.join(ws.dir, '.beownir', 'root-link.bin');
+    const info = cache.pack(checkpoint);
+    assert.ok(info.entries > 0);
+    fs.rmSync(path.join(ws.dir, 'node_modules', 'self-link'), { recursive: true, force: true });
+    cache.restore(checkpoint);
+    assert.equal(fs.readlinkSync(path.join(ws.dir, 'node_modules', 'self-link', 'root')), '../..');
+  } finally {
+    ws.cleanup();
+  }
+});
+
+test('portable-subprocess accepts ArrayBuffer and SharedArrayBuffer inputs', () => {
+  const vm = require('node:vm');
+  const subPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'o', 'native', 'portable-subprocess.cjs');
+  const source = fs.readFileSync(subPath, 'utf8');
+  const seen = [];
+  const cpStub = { spawnSync: null, execFileSync: null, execSync: null };
+  const fakeRequire = id => {
+    if (id === 'node:child_process') return cpStub;
+    if (id === 'node:url') return { fileURLToPath: x => String(x) };
+    if (id === 'node:module') return { syncBuiltinESMExports() {} };
+    throw new Error('unexpected require: ' + id);
+  };
+  const mod = { exports: {} };
+  const ctx = {
+    require: fakeRequire,
+    module: mod,
+    exports: mod.exports,
+    process: { cwd: () => '/workspace', env: {} },
+    Buffer,
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    URL,
+    TypeError,
+    RangeError,
+    Error,
+    globalThis: {
+      __beownirSyscallSync(req) {
+        seen.push(Array.from(req.input));
+        return { pid: 1, status: 0, stdout: req.input, stderr: new Uint8Array() };
+      },
+    },
+  };
+  vm.runInNewContext(source, ctx, { filename: 'portable-subprocess.cjs' });
+  cpStub.spawnSync('cat', [], { input: new Uint8Array([0x10, 0x80, 0xff]).buffer });
+  const sab = new SharedArrayBuffer(2);
+  new Uint8Array(sab).set([0x41, 0x42]);
+  cpStub.spawnSync('cat', [], { input: sab });
+  assert.deepEqual(seen, [[0x10, 0x80, 0xff], [0x41, 0x42]]);
+});
+
+test('package-manager verifyMaterialized handles empty manifests without node_modules and npm: aliases', () => {
+  const vm = require('node:vm');
+  const pmPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'o', 'native', 'package-manager.cjs');
+  const pmSource = fs.readFileSync(pmPath, 'utf8');
+  const fnMatch = pmSource.match(/function within[\s\S]*?\nfunction writeMaterializationReceipt/);
+  assert.ok(fnMatch, 'verifyMaterialized helper exists in package-manager.cjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-pm-'));
+  try {
+    const snippet = fnMatch[0].replace(/\nfunction writeMaterializationReceipt$/, '');
+    const fn = vm.runInNewContext(
+      '(function(fs, path, manager) {\n' + snippet + '\nreturn verifyMaterialized;\n})',
+      {},
+    )(fs, path, 'npm');
+
+    // Empty dependencies with absent node_modules (e.g. after uninstalling last package)
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'empty', version: '1.0.0', dependencies: {} }));
+    const emptyRes = fn(dir);
+    assert.equal(emptyRes.directDependencies, 0);
+    assert.equal(emptyRes.nodeModules, null);
+
+    // npm: alias package points to node_modules/my-ms whose package.json declares name: "ms"
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'aliased', version: '1.0.0', dependencies: { 'my-ms': 'npm:ms@^2.1.3', '@my/pkg': 'npm:@real/pkg@^1.0.0' } }));
+    fs.mkdirSync(path.join(dir, 'node_modules', 'my-ms'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'node_modules', 'my-ms', 'package.json'), JSON.stringify({ name: 'ms', version: '2.1.3' }));
+    fs.mkdirSync(path.join(dir, 'node_modules', '@my', 'pkg'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'node_modules', '@my', 'pkg', 'package.json'), JSON.stringify({ name: '@real/pkg', version: '1.2.0' }));
+    const aliasRes = fn(dir);
+    assert.equal(aliasRes.directDependencies, 2);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

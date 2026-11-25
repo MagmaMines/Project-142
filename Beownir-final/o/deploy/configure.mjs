@@ -65,15 +65,29 @@ html = stamped.html;
 fs.writeFileSync(htmlPath, html);
 
 let toml = fs.readFileSync(tomlPath, 'utf8');
-const permsRe = /cross-origin-isolated=(\([^)]*\)|\*)/;
+const permsRe = /cross-origin-isolated=(\([^)]*\)|\*)/g;
 if (!permsRe.test(toml)) throw new Error('cross-origin-isolated allowlist not found in netlify.toml');
+permsRe.lastIndex = 0;
 toml = toml.replace(permsRe, `cross-origin-isolated=(self "${runtime}" "${preview}")`);
 fs.writeFileSync(tomlPath, toml);
+
+const parentTomlPath = path.join(root, '..', 'netlify.toml');
+let updatedParentToml = false;
+if (path.basename(root) === 'o' && fs.existsSync(parentTomlPath)) {
+  const parentToml = fs.readFileSync(parentTomlPath, 'utf8');
+  permsRe.lastIndex = 0;
+  if (permsRe.test(parentToml)) {
+    permsRe.lastIndex = 0;
+    fs.writeFileSync(parentTomlPath, parentToml.replace(permsRe, `cross-origin-isolated=(self "${runtime}" "${preview}")`));
+    updatedParentToml = true;
+  }
+}
 
 /* Cloudflare Pages and other static hosts read the generated _headers file
  * instead of netlify.toml, so it has to carry the same allowlist. */
 const headersPath = path.join(root, 'site', '_headers');
 if (fs.existsSync(headersPath)) {
+  permsRe.lastIndex = 0;
   const headers = fs.readFileSync(headersPath, 'utf8').replace(permsRe, `cross-origin-isolated=(self "${runtime}" "${preview}")`);
   fs.writeFileSync(headersPath, headers);
 }
@@ -82,7 +96,7 @@ console.log('configured');
 console.log('  runtime origin :', runtime);
 console.log('  preview origin :', preview);
 console.log('  site meta      : runtime=' + runtime + ';preview=' + preview);
-console.log('  netlify.toml   : Permissions-Policy allowlist updated');
+console.log('  netlify.toml   : Permissions-Policy allowlist updated' + (updatedParentToml ? ' (+ ../netlify.toml)' : ''));
 console.log('  site/_headers  : ' + (fs.existsSync(path.join(root, 'site', '_headers')) ? 'Permissions-Policy allowlist updated' : 'not present'));
 console.log('  build manifest : ' + (stamped.restamped ? 'document digest restamped' : 'not present (not a release artifact)'));
 console.log('next: deploy the zip root to Netlify, and run the host with the same origins plus your IDE URL');

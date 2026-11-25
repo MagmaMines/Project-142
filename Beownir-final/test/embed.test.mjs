@@ -95,3 +95,73 @@ test('the template documents what the kernel cannot do', () => {
     assert.ok(template.includes(claim), 'the header names the limit: ' + claim);
   }
 });
+
+test('writeFileBytes, setFiles, removeFile and destroy maintain kernel/mirror integrity', async () => {
+  const vm = await import('node:vm');
+  const source = fs.readFileSync(outputPath, 'utf8');
+  const posted = [];
+  const domTimers = new Map();
+  let nextTimer = 1;
+  const fakeDocument = {
+    createElement() {
+      return {
+        setAttribute() {},
+        addEventListener() {},
+        remove() {},
+        style: {},
+        contentWindow: { postMessage() {} },
+      };
+    },
+    body: { appendChild() {} },
+    querySelector() { return null; },
+  };
+  const context = {
+    document: fakeDocument,
+    setTimeout(fn, ms) { const id = nextTimer++; domTimers.set(id, { fn, ms }); return id; },
+    clearTimeout(id) { domTimers.delete(id); },
+    Uint8Array,
+    ArrayBuffer,
+    TextEncoder,
+    TextDecoder,
+    Promise,
+    Error,
+    TypeError,
+    Object,
+    Set,
+    Map,
+    URL,
+    btoa: globalThis.btoa,
+    atob: globalThis.atob,
+  };
+  context.window = context;
+  context.globalThis = context;
+  const api = vm.runInNewContext(source + '\n;BeownirKernel;', context);
+  const kernel = api.create({ autostart: false, files: { '/project/old.txt': 'old', '/project/dir/child.txt': 'c' } });
+  kernel._channel = { postMessage(msg) { posted.push(msg); }, close() {} };
+  kernel._state = 'ready';
+
+  await kernel.writeFileBytes('bin.dat', new Uint8Array([0x00, 0x80, 0xff, 0xfe]));
+  assert.equal(kernel.readFile('bin.dat'), '__BEOWNIR_WASM64__:AID//g==');
+
+  await kernel.removeFile('dir');
+  assert.equal(kernel.exists('dir'), false);
+  assert.equal(kernel.exists('dir/child.txt'), false);
+  const rmMsg = posted[posted.length - 1];
+  assert.equal(rmMsg.files['/project/dir'], null);
+  assert.equal(rmMsg.files['/project/dir/child.txt'], null);
+
+  await kernel.setFiles({ '/project/fresh.txt': 'new' });
+  assert.equal(kernel.exists('old.txt'), false);
+  assert.equal(kernel.exists('bin.dat'), false);
+  assert.equal(kernel.readFile('fresh.txt'), 'new');
+  const setMsg = posted[posted.length - 1];
+  assert.equal(setMsg.files['/project/old.txt'], null);
+  assert.equal(setMsg.files['/project/bin.dat'], null);
+  assert.equal(setMsg.files['/project/fresh.txt'].c, 'new');
+
+  const k2 = api.create({ autostart: true });
+  k2.whenReady().catch(() => {});
+  assert.equal(domTimers.size, 1, 'start() arms the boot timeout immediately');
+  k2.destroy();
+  assert.equal(domTimers.size, 0, 'destroy() clears the boot timeout');
+});

@@ -97,20 +97,29 @@ function within(root, target) {
 }
 function verifyMaterialized(root) {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-  const names = Object.keys({ ...manifest.dependencies, ...manifest.devDependencies });
+  const declared = { ...manifest.dependencies, ...manifest.devDependencies };
+  const names = Object.keys(declared);
   const modules = path.join(root, 'node_modules');
+  if (names.length === 0) {
+    let existingModules = null;
+    try { const resolved = fs.realpathSync(modules); if (fs.statSync(resolved).isDirectory()) existingModules = resolved; } catch {}
+    return { directDependencies: 0, packageManager: manager, nodeModules: existingModules };
+  }
   let moduleRoot;
   try { moduleRoot = fs.realpathSync(modules); if (!fs.statSync(moduleRoot).isDirectory()) throw Error('not a directory'); }
   catch { throw Error('Package manager exited successfully but node_modules was not materialized.'); }
   const missing = [], invalid = [];
   for (const name of names) {
     const packageDir = path.join(modules, ...name.split('/'));
+    const spec = String(declared[name] || '');
+    const aliasMatch = /^npm:((?:@[^/@]+\/)?[^@]+)/.exec(spec);
+    const expectedName = aliasMatch ? aliasMatch[1] : name;
     try {
       const actual = fs.realpathSync(packageDir);
       if (!within(root, actual)) throw Error('link escapes workspace');
       const file = path.join(actual, 'package.json');
       const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (!value || value.name !== name || typeof value.version !== 'string') throw Error('invalid package metadata');
+      if (!value || (value.name !== name && value.name !== expectedName) || typeof value.version !== 'string') throw Error('invalid package metadata');
     } catch (error) {
       (error?.code === 'ENOENT' ? missing : invalid).push(name);
     }

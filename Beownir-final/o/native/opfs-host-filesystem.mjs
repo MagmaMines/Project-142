@@ -63,7 +63,7 @@ class OPFSHostFileSystem {
     let directory = this.root;
     if (!names.length) return { handle: directory, kind: 'directory' };
     for (let index = 0; index < names.length - 1; index++) directory = await directory.getDirectoryHandle(names[index]);
-    const name = names.at(-1);
+    const name = names[names.length - 1];
     try { return { handle: await directory.getFileHandle(name), kind: 'file', parent: directory, name }; }
     catch (fileError) {
       if (fileError?.name !== 'NotFoundError' && fileError?.name !== 'TypeMismatchError') throw fileError;
@@ -80,7 +80,7 @@ class OPFSHostFileSystem {
     if (!names.length) fail('EACCES', 'Cannot modify mount root');
     let directory = this.root;
     for (let index = 0; index < names.length - 1; index++) directory = await directory.getDirectoryHandle(names[index]);
-    return { directory, name: names.at(-1) };
+    return { directory, name: names[names.length - 1] };
   }
   async mkdirParents(names) {
     let directory = this.root;
