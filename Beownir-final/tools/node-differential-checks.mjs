@@ -488,6 +488,65 @@ export const checks = [
       s1.equals(s2),
     ];
   })()`],
+  ['fs-readdir-recursive-types', `(() => {
+    const fs = require('fs'), base = process.cwd();
+    fs.mkdirSync(base + '/rec-types/sub/deep', { recursive: true });
+    fs.writeFileSync(base + '/rec-types/root.txt', 'r');
+    fs.writeFileSync(base + '/rec-types/sub/mid.txt', 'm');
+    fs.writeFileSync(base + '/rec-types/sub/deep/leaf.txt', 'l');
+    fs.symlinkSync('root.txt', base + '/rec-types/link.txt');
+    fs.symlinkSync('sub', base + '/rec-types/dir-link');
+    fs.symlinkSync('missing.txt', base + '/rec-types/dead-link');
+    const ents = fs.readdirSync(base + '/rec-types', { recursive: true, withFileTypes: true })
+      .map(d => [d.name, d.parentPath.slice(base.length), d.path.slice(base.length), d.isFile(), d.isDirectory(), d.isSymbolicLink()])
+      .sort((a, b) => (a[1] + '/' + a[0]).localeCompare(b[1] + '/' + b[0]));
+    const dir = fs.opendirSync(base + '/rec-types');
+    const opened = [];
+    for (let e = dir.readSync(); e; e = dir.readSync()) {
+      opened.push([e.name, e.parentPath.slice(base.length), e.path.slice(base.length), e.isFile(), e.isDirectory(), e.isSymbolicLink()]);
+    }
+    dir.closeSync();
+    opened.sort((a, b) => a[0].localeCompare(b[0]));
+    return [ents, opened];
+  })()`],
+  ['fs-symlink-dangling-and-dir', `(() => {
+    const fs = require('fs'), base = process.cwd();
+    fs.mkdirSync(base + '/symbox/targetdir', { recursive: true });
+    fs.writeFileSync(base + '/symbox/target.txt', 'sym-payload');
+    fs.symlinkSync('target.txt', base + '/symbox/file-link');
+    fs.symlinkSync('targetdir', base + '/symbox/dir-link');
+    fs.symlinkSync('nonexistent', base + '/symbox/dead-link');
+    let deadStatErr = null;
+    try { fs.statSync(base + '/symbox/dead-link'); } catch (e) { deadStatErr = e.code; }
+    return [
+      fs.lstatSync(base + '/symbox/dead-link').isSymbolicLink(),
+      fs.lstatSync(base + '/symbox/dead-link').isFile(),
+      fs.lstatSync(base + '/symbox/dir-link').isSymbolicLink(),
+      fs.lstatSync(base + '/symbox/dir-link').isDirectory(),
+      fs.statSync(base + '/symbox/dir-link').isDirectory(),
+      fs.existsSync(base + '/symbox/dead-link'),
+      fs.readlinkSync(base + '/symbox/dead-link'),
+      fs.realpathSync(base + '/symbox/file-link').slice(base.length),
+      deadStatErr,
+    ];
+  })()`],
+  ['crypto-sha3-shake-blake2', `(() => {
+    const crypto = require('crypto');
+    const data = Buffer.from('differential-sha3-blake2-'.repeat(10));
+    const key = Buffer.alloc(170, 0x33);
+    const out = {};
+    for (const alg of ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512', 'shake128', 'shake256', 'blake2b512', 'blake2s256']) {
+      out[alg] = [
+        crypto.createHash(alg).update(data).digest('hex'),
+        crypto.hash(alg, data),
+        alg.startsWith('shake') ? null : crypto.createHmac(alg, key).update(data).digest('hex'),
+        crypto.getHashes().includes(alg),
+      ];
+    }
+    out.shake128_32 = crypto.createHash('shake128', { outputLength: 32 }).update(data).digest('hex');
+    out.shake256_64 = crypto.createHash('shake256', { outputLength: 64 }).update(data).digest('hex');
+    return out;
+  })()`],
   ['vm-context-isolation', `(() => {
     const vm = require('vm');
     const c = vm.createContext({ x: 5 });

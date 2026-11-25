@@ -711,3 +711,61 @@ test('Ed25519 keys, deterministic signatures, X.509 certificates, and X25519 dif
     t.diagnostic('openssl ed25519 cert generation unavailable; skipped x509 sub-assert');
   }
 });
+
+test('SHA-3, SHAKE XOF, and BLAKE2 hashes, HMACs, and RSA-SHA3 signatures match OpenSSL', () => {
+  const runtime = loadRuntime();
+  const payload = Buffer.from('beownir-keccak-blake2-vector-'.repeat(12));
+  const longKey = Buffer.alloc(170, 0x5a);
+  const algorithms = ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512', 'shake128', 'shake256', 'blake2b512', 'blake2s256'];
+
+  for (const alg of algorithms) {
+    const expEmpty = crypto.createHash(alg).digest('hex');
+    const expPayload = crypto.createHash(alg).update(payload).digest('hex');
+    const expHmac = alg.startsWith('shake') ? null : crypto.createHmac(alg, longKey).update(payload).digest('hex');
+    const actual = run(runtime, `
+      const crypto = require('crypto');
+      const data = Buffer.from(${JSON.stringify(payload.toString())});
+      const key = Buffer.alloc(170, 0x5a);
+      ({
+        empty: crypto.createHash(${JSON.stringify(alg)}).digest('hex'),
+        hash: crypto.createHash(${JSON.stringify(alg)}).update(data).digest('hex'),
+        oneshot: crypto.hash(${JSON.stringify(alg)}, data),
+        hmac: ${JSON.stringify(alg)}.startsWith('shake') ? null : crypto.createHmac(${JSON.stringify(alg)}, key).update(data).digest('hex'),
+        listed: crypto.getHashes().includes(${JSON.stringify(alg)}),
+      });
+    `);
+    assert.equal(actual.empty, expEmpty, `${alg} empty digest`);
+    assert.equal(actual.hash, expPayload, `${alg} digest`);
+    assert.equal(actual.oneshot, expPayload, `${alg} crypto.hash`);
+    assert.equal(actual.hmac, expHmac, `${alg} HMAC`);
+    assert.equal(actual.listed, true, `${alg} listed in getHashes()`);
+  }
+
+  for (const [xof, outLen] of [['shake128', 0], ['shake128', 32], ['shake128', 99], ['shake256', 64]]) {
+    const exp = crypto.createHash(xof, { outputLength: outLen }).update(payload).digest('hex');
+    const actual = run(runtime, `
+      const crypto = require('crypto');
+      crypto.createHash(${JSON.stringify(xof)}, { outputLength: ${outLen} }).update(${JSON.stringify(payload.toString())}).copy().digest('hex');
+    `);
+    assert.equal(actual, exp, `${xof} outputLength=${outLen}`);
+  }
+
+  const rsaRes = run(runtime, `
+    const crypto = require('crypto');
+    let badXofLenCode = null;
+    try { crypto.createHash('sha256', { outputLength: 16 }); } catch (e) { badXofLenCode = e.code; }
+    const msg = Buffer.from('sha3-rsa-interop');
+    const sigs = {};
+    for (const alg of ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512']) {
+      sigs[alg] = crypto.sign(alg, msg, ${JSON.stringify(privatePem)}).toString('hex');
+    }
+    ({ badXofLenCode, sigs });
+  `);
+  assert.equal(rsaRes.badXofLenCode, 'ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH');
+  for (const alg of ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512']) {
+    const sig = Buffer.from(rsaRes.sigs[alg], 'hex');
+    assert.equal(crypto.verify(alg, Buffer.from('sha3-rsa-interop'), publicPem, sig), true, `OpenSSL verifies ${alg} RSA sig`);
+    const nodeSig = crypto.sign(alg, Buffer.from('sha3-rsa-interop'), privateKey).toString('hex');
+    assert.equal(run(runtime, `require('crypto').verify(${JSON.stringify(alg)}, Buffer.from('sha3-rsa-interop'), ${JSON.stringify(publicPem)}, Buffer.from(${JSON.stringify(nodeSig)}, 'hex'))`), true);
+  }
+});

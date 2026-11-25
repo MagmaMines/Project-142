@@ -88,3 +88,59 @@ test('openSync handles directory fds and writeSync handles stdio fds like Node',
   assert.throws(() => fs.openSync('/project/scratch/file.txt', fs.constants.O_RDONLY | fs.constants.O_DIRECTORY), error => error.code === 'ENOTDIR');
   assert.equal(fs.writeSync(1, 'hello-stdout\n'), 13);
 }));
+
+test('recursive readdir Dirent, opendir, lstat and dangling symlinks match POSIX semantics', () => withScratch(async () => {
+  fs.mkdirSync('/project/scratch/tree/sub/deep', { recursive: true });
+  fs.writeFileSync('/project/scratch/tree/root.txt', 'alpha');
+  fs.writeFileSync('/project/scratch/tree/sub/child.txt', 'beta');
+  fs.writeFileSync('/project/scratch/tree/sub/deep/leaf.txt', 'gamma');
+  fs.symlinkSync('root.txt', '/project/scratch/tree/file-link');
+  fs.symlinkSync('sub', '/project/scratch/tree/dir-link');
+  fs.symlinkSync('does-not-exist', '/project/scratch/tree/dangling-link');
+
+  const recursive = fs.readdirSync('/project/scratch/tree', { recursive: true, withFileTypes: true })
+    .map(d => ({
+      name: d.name,
+      path: d.path,
+      parentPath: d.parentPath,
+      file: d.isFile(),
+      dir: d.isDirectory(),
+      sym: d.isSymbolicLink(),
+    }))
+    .sort((a, b) => (a.parentPath + '/' + a.name).localeCompare(b.parentPath + '/' + b.name));
+
+  assert.deepEqual(JSON.parse(JSON.stringify(recursive)), [
+    { name: 'dangling-link', path: '/project/scratch/tree', parentPath: '/project/scratch/tree', file: false, dir: false, sym: true },
+    { name: 'dir-link', path: '/project/scratch/tree', parentPath: '/project/scratch/tree', file: false, dir: false, sym: true },
+    { name: 'child.txt', path: '/project/scratch/tree/dir-link', parentPath: '/project/scratch/tree/dir-link', file: true, dir: false, sym: false },
+    { name: 'deep', path: '/project/scratch/tree/dir-link', parentPath: '/project/scratch/tree/dir-link', file: false, dir: true, sym: false },
+    { name: 'leaf.txt', path: '/project/scratch/tree/dir-link/deep', parentPath: '/project/scratch/tree/dir-link/deep', file: true, dir: false, sym: false },
+    { name: 'file-link', path: '/project/scratch/tree', parentPath: '/project/scratch/tree', file: false, dir: false, sym: true },
+    { name: 'root.txt', path: '/project/scratch/tree', parentPath: '/project/scratch/tree', file: true, dir: false, sym: false },
+    { name: 'sub', path: '/project/scratch/tree', parentPath: '/project/scratch/tree', file: false, dir: true, sym: false },
+    { name: 'child.txt', path: '/project/scratch/tree/sub', parentPath: '/project/scratch/tree/sub', file: true, dir: false, sym: false },
+    { name: 'deep', path: '/project/scratch/tree/sub', parentPath: '/project/scratch/tree/sub', file: false, dir: true, sym: false },
+    { name: 'leaf.txt', path: '/project/scratch/tree/sub/deep', parentPath: '/project/scratch/tree/sub/deep', file: true, dir: false, sym: false },
+  ]);
+
+  const opened = [];
+  const dir = fs.opendirSync('/project/scratch/tree');
+  for (let d = dir.readSync(); d; d = dir.readSync()) {
+    opened.push({ name: d.name, path: d.path, parentPath: d.parentPath, file: d.isFile(), dir: d.isDirectory(), sym: d.isSymbolicLink() });
+  }
+  dir.closeSync();
+  opened.sort((a, b) => a.name.localeCompare(b.name));
+  assert.deepEqual(JSON.parse(JSON.stringify(opened)), JSON.parse(JSON.stringify(recursive)).filter(d => d.parentPath === '/project/scratch/tree'));
+
+  assert.equal(fs.lstatSync('/project/scratch/tree/dangling-link').isSymbolicLink(), true);
+  assert.equal(fs.lstatSync('/project/scratch/tree/dangling-link').isFile(), false);
+  assert.equal(fs.lstatSync('/project/scratch/tree/dangling-link').isDirectory(), false);
+  assert.equal(fs.lstatSync('/project/scratch/tree/dir-link').isSymbolicLink(), true);
+  assert.equal(fs.lstatSync('/project/scratch/tree/dir-link').isDirectory(), false);
+  assert.equal(fs.statSync('/project/scratch/tree/dir-link').isDirectory(), true);
+  assert.equal(fs.existsSync('/project/scratch/tree/dangling-link'), false);
+  assert.equal(fs.readlinkSync('/project/scratch/tree/dangling-link'), 'does-not-exist');
+  assert.equal(fs.realpathSync('/project/scratch/tree/file-link'), '/project/scratch/tree/root.txt');
+  assert.throws(() => fs.statSync('/project/scratch/tree/dangling-link'), { code: 'ENOENT' });
+  assert.throws(() => fs.realpathSync('/project/scratch/tree/dangling-link'), { code: 'ENOENT' });
+}));
