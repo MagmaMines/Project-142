@@ -254,6 +254,29 @@ test('dependency checkpoints round-trip node_modules outside the source workspac
     assert.equal(second.vfs.readFileSync('/project/node_modules/checkpoint-dep/index.js', 'utf8'), 'module.exports = "checkpoint";\n');
     assert.deepEqual([...second.vfs.readFileSync('/project/node_modules/checkpoint-dep/data.bin')], [0, 1, 2, 250]);
     assert.ok(second.posts.some(message => message.type === 'deps-restored'));
+
+    // Full worker init with `deps` must restore dependencies before posting `ready`
+    const { loadRuntime } = await import('./helpers/runtime.mjs');
+    const { readSite, scriptById } = await import('./helpers/embedded.mjs');
+    const zlibMod = await import('node:zlib');
+    const booted = loadRuntime({ keep: true });
+    const site = readSite();
+    await booted.sandbox.self.onmessage({
+      data: {
+        type: 'init',
+        files: { '/project/package.json': { c: JSON.stringify({ name: 'app', version: '1.0.0' }) } },
+        versions: {},
+        deps: packaged,
+        embeddedPako: scriptById(site, 'pakoSource'),
+        embeddedEsbuildBrowser: Buffer.from(scriptById(site, 'esbuildBrowser').trim(), 'base64').toString('utf8'),
+        embeddedEsbuildWasm: new Uint8Array(zlibMod.gunzipSync(Buffer.from(scriptById(site, 'esbuildWasm').trim(), 'base64')))
+      }
+    });
+    const restoredIdx = booted.posts.findIndex(m => m.type === 'deps-restored');
+    const readyIdx = booted.posts.findIndex(m => m.type === 'ready');
+    assert.ok(restoredIdx !== -1 && readyIdx !== -1 && restoredIdx < readyIdx, `expected deps-restored (${restoredIdx}) before ready (${readyIdx})`);
+    const runRes = await booted.run("node -e \"console.log(require('checkpoint-dep'))\"");
+    assert.equal(runRes.stdout.trim(), 'checkpoint');
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

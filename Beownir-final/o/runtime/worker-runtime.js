@@ -12127,13 +12127,14 @@ self.onmessage=async ev=>{
       FS['/.beownir/runtime/rollup/wasm-node/bindings_wasm.js']={c:ROLLUP_BINDINGS_SOURCE,m:Date.now()};
       // Boot must not depend on the optional Rollup build: without it only Rollup-based tools fail.
       try { FS['/.beownir/runtime/rollup/wasm-node/bindings_wasm_bg.wasm']={c:Buffer.from(pakoApi().ungzip(Buffer.from(ROLLUP_WASM_GZ_B64,'base64'))),m:Date.now()}; } catch {}
-      dirty.clear();holdSync--;post({type:'ready'});
+      dirty.clear();holdSync--;
+      if(m.limits)applyWorkspaceLimits(m.limits);
+      if(m.deps){const incoming=m.deps;try{await restoreDependencyCheckpoint(incoming);}catch(e){post({type:'deps-state',state:'error',message:'Dependency restore failed: '+(e?.message||e)});}}
+      post({type:'ready'});
       // The quota decides what the write path enforces. Adopt the page's numbers
       // when it sent them (it measured the same origin), otherwise measure here,
       // and always report back so the editor and importer agree with the FS.
-      if(m.limits)applyWorkspaceLimits(m.limits);
       void (m.limits?Promise.resolve(LIMITS):refreshWorkspaceBudget()).then(limits=>post({type:'storage',report:{limits:{...limits}}}));
-      if(m.deps){const incoming=m.deps;void restoreDependencyCheckpoint(incoming).catch(e=>post({type:'deps-state',state:'error',message:'Dependency restore failed: '+(e?.message||e)}));}
       return;
     }
     if(m.type==='setfiles'){for(const [path,value]of Object.entries(m.files||{})){if(!path.startsWith('/project/')&&path!=='/project'&&!path.startsWith('/tmp/')&&path!=='/tmp')continue;if(value===null)delete FS[path];else FS[path]=value.d?{d:true,m:Date.now()}:{c:unpackFileData(value.c),m:Date.now()};baseRevisions[path]=m.versions?.[path]||0;delete cache[path];}return;}
