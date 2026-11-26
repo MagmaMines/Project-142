@@ -37,7 +37,7 @@ function retire(engine,reason='Execution group finished'){
  for(const[id,c]of connections)if(c.engine===engine)connections.delete(id);
  engines.delete(engine.pid);engine.rejectReady?.(Error(reason));engine.resolveReady=null;engine.rejectReady=null;table();
 }
-function failed(engine,error){if(engine.retired)return;send({type:'stderr',data:'\n[group '+engine.pid+'] '+format(error)+'\nThis isolated execution group was stopped; the browser renderer, other groups and committed dependencies remain available.\n'});if(isQuotaError(error)){send({type:'stderr',data:'\n\x1b[33m[storage]\x1b[0m The origin storage quota is exhausted (Storage capacity quota exceeded).\n\x1b[90mRun \x1b[0mstorage gc\x1b[90m or Help → Storage → Free space, then retry. .next output and package caches are rebuildable.\x1b[0m\n'});void freeSpace().catch(()=>{})}if(!engine.commandDone&&engine.commandId)send({type:'done',id:engine.commandId,code:1});retire(engine,'Execution group failed: '+String(error?.message||error).slice(0,1200))}
+function failed(engine,error,raw=false){if(engine.retired)return;send({type:'stderr',data:'\n[group '+engine.pid+'] '+(raw?String(error?.message||error).slice(0,8000):format(error))+'\nThis isolated execution group was stopped; the browser renderer, other groups and committed dependencies remain available.\n'});if(isQuotaError(error)){send({type:'stderr',data:'\n\x1b[33m[storage]\x1b[0m The origin storage quota is exhausted (Storage capacity quota exceeded).\n\x1b[90mRun \x1b[0mstorage gc\x1b[90m or Help → Storage → Free space, then retry. .next output and package caches are rebuildable.\x1b[0m\n'});void freeSpace().catch(()=>{})}if(!engine.commandDone&&engine.commandId)send({type:'done',id:engine.commandId,code:1});retire(engine,'Execution group failed: '+String(error?.message||error).slice(0,1200))}
 async function synchronizePeers(engine){for(const[port,owner]of ports)if(owner!==engine&&!owner.retired)await coreCall(engine,'peerConfigure',[port,true])}
 function endpointKey(engine,socket){return engine.pid+'/'+socket}
 async function closePeer(peer){if(peer.closed)return;peer.closed=true;peerStreams.delete(peer);peerIndex.delete(endpointKey(peer.a.engine,peer.a.socket));peerIndex.delete(endpointKey(peer.b.engine,peer.b.socket));await Promise.all([peer.a,peer.b].map(async end=>{if(!end.engine.retired)try{await coreCall(end.engine,'peerControl',[{action:'destroy',socket:end.socket}])}catch{}}))}
@@ -77,7 +77,7 @@ async function childMessage(engine,m){
  if(m.type==='done'){engine.commandDone=true;if(engine.server)clearTimeout(engine.deadline);send(m);return}
  if(m.type==='engine-exit'){if(!engine.commandDone)send({type:'done',id:engine.commandId,code:m.code||0});retire(engine);return}
  if(m.type==='storage-gc-request'){void freeSpace().catch(error=>send({type:'stderr',data:'[storage] '+format(error)+'\n'}));return}
- if(m.type==='fatal'){failed(engine,Error(m.message));return}
+ if(m.type==='fatal'){failed(engine,Error(m.message),true);return}
  if(!['connected','kernel-stopped'].includes(m.type))send(m);
 }
 async function createEngine({line='',commandId=null,utility=false,checkpointAfter=false,transactionalInstall=false}={}){

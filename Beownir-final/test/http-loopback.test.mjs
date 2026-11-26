@@ -395,3 +395,42 @@ test('server.listen(cb), listen(null, cb) and multiple listen(0) calls assign di
     s3.close();
   }
 });
+
+test('SSE text/event-stream responses flush without hanging virtual HTTP and PID 1 servers with fs.watchFile settle', async () => {
+  const closedClients = [];
+  const server = await listen((req, res) => {
+    if (req.url === '/__reload') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write(': connected\n\n');
+      req.on('close', () => closedClients.push('closed'));
+      return;
+    }
+    res.end('ok');
+  });
+  try {
+    const sse = await request({ port: server.port, path: '/__reload' });
+    assert.equal(sse.status, 200);
+    assert.match(String(sse.headers['content-type']), /^text\/event-stream/);
+    assert.ok(sse.body.includes(': connected'));
+    assert.ok(sse.body.includes('retry:'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(closedClients, ['closed']);
+  } finally {
+    server.close();
+  }
+
+  const settle = await rt.evaluate(`(async () => {
+    FS['/project/watched-srv.js'] = { c: "const http = require('node:http'), fs = require('node:fs'); fs.writeFileSync('/project/watched-target.txt', 'v1'); const s = http.createServer((q, r) => r.end('hi')); s.listen(3199); fs.watchFile('/project/watched-target.txt', { interval: 200 }, () => {});", m: Date.now() };
+    const started = Date.now();
+    const code = await runNode(['/project/watched-srv.js']);
+    const elapsed = Date.now() - started;
+    const listening = SERVERS.has(3199);
+    SERVERS.get(3199)?.close();
+    fsWatchFile.delete('/project/watched-target.txt');
+    return { code, elapsed, listening };
+  })()`);
+  assert.equal(settle.code, 0);
+  assert.equal(settle.listening, true);
+  assert.ok(settle.elapsed < 1000, 'server + watchFile settled in ' + settle.elapsed + 'ms');
+});
+

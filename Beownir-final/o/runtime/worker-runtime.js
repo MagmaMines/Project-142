@@ -1285,13 +1285,19 @@ class ServerResponse extends EventEmitter {
   getHeaders(){return {...this._headers};} getHeaderNames(){return Object.keys(this._headers);} hasHeader(k){return Object.prototype.hasOwnProperty.call(this._headers,String(k).toLowerCase());}
   writeHead(code, msg, hdrs){ this.statusCode=code; if(typeof msg==='object'){hdrs=msg;msg=null;} if(msg)this.statusMessage=msg;
     if(hdrs) for(const k in hdrs) this.setHeader(k,hdrs[k]); this.headersSent=true; return this; }
-  write(c){const b=Buffer.from(c);this._size=(this._size||0)+b.length;if(this._size>8*1024*1024)throw new Error('Virtual HTTP response exceeds 8 MiB.');this._body.push(b);this.headersSent=true;return true;}
+  write(c){const b=Buffer.from(c);this._size=(this._size||0)+b.length;if(this._size>8*1024*1024)throw new Error('Virtual HTTP response exceeds 8 MiB.');this._body.push(b);this.headersSent=true;
+    if(!this.finished&&!this._sseTimer&&String(this.getHeader('content-type')||'').toLowerCase().includes('text/event-stream')){
+      this._sseTimer=runtimeNativeSetTimeout(()=>{this._sseTimer=null;if(!this.finished){if(!Buffer.concat(this._body).toString('utf8').includes('retry:'))this.write('retry: 15000\n\n');this.end();}},25);
+      if(this._sseTimer&&typeof this._sseTimer.unref==='function')this._sseTimer.unref();
+    }
+    return true;}
   /* Node internal the compression middleware (and anything else wrapping the
    * stream) calls before the first write when no writeHead happened. */
   _implicitHeader(){ if(!this.headersSent) this.writeHead(this.statusCode); }
   end(c){ if(c!==undefined&&c!==null)this.write(c); if(this.finished)return this; this.finished=true;
+    if(this._sseTimer){runtimeNativeClearTimeout(this._sseTimer);this._sseTimer=null;}
     const mh=this._request&&this._request._middlewareHeaders;if(mh)mh.forEach((v,k)=>{if(!k.startsWith('x-middleware-'))this.setHeader(k,v);});
-    this._done({status:this.statusCode,statusMessage:this.statusMessage,headers:this._headers,body:Buffer.concat(this._body)}); this.socket.writable=false; this.emit('finish'); return this; }
+    this._done({status:this.statusCode,statusMessage:this.statusMessage,headers:this._headers,body:Buffer.concat(this._body)}); this.socket.writable=false; this.emit('finish'); if(this._request)queueMicrotask(()=>{try{this._request.emit('close');}catch{}}); return this; }
   json(o){ this.setHeader('content-type','application/json'); this.end(JSON.stringify(o)); }
   send(x){ if(typeof x==='object'&&!ArrayBuffer.isView(x)) return this.json(x); if(!this.getHeader('content-type'))this.setHeader('content-type','text/html; charset=utf-8'); this.end(x); }
   status(c){ this.statusCode=c; return this; }
@@ -11793,6 +11799,8 @@ async function extractPackage(base, dist, options = {}) {
     return integrity;
   }
   let sink = createPackageSink(base, options.onFile);
+  const unpacked = Number(dist.unpackedSize);
+  const singleStream = Number.isFinite(unpacked) && unpacked > 0 && unpacked <= 8 * 1024 * 1024;
   const result = await kit.streamPackage({
     tarball: dist.tarball,
     integrity,
@@ -11805,7 +11813,7 @@ async function extractPackage(base, dist, options = {}) {
     maxEntries: INSTALL_BUDGET.filesPerPackage,
     idleTimeoutMs: INSTALL_BUDGET.idleTimeoutMs,
     attempts: INSTALL_BUDGET.attempts,
-    segments: INSTALL_BUDGET.segments,
+    segments: singleStream ? 1 : INSTALL_BUDGET.segments,
     segmentBytes: INSTALL_BUDGET.segmentBytes,
     concurrency: INSTALL_BUDGET.concurrency,
     onRangeFallback: () => { installRangeFallbacks++; },
@@ -13195,13 +13203,14 @@ let EVAL_SOURCE;
  * child workers and file watchers. Servers, stdio and IPC are deliberately not
  * counted - they are the "may remain active" background surface. */
 function entryWorkPending() {
+  const pid1Server = kernelInfo.pid === 1 && !kernelInfo.isThread && SERVERS.size > 0;
   return (globalThis.__beownirEsbuildJobs || 0) || fsJobs || kernelPending.size || [...kernelTimers.values()].some(timer => timer._referenced) ||
     [...kernelChildren].some(child => child._referenced && !child._closed) ||
     [...KERNEL_THREADS.values()].some(thread => thread._referenced && !thread._exited) ||
     [...VIRTUAL_THREADS.values()].some(thread => thread._referenced && !thread._exited) ||
     [...ACTIVE_MESSAGE_PORTS].some(p => p._referenced && !p._closed && (p.listenerCount('message') > 0 || typeof p._onmessage === 'function')) ||
-    [...fsWatchers].some(watcher => !watcher.closed && watcher._beownirRef !== false) ||
-    [...fsWatchFile.values()].some(set => [...set].some(watcher => watcher._beownirRef !== false));
+    (!pid1Server && ([...fsWatchers].some(watcher => !watcher.closed && watcher._beownirRef !== false) ||
+    [...fsWatchFile.values()].some(set => [...set].some(watcher => watcher._beownirRef !== false))));
 }
 async function settleEntryWork() {
   for (;;) {
