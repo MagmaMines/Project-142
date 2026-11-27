@@ -13,7 +13,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, '..', 'o', 'site', 'coi-sw.js'), 'utf8');
 const ORIGIN = 'https://ide.example.app';
 
-function loadWorker({ windows, shellBody = 'shell', origin = ORIGIN }) {
+function loadWorker({ windows, shellBody = 'shell', origin = ORIGIN, scope }) {
   const listeners = {};
   const posted = [];
   const cache = { add: async () => {}, put: async () => {}, match: async () => undefined, keys: async () => [] };
@@ -24,11 +24,12 @@ function loadWorker({ windows, shellBody = 'shell', origin = ORIGIN }) {
     clients: {
       claim: async () => {},
       matchAll: async () => windows.map(w => ({
+        id: w.id,
         url: w.url,
         postMessage(message, transfer) { posted.push({ message, transfer, client: w }); if (w.answer) w.answer(message, transfer[0]); },
       })),
     },
-    registration: { unregister: async () => true },
+    registration: { scope, unregister: async () => true },
   };
   const sandbox = {
     self, Response, Request, Headers, URL, MessageChannel, TextEncoder, TextDecoder, setTimeout, clearTimeout,
@@ -45,7 +46,10 @@ function loadWorker({ windows, shellBody = 'shell', origin = ORIGIN }) {
     listeners.fetch(event);
     return { event, answer: () => answer };
   };
-  return { fetchEvent, posted };
+  const messageEvent = (data, sourceId) => {
+    if (listeners.message) listeners.message({ data, source: sourceId ? { id: sourceId } : null });
+  };
+  return { fetchEvent, messageEvent, posted };
 }
 
 const kernelTab = answer => ({
@@ -216,3 +220,80 @@ test('service-worker routes wildcard subdomain p<port>-<id> hostnames directly t
   const html = await resp.text();
   assert.match(html, /__beownirSwWsShim/);
 });
+
+test('service-worker routes subpath-scoped preview requests when hosted under a subdirectory', async () => {
+  const tab = kernelTab();
+  const worker = loadWorker({ windows: [tab], scope: ORIGIN + '/o/site/' });
+  const response = await worker.fetchEvent(ORIGIN + '/o/site/__beownir_preview__/3000/hello?x=1').answer();
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), '<h1>GET /hello?x=1</h1>');
+});
+
+test('service-worker rewrites 3xx Location headers to keep redirects on the preview route', async () => {
+  const tab = {
+    url: ORIGIN + '/',
+    answer(message, port) {
+      port.postMessage({ status: 302, statusMessage: 'Found', headers: { location: '/dashboard?ok=1' }, body: new Uint8Array() });
+    },
+  };
+  const worker = loadWorker({ windows: [tab] });
+  const response = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/').answer();
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), '/__beownir_preview__/3000/dashboard?ok=1');
+
+  const absTab = {
+    url: ORIGIN + '/',
+    answer(message, port) {
+      port.postMessage({ status: 307, statusMessage: 'Temporary Redirect', headers: { Location: 'http://localhost:3000/next' }, body: new Uint8Array() });
+    },
+  };
+  const worker2 = loadWorker({ windows: [absTab] });
+  const response2 = await worker2.fetchEvent(ORIGIN + '/__beownir_preview__/3000/').answer();
+  assert.equal(response2.headers.get('location'), '/__beownir_preview__/3000/next');
+});
+
+test('claimed preview navigation propagates the virtual port to the resulting client', async () => {
+  const tab = kernelTab();
+  const worker = loadWorker({ windows: [tab] });
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/', 'GET', undefined, { resultingClientId: 'c-1' }).answer();
+  await worker.fetchEvent(ORIGIN + '/about', 'GET', undefined, { clientId: 'c-1', resultingClientId: 'c-2' }).answer();
+  const sub = await worker.fetchEvent(ORIGIN + '/about.js', 'GET', undefined, { clientId: 'c-2' }).answer();
+  assert.equal(await sub.text(), '<h1>GET /about.js</h1>');
+});
+
+test('multi-tab kernelClient probes skip non-IDE tabs and route to the tab running the port', async () => {
+  const nonIde = { id: 'tab-non-ide', url: ORIGIN + '/docs.html' };
+  const idleIde = {
+    id: 'tab-idle',
+    url: ORIGIN + '/',
+    answer(message, port) {
+      if (message.type === 'beownir-sw-probe') { port.postMessage({ ok: true, hasPort: false }); return; }
+      port.postMessage({ status: 500, headers: {}, body: new TextEncoder().encode('WRONG_IDLE_TAB') });
+    },
+  };
+  const activeIde = {
+    id: 'tab-active',
+    url: ORIGIN + '/',
+    answer(message, port) {
+      if (message.type === 'beownir-sw-probe') { port.postMessage({ ok: true, hasPort: message.port === 3000 }); return; }
+      port.postMessage({ status: 200, headers: { 'content-type': 'text/plain' }, body: new TextEncoder().encode('FROM_ACTIVE_TAB') });
+    },
+  };
+  const worker = loadWorker({ windows: [nonIde, idleIde, activeIde] });
+  const response = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/').answer();
+  assert.equal(await response.text(), 'FROM_ACTIVE_TAB');
+
+  const secondActive = {
+    id: 'tab-second',
+    url: ORIGIN + '/',
+    answer(message, port) {
+      if (message.type === 'beownir-sw-probe') { port.postMessage({ ok: true, hasPort: message.port === 3000 }); return; }
+      port.postMessage({ status: 200, headers: { 'content-type': 'text/plain' }, body: new TextEncoder().encode('FROM_SECOND_TAB') });
+    },
+  };
+  const worker2 = loadWorker({ windows: [activeIde, secondActive] });
+  worker2.messageEvent({ type: 'beownir-sw-open', port: 3000 }, 'tab-second');
+  const response2 = await worker2.fetchEvent(ORIGIN + '/__beownir_preview__/3000/').answer();
+  assert.equal(await response2.text(), 'FROM_SECOND_TAB');
+});
+

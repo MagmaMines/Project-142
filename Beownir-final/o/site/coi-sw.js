@@ -9,7 +9,17 @@
  * installer's business and must never be served from a stale cache.
  */
 const SHELL_CACHE = 'beownir-shell-v3';
-const SHELL_URLS = ['/', '/index.html'];
+const SCOPE_PATH = (() => {
+  try {
+    const raw = (self.registration && self.registration.scope) || (self.location.origin + '/');
+    const p = new URL(raw, self.location.origin + '/').pathname;
+    return p.endsWith('/') ? p : p + '/';
+  } catch {
+    return '/';
+  }
+})();
+const SHELL_URLS = [SCOPE_PATH, SCOPE_PATH + 'index.html'];
+const PREVIEW_PREFIX = SCOPE_PATH + '__beownir_preview__/';
 const ISOLATION = {
   'Cross-Origin-Opener-Policy': 'same-origin',
   'Cross-Origin-Embedder-Policy': 'credentialless',
@@ -40,7 +50,7 @@ async function navigation(request) {
     return response;
   } catch (error) {
     const cached = await caches.match(request, { ignoreSearch: true }) ||
-      (await caches.open(SHELL_CACHE).then(cache => cache.match('/index.html') || cache.match('/')));
+      (await caches.open(SHELL_CACHE).then(cache => cache.match(SCOPE_PATH + 'index.html') || cache.match(SCOPE_PATH) || cache.match('/index.html') || cache.match('/')));
     if (cached) return cached;
     throw error;
   }
@@ -82,9 +92,18 @@ self.addEventListener('activate', event => {
   })());
 });
 
+const preferredKernelByPort = new Map();
 self.addEventListener('message', event => {
   const data = event.data || {};
   const reply = value => { try { event.source?.postMessage(value); } catch { /* client is gone */ } };
+  if (data.type === 'beownir-sw-open') {
+    const port = Number(data.port);
+    if (event.source && event.source.id && Number.isInteger(port) && port > 0 && port < 65536) {
+      if (preferredKernelByPort.size > 64) preferredKernelByPort.clear();
+      preferredKernelByPort.set(port, { id: event.source.id, at: Date.now() });
+    }
+    return;
+  }
   if (data.type === 'deregister') { event.waitUntil(self.registration.unregister()); return; }
   if (data.type === 'skip-waiting') { event.waitUntil(self.skipWaiting()); return; }
   if (data.type === 'clear-cache') {
@@ -116,7 +135,6 @@ self.addEventListener('message', event => {
  * same-origin privileges. That is acceptable on a developer's machine for their own
  * project, and deliberately not what the deployed IDE uses for untrusted code. The IDE
  * decides which mode to use; this worker just serves both faithfully. */
-const PREVIEW_PREFIX = '/__beownir_preview__/';
 const PREVIEW_TIMEOUT_MS = 600000;
 const swCookieJars = new Map();
 function swPortJar(port) {
@@ -190,16 +208,26 @@ function swSubdomainPort(hostname) {
  * a worker restart just means the next refresh re-claims. */
 const claimedPreviewClients = new Map();
 const CLIENT_CLAIM_TTL = 30 * 60 * 1000;
-function claimPreviewClient(clientId, port) {
+function claimPreviewClient(clientId, port, kernelId) {
   if (!clientId) return;
   if (claimedPreviewClients.size > 128) claimedPreviewClients.clear();
-  claimedPreviewClients.set(clientId, { port, at: Date.now() });
+  const prev = claimedPreviewClients.get(clientId);
+  claimedPreviewClients.set(clientId, {
+    port,
+    kernelId: kernelId || (prev && prev.port === port ? prev.kernelId : null) || null,
+    at: Date.now(),
+  });
+}
+function claimedPreviewEntry(clientId) {
+  if (!clientId) return null;
+  const entry = claimedPreviewClients.get(clientId);
+  if (!entry) return null;
+  if (Date.now() - entry.at > CLIENT_CLAIM_TTL) { claimedPreviewClients.delete(clientId); return null; }
+  return entry;
 }
 function claimedPreviewPort(clientId) {
-  const entry = claimedPreviewClients.get(clientId);
-  if (!entry) return 0;
-  if (Date.now() - entry.at > CLIENT_CLAIM_TTL) { claimedPreviewClients.delete(clientId); return 0; }
-  return entry.port;
+  const entry = claimedPreviewEntry(clientId);
+  return entry ? entry.port : 0;
 }
 /* Injected into preview HTML documents. Replaces window.WebSocket with a
  * BroadcastChannel-backed implementation that reaches the IDE tab, which
@@ -208,15 +236,15 @@ function claimedPreviewPort(clientId) {
 const PREVIEW_WS_SHIM = `(function () {
   if (window.__beownirSwWsShim) return;
   window.__beownirSwWsShim = true;
-  var prefix = '/__beownir_preview__/';
-  var previewPort = 0;
-  if (window.location.pathname.indexOf(prefix) === 0) {
+  var prefix = ${JSON.stringify(PREVIEW_PREFIX)};
+  var previewPort = Number(window.__beownirSwPort) || 0;
+  if (!previewPort && window.location.pathname.indexOf(prefix) === 0) {
     var rest = window.location.pathname.slice(prefix.length);
     var slash = rest.indexOf('/');
     previewPort = Number(slash < 0 ? rest : rest.slice(0, slash)) || 0;
   }
   if (!previewPort) {
-    var hm = /^p(\d{1,5})(?:-[a-z0-9-]+)?\./i.exec(window.location.hostname);
+    var hm = /^p(\d{1,5})(?:-[a-z0-9-]+)?\\./i.exec(window.location.hostname);
     if (hm) previewPort = Number(hm[1]) || 0;
   }
   var NativeWebSocket = window.WebSocket;
@@ -483,7 +511,8 @@ const PREVIEW_WS_SHIM = `(function () {
     });
   });
 })();`;
-async function injectPreviewScripts(response, request) {
+async function injectPreviewScripts(response, request, port) {
+  if (response.status >= 300 && response.status < 400) return response;
   var type = response.headers.get('content-type') || '';
   if (type.toLowerCase().indexOf('text/html') < 0) return response;
   var destination = request.destination || String(request.headers.get('sec-fetch-dest') || '').toLowerCase();
@@ -491,7 +520,8 @@ async function injectPreviewScripts(response, request) {
   if (!isDocument) return response;
   try {
     var body = await response.text();
-    var shim = '<script>' + PREVIEW_WS_SHIM + '<\/script>';
+    var portScript = port ? 'window.__beownirSwPort=' + Number(port) + ';' : '';
+    var shim = '<script>' + portScript + PREVIEW_WS_SHIM + '<\/script>';
     var headOpen = body.indexOf('<head');
     if (headOpen >= 0) {
       var close = body.indexOf('>', headOpen);
@@ -512,21 +542,106 @@ const textResponse = (message, status) => new Response(message, {
 });
 
 function previewRoute(url) {
-  const match = /^\/__beownir_preview__\/(\d{1,5})(\/[^]*)?$/.exec(url.pathname);
+  if (!url.pathname.startsWith(PREVIEW_PREFIX)) return null;
+  const rest = url.pathname.slice(PREVIEW_PREFIX.length);
+  const match = /^(\d{1,5})(\/[^]*)?$/.exec(rest);
   if (!match) return null;
   const port = Number(match[1]);
   if (port < 1 || port > 65535) return null;
   return { port, path: (match[2] || '/') + url.search };
 }
 
-async function kernelClient() {
-  const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-  return windows.find(client => !new URL(client.url).pathname.startsWith(PREVIEW_PREFIX)) || null;
+function isPreviewWindowClient(client) {
+  try {
+    const u = new URL(client.url);
+    if (u.pathname.startsWith(PREVIEW_PREFIX) || u.pathname.startsWith('/__beownir_preview__/')) return true;
+  } catch {}
+  if (client.id && claimedPreviewPort(client.id)) return true;
+  return false;
 }
 
-async function previewResponse(request, port, path) {
-  const client = await kernelClient();
+function probeKernelClient(client, port, timeoutMs = 200) {
+  return new Promise(resolve => {
+    let settled = false;
+    let ch = null;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (ch) { try { ch.port1.close(); } catch {} try { ch.port2.close(); } catch {} }
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ ok: false, hasPort: false }), timeoutMs);
+    try {
+      ch = new MessageChannel();
+      ch.port1.onmessage = ({ data }) => {
+        finish({ ok: Boolean(data && data.ok), hasPort: Boolean(data && data.hasPort) });
+      };
+      client.postMessage({ type: 'beownir-sw-probe', port }, [ch.port2]);
+    } catch {
+      finish({ ok: false, hasPort: false });
+    }
+  });
+}
+
+async function kernelClient(port, preferredKernelId) {
+  const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  const candidates = windows.filter(client => !isPreviewWindowClient(client));
+  if (!candidates.length) return null;
+  if (candidates.length === 1) return candidates[0];
+  const pref = preferredKernelByPort.get(port);
+  const prefId = preferredKernelId || (pref && (Date.now() - pref.at < 30 * 60 * 1000) ? pref.id : null);
+  if (typeof MessageChannel === 'function' && candidates.some(c => typeof c.id === 'string')) {
+    if (prefId) {
+      const prefClient = candidates.find(c => c.id === prefId);
+      if (prefClient) {
+        const fast = await probeKernelClient(prefClient, port, 120);
+        if (fast.ok && fast.hasPort) return prefClient;
+      }
+    }
+    const results = await Promise.all(candidates.map(c => probeKernelClient(c, port, 200)));
+    if (prefId) {
+      const prefIdx = candidates.findIndex(c => c.id === prefId);
+      if (prefIdx >= 0 && results[prefIdx].ok && results[prefIdx].hasPort) return candidates[prefIdx];
+    }
+    const activeIdx = results.findIndex(r => r.ok && r.hasPort);
+    if (activeIdx >= 0) return candidates[activeIdx];
+    if (prefId) {
+      const prefIdx = candidates.findIndex(c => c.id === prefId);
+      if (prefIdx >= 0 && results[prefIdx].ok) return candidates[prefIdx];
+    }
+    const ideIdx = results.findIndex(r => r.ok);
+    if (ideIdx >= 0) return candidates[ideIdx];
+  }
+  if (prefId) {
+    const preferred = candidates.find(c => c.id === prefId);
+    if (preferred) return preferred;
+  }
+  return candidates[0];
+}
+
+function rewritePreviewRedirect(locationValue, port) {
+  const raw = String(locationValue || '').trim();
+  if (!raw) return raw;
+  if (raw.startsWith('/') && !raw.startsWith('//')) {
+    if (raw.startsWith(PREVIEW_PREFIX)) return raw;
+    return PREVIEW_PREFIX + port + raw;
+  }
+  try {
+    const parsed = new URL(raw);
+    const localHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
+    const parsedPort = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+    if (localHost && parsedPort === port) {
+      return PREVIEW_PREFIX + port + (parsed.pathname || '/') + (parsed.search || '') + (parsed.hash || '');
+    }
+  } catch {}
+  return raw;
+}
+
+async function previewResponse(request, port, path, options = {}) {
+  const client = await kernelClient(port, options.preferredKernelId);
   if (!client) return textResponse('Open the Beownir IDE tab on this site to serve preview port ' + port + '.', 503);
+  if (options.claimId) claimPreviewClient(options.claimId, port, client.id || null);
   const body = ['GET', 'HEAD'].includes(request.method) ? undefined : new Uint8Array(await request.arrayBuffer());
   const reqHeaders = Object.fromEntries(request.headers);
   const jarCookies = swGetCookieHeader(port, path);
@@ -552,6 +667,11 @@ async function previewResponse(request, port, path) {
         swSetCookies(port, v, path);
         continue;
       }
+      if (k.toLowerCase() === 'location' && !options.isSubdomain && result.status >= 300 && result.status < 400) {
+        if (Array.isArray(v)) for (const item of v) respHeaders.append(k, rewritePreviewRedirect(item, port));
+        else if (v !== undefined && v !== null) respHeaders.set(k, rewritePreviewRedirect(v, port));
+        continue;
+      }
       if (Array.isArray(v)) for (const item of v) respHeaders.append(k, String(item));
       else if (v !== undefined && v !== null) respHeaders.set(k, String(v));
     }
@@ -574,29 +694,31 @@ self.addEventListener('fetch', event => {
         event.respondWith(Promise.resolve(textResponse('Not a preview address.', 404)).then(isolated));
         return;
       }
-      claimPreviewClient(event.resultingClientId || event.clientId, explicit.port);
-      event.respondWith(previewResponse(request, explicit.port, explicit.path)
-        .then(response => injectPreviewScripts(response, request))
+      const claimId = event.resultingClientId || event.clientId;
+      claimPreviewClient(claimId, explicit.port);
+      event.respondWith(previewResponse(request, explicit.port, explicit.path, { claimId })
+        .then(response => injectPreviewScripts(response, request, explicit.port))
         .catch(error => textResponse('Preview failed: ' + error.message, 502))
         .then(isolated));
       return;
     }
     const subPort = swSubdomainPort(url.hostname);
-    if (subPort > 0 && url.pathname !== '/coi-sw.js') {
+    if (subPort > 0 && url.pathname !== SCOPE_PATH + 'coi-sw.js' && url.pathname !== '/coi-sw.js') {
       const path = url.pathname + url.search;
-      event.respondWith(previewResponse(request, subPort, path)
-        .then(response => injectPreviewScripts(response, request))
+      event.respondWith(previewResponse(request, subPort, path, { isSubdomain: true })
+        .then(response => injectPreviewScripts(response, request, subPort))
         .catch(error => textResponse('Preview failed: ' + error.message, 502))
         .then(isolated));
       return;
     }
     // Not a preview address: after a preview document claimed this client,
-    // its root-relative subresources route to the same virtual port.
-    const claimedPort = claimedPreviewPort(event.clientId);
-    if (claimedPort) {
+    // its root-relative subresources and link navigations route to the same virtual port.
+    const claimed = claimedPreviewEntry(event.clientId);
+    if (claimed && claimed.port && url.pathname !== SCOPE_PATH + 'coi-sw.js' && url.pathname !== '/coi-sw.js') {
+      if (event.resultingClientId) claimPreviewClient(event.resultingClientId, claimed.port, claimed.kernelId);
       const path = url.pathname + url.search;
-      event.respondWith(previewResponse(request, claimedPort, path)
-        .then(response => injectPreviewScripts(response, request))
+      event.respondWith(previewResponse(request, claimed.port, path, { preferredKernelId: claimed.kernelId })
+        .then(response => injectPreviewScripts(response, request, claimed.port))
         .catch(error => textResponse('Preview failed: ' + error.message, 502))
         .then(isolated));
       return;

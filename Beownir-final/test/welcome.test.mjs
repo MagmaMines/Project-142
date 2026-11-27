@@ -132,12 +132,16 @@ test('OPFS and the service worker tab bridge are reported independently', () => 
   assert.match(rows['Offline shell (service worker)'].detail, /failed/);
 });
 
-test('worker stop never auto-restarts new workers and SW open-in-tab button stays wired', () => {
+test('worker stop never auto-restarts new workers and SW / popup open-in-tab button stays wired', () => {
   assert.match(page, /async function stopRuntime\(/);
   assert.match(page, /bind\('#stop',\s*\(\)\s*=>\s*stopRuntime\(\{\s*announce:\s*true\s*\}\)\)/);
   assert.match(page, /stop:\s*\(\)\s*=>\s*stopRuntime\(\{\s*announce:\s*true\s*\}\)/);
   assert.match(page, /if\s*\(data === '\\x03'\)\s*\{[^}]*stopRuntime\(\{\s*announce:\s*true\s*\}\)/);
-  assert.match(page, /if\s*\(swPreviewBridgeAvailable\(\)\)\s*\{\s*openBtn\.dataset\.url\s*=\s*'\/__beownir_preview__\/'\s*\+\s*port\s*\+\s*path;\s*openBtn\.hidden\s*=\s*false;/);
+  assert.match(page, /openBtn\.dataset\.url\s*=\s*'\/__beownir_preview__\/'\s*\+\s*port\s*\+\s*path;\s*openBtn\.dataset\.mode\s*=\s*canUseSwCrossTab\(\)\s*\?\s*'sw'\s*:\s*'popup';\s*openBtn\.hidden\s*=\s*false;/);
+  assert.match(page, /function canUseSwCrossTab\(\)/);
+  assert.match(page, /function openPreviewInPopup\(port,\s*path\)/);
+  assert.match(page, /function isThirdPartyEmbedded\(\)/);
+  assert.match(page, /function swScopePath\(\)/);
 });
 
 test('the capability list marks each row and carries its reason', () => {
