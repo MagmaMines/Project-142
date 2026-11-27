@@ -35,6 +35,7 @@ export function payload(html = fs.readFileSync(appPath, 'utf8')) {
     version,
     runtime: block(html, 'runtimeSource'),
     kernel: block(html, 'runtimeFrameSource'),
+    previewBridge: block(html, 'previewBridgeSource'),
     pako: block(html, 'pakoSource'),
     esbuildWasm: block(html, 'esbuildWasm').trim(),
     esbuildBrowser: block(html, 'esbuildBrowser').trim(),

@@ -13,12 +13,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, '..', 'o', 'site', 'coi-sw.js'), 'utf8');
 const ORIGIN = 'https://ide.example.app';
 
-function loadWorker({ windows, shellBody = 'shell' }) {
+function loadWorker({ windows, shellBody = 'shell', origin = ORIGIN }) {
   const listeners = {};
   const posted = [];
   const cache = { add: async () => {}, put: async () => {}, match: async () => undefined, keys: async () => [] };
   const self = {
-    location: { origin: ORIGIN },
+    location: { origin },
     addEventListener: (type, fn) => { listeners[type] = fn; },
     skipWaiting: async () => {},
     clients: {
@@ -161,4 +161,58 @@ test('preview HTML documents get the WebSocket shim injected; other responses do
   assert.equal(doc.headers.get('content-length'), null, 'stale content-length must be dropped');
   const plain = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/', 'GET').answer();
   assert.equal(await plain.text(), '<h1>GET /</h1>', 'non-document responses pass through unchanged');
+});
+
+test('service-worker VirtualCookieJar isolates cookies per preview port and strips Set-Cookie from host headers', async () => {
+  const seen = [];
+  const tab = {
+    url: ORIGIN + '/',
+    answer(message, port) {
+      seen.push({ port: message.port, url: message.url, cookie: message.headers.cookie || '' });
+      if (message.url === '/login') {
+        port.postMessage({ status: 200, headers: { 'content-type': 'text/plain', 'set-cookie': ['sid=p' + message.port + '; Path=/; HttpOnly', 'prefs=dark; Path=/'] }, body: new TextEncoder().encode('ok') });
+      } else if (message.url === '/logout') {
+        port.postMessage({ status: 200, headers: { 'content-type': 'text/plain', 'set-cookie': 'sid=; Path=/; Max-Age=0' }, body: new TextEncoder().encode('bye') });
+      } else {
+        port.postMessage({ status: 200, headers: { 'content-type': 'text/plain' }, body: new TextEncoder().encode('hi') });
+      }
+    },
+  };
+  const worker = loadWorker({ windows: [tab] });
+  const loginRes = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/login').answer();
+  assert.equal(loginRes.headers.get('set-cookie'), null, 'Set-Cookie must not leak into IDE host origin');
+
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/me').answer();
+  assert.match(seen[seen.length - 1].cookie, /sid=p3000/);
+  assert.match(seen[seen.length - 1].cookie, /prefs=dark/);
+
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/4000/me').answer();
+  assert.equal(seen[seen.length - 1].cookie, '', 'cookies on port 3000 must never leak to port 4000');
+
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/logout').answer();
+  await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/me').answer();
+  assert.ok(!seen[seen.length - 1].cookie.includes('sid='), 'Max-Age=0 deletes sid');
+  assert.match(seen[seen.length - 1].cookie, /prefs=dark/);
+});
+
+test('service-worker routes wildcard subdomain p<port>-<id> hostnames directly to that virtual port', async () => {
+  const seen = [];
+  const subOrigin = 'https://p3005-alpha.preview.example.test';
+  const worker = loadWorker({
+    origin: subOrigin,
+    windows: [{
+      url: subOrigin + '/',
+      answer(message, port) {
+        seen.push(message);
+        port.postMessage({ status: 200, headers: { 'content-type': 'text/html' }, body: new TextEncoder().encode('<html><head></head><body>sub</body></html>') });
+      },
+    }],
+  });
+  // Wait: kernelClient filters out preview clients on /__beownir_preview__, so subdomain preview tests client routing cleanly
+  const resp = await worker.fetchEvent(subOrigin + '/hello?a=1', 'GET', undefined, { headers: { 'sec-fetch-dest': 'iframe' } }).answer();
+  assert.equal(resp.status, 200);
+  assert.equal(seen[0].port, 3005);
+  assert.equal(seen[0].url, '/hello?a=1');
+  const html = await resp.text();
+  assert.match(html, /__beownirSwWsShim/);
 });

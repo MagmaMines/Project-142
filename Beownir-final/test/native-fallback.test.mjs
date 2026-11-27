@@ -84,3 +84,17 @@ test('plain JavaScript packages do not take the fallback path', () => {
   makePackage('plain-js', 'index.js', "module.exports = { plain: true };\n");
   assert.equal(requireFromProject('plain-js').plain, true);
 });
+
+test('rolldown, oxc and generic -wasm32-wasi bindings resolve via fallback or report WASM sibling', () => {
+  makePackage('@rolldown/binding-linux-x64-gnu', 'index.node', 'ELF');
+  assert.throws(
+    () => requireFromProject('@rolldown/binding-linux-x64-gnu'),
+    error => error.code === 'ENOSYS' && /@rolldown\/binding-wasm32-wasi/.test(error.message),
+  );
+  makePackage('@rolldown/binding-wasm32-wasi', 'index.js', 'module.exports = { wasiRolldown: true };\n');
+  assert.equal(requireFromProject('@rolldown/binding-linux-x64-gnu').wasiRolldown, true);
+
+  makePackage('@acme/tool-darwin-arm64', 'native.node', 'MACHO');
+  makePackage('@acme/tool-wasm32-wasi', 'index.js', 'module.exports = { genericWasi: true };\n');
+  assert.equal(requireFromProject('@acme/tool-darwin-arm64').genericWasi, true);
+});

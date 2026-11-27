@@ -3740,6 +3740,7 @@ var require_websocket_server = __commonJS({
 
 // native/host.mjs
 import http from "node:http";
+import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import crypto2 from "node:crypto";
@@ -4066,10 +4067,10 @@ function createPreviewBroker() {
       offset += n;
     }
   }
-  async function pipe(entry, req, socket, body, upgrade2, head, frameOrigin) {
+  async function pipe(entry, req, socket, body, upgrade2, head, frameOrigin, portOverride = null) {
     if (entry.connections >= MAX_CONNECTIONS) throw Error("Too many preview connections");
     entry.connections++;
-    const guestPort = upgrade2 ? entry.wsPort : entry.port, previewId = entry.previewId;
+    const guestPort = portOverride || (upgrade2 ? entry.wsPort : entry.port), previewId = entry.previewId;
     let reported = false;
     const report = (status) => {
       if (reported || upgrade2 || entry.ws.readyState !== 1) return;
@@ -4147,7 +4148,7 @@ function createPreviewBroker() {
       socket.removeListener("close", close);
     }
   }
-  async function request(req, res, { ideOrigin } = {}) {
+  async function request(req, res, { ideOrigin, resolvePort } = {}) {
     const u = new URL(req.url, "http://preview.invalid");
     if (u.pathname.startsWith("/_session/")) {
       const id = u.pathname.slice(10);
@@ -4173,13 +4174,14 @@ function createPreviewBroker() {
         if (size > 1024 * 1024) throw Error("Preview request exceeds 1 MiB");
         chunks.push(chunk);
       }
-      await pipe(entry, req, req.socket, Buffer.concat(chunks), false, null, ideOrigin);
+      const portOverride = typeof resolvePort === "function" ? resolvePort(req) : null;
+      await pipe(entry, req, req.socket, Buffer.concat(chunks), false, null, ideOrigin, portOverride);
     } catch (error) {
       if (!res.headersSent && !res.socket?.bytesWritten) res.writeHead(502).end(String(error.message));
       else req.socket.destroy();
     }
   }
-  function upgrade(req, socket, head, { previewOrigin } = {}) {
+  function upgrade(req, socket, head, { previewOrigin, isAllowedPreviewOrigin, resolvePort } = {}) {
     let origin2;
     try {
       origin2 = new URL(req.headers.origin).origin;
@@ -4188,7 +4190,8 @@ function createPreviewBroker() {
       return;
     }
     const expected = previewOrigin || (req.headers["x-forwarded-proto"] === "https" || req.socket.encrypted ? "https" : "http") + "://" + req.headers.host;
-    if (origin2 !== expected) {
+    const ok = origin2 === expected || (typeof isAllowedPreviewOrigin === "function" && isAllowedPreviewOrigin(origin2, req));
+    if (!ok) {
       socket.destroy();
       return;
     }
@@ -4197,8 +4200,9 @@ function createPreviewBroker() {
       socket.destroy();
       return;
     }
+    const portOverride = typeof resolvePort === "function" ? resolvePort(req) : null;
     socket.pause();
-    void pipe(entry, req, socket, null, true, head).catch(() => socket.destroy());
+    void pipe(entry, req, socket, null, true, head, null, portOverride).catch(() => socket.destroy());
   }
   const sweep = setInterval(() => {
     for (const [id, s] of sessions) if (s.disconnectedAt && Date.now() - s.disconnectedAt > 12e4) sessions.delete(id);
@@ -4263,9 +4267,217 @@ function serve(handler) {
   });
   return server;
 }
-for (const name of ["BEOWNIR_IDE_ORIGIN", "BEOWNIR_RUNTIME_ORIGIN", "BEOWNIR_PREVIEW_ORIGIN"]) if (process.env[name]) {
+function parsePreviewPattern(raw) {
+  if (!raw) return null;
+  const text = String(raw).trim();
+  const hasWildcard = text.includes("*") || text.includes("{port}") || text.includes("{id}");
+  const sample = text.replace(/\*/g, "preview").replace(/\{port\}/g, "3000").replace(/\{id\}/g, "default");
+  const url = new URL(sample);
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+    throw Error("BEOWNIR_PREVIEW_ORIGIN must be a plain HTTP(S) origin or subdomain template without credentials or paths");
+  }
+  if (!hasWildcard) {
+    return {
+      raw: url.origin,
+      isWildcard: false,
+      concreteOrigin: url.origin,
+      matches(candidateOrigin) { return candidateOrigin === url.origin; },
+      originFor() { return url.origin; }
+    };
+  }
+  const tpl = new URL(text.replace(/\*/g, "__beownir_wild__").replace(/\{port\}/g, "__beownir_port__").replace(/\{id\}/g, "__beownir_id__"));
+  const hostPattern = tpl.hostname
+    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/__beownir_wild__/g, "(?:p(?<wp>\\d{1,5})-[a-z0-9-]+|[a-z0-9-]+(?:\\.[a-z0-9-]+)*)")
+    .replace(/__beownir_port__/g, "(?<pp>\\d{1,5})")
+    .replace(/__beownir_id__/g, "[a-z0-9-]+");
+  const hostRegex = new RegExp("^" + hostPattern + "$", "i");
+  return {
+    raw: text,
+    isWildcard: true,
+    concreteOrigin: url.origin,
+    matches(candidateOrigin) {
+      try {
+        const u = new URL(candidateOrigin);
+        return u.protocol === tpl.protocol && u.port === tpl.port && hostRegex.test(u.hostname);
+      } catch {
+        return false;
+      }
+    },
+    extractPort(hostHeader) {
+      const host = String(hostHeader || "").split(":")[0].trim().toLowerCase();
+      if (!host) return null;
+      const m = hostRegex.exec(host);
+      if (!m || !m.groups) return null;
+      const n = Number(m.groups.pp || m.groups.wp);
+      return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+    },
+    originFor(port, sessionId = "default") {
+      const p = String(Number(port) || 3000);
+      const sid = String(sessionId || "default").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 24) || "default";
+      const label = "p" + p + "-" + sid;
+      const resolved = text
+        .replace(/\{port\}/g, p)
+        .replace(/\{id\}/g, sid)
+        .replace(/\*/g, label);
+      return new URL(resolved).origin;
+    }
+  };
+}
+for (const name of ["BEOWNIR_IDE_ORIGIN", "BEOWNIR_RUNTIME_ORIGIN"]) if (process.env[name]) {
   const url = new URL(process.env[name]);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) throw Error(name + " must be a plain HTTP(S) origin without credentials or paths");
+}
+var previewPattern = process.env.BEOWNIR_PREVIEW_ORIGIN ? parsePreviewPattern(process.env.BEOWNIR_PREVIEW_ORIGIN) : null;
+var corsProxyEnabled = process.env.BEOWNIR_CORS_PROXY === "1" || process.argv.includes("--cors-proxy");
+var allowedFetchDomains = [
+  ...String(process.env.BEOWNIR_ALLOWED_FETCH_DOMAINS || "").split(","),
+  ...process.argv.filter((a) => a.startsWith("--allow-fetch-domain=")).map((a) => a.slice("--allow-fetch-domain=".length))
+].map((d) => d.trim().toLowerCase()).filter(Boolean);
+function isPrivateIpAddress(ip) {
+  const s = String(ip || "").toLowerCase();
+  if (!s) return true;
+  if (s === "::1" || s === "::" || s.startsWith("fe80:") || s.startsWith("fc") || s.startsWith("fd") || s.startsWith("::ffff:127.") || s.startsWith("::ffff:10.") || s.startsWith("::ffff:192.168.") || s.startsWith("::ffff:169.254.") || /^::ffff:172\.(1[6-9]|2\d|3[01])\./.test(s) || s.startsWith("::ffff:0.")) return true;
+  const parts = s.split(".").map(Number);
+  if (parts.length === 4 && parts.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+    if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+  }
+  return false;
+}
+function domainMatchesRule(hostname, rule) {
+  const h = String(hostname || "").toLowerCase();
+  const r = String(rule || "").toLowerCase();
+  if (!r || !h) return false;
+  if (r.startsWith("*.")) return h.endsWith(r.slice(1)) && h.length > r.length - 1;
+  return h === r;
+}
+function isProxyTargetAllowed(targetUrl) {
+  let u;
+  try { u = new URL(targetUrl); } catch { return { ok: false, reason: "Invalid target URL" }; }
+  if (u.protocol !== "https:") return { ok: false, reason: "Only https:// targets are supported by the CORS proxy" };
+  if (u.username || u.password) return { ok: false, reason: "Credentials in target URL are forbidden" };
+  const host = u.hostname.toLowerCase();
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal") || net.isIP(host) && isPrivateIpAddress(host)) {
+    return { ok: false, reason: "Private/local target hosts are blocked" };
+  }
+  if (allowedFetchDomains.length > 0 && !allowedFetchDomains.some((rule) => domainMatchesRule(host, rule))) {
+    return { ok: false, reason: "Domain is not in BEOWNIR_ALLOWED_FETCH_DOMAINS" };
+  }
+  return { ok: true, url: u };
+}
+async function resolveVerifiedPublicIp(hostname) {
+  if (net.isIP(hostname)) {
+    if (isPrivateIpAddress(hostname)) throw Error("Blocked private IP target");
+    return { address: hostname, family: net.isIPv6(hostname) ? 6 : 4 };
+  }
+  const records = await dns.lookup(hostname, { all: true });
+  if (!records || !records.length) throw Error("Could not resolve host: " + hostname);
+  for (const r of records) {
+    if (isPrivateIpAddress(r.address)) throw Error("Resolved IP is private or reserved");
+  }
+  return records[0];
+}
+async function handleCorsProxy(req, res, c) {
+  const originHeader = req.headers.origin;
+  const allowedOrigins = new Set([c.ideOrigin, c.runtimeOrigin, previewPattern ? previewPattern.concreteOrigin : c.previewOrigin]);
+  const originOk = !originHeader || allowedOrigins.has(originHeader) || (previewPattern && previewPattern.matches(originHeader));
+  if (!originOk) {
+    res.writeHead(403, { "content-type": "text/plain" }).end("Forbidden origin");
+    return;
+  }
+  if (originHeader) {
+    res.setHeader("Access-Control-Allow-Origin", originHeader);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Access-Control-Max-Age", "600");
+    res.writeHead(204).end();
+    return;
+  }
+  const reqUrl = new URL(req.url, "http://local.invalid");
+  const rawTarget = reqUrl.searchParams.get("url") || "";
+  const check = isProxyTargetAllowed(rawTarget);
+  if (!check.ok) {
+    res.writeHead(403, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ error: check.reason }));
+    return;
+  }
+  const chunks = [];
+  let reqBytes = 0;
+  for await (const chunk of req) {
+    reqBytes += chunk.length;
+    if (reqBytes > 8 * 1024 * 1024) {
+      res.writeHead(413, { "content-type": "text/plain" }).end("Proxy request body exceeds 8 MiB");
+      return;
+    }
+    chunks.push(chunk);
+  }
+  const reqBody = Buffer.concat(chunks);
+  let currentUrl = check.url;
+  try {
+    for (let hop = 0; hop <= 2; hop++) {
+      const resolved = await resolveVerifiedPublicIp(currentUrl.hostname);
+      const forwardHeaders = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        const lower = k.toLowerCase();
+        if (["host", "origin", "referer", "cookie", "connection", "content-length", "transfer-encoding", "accept-encoding"].includes(lower)) continue;
+        if (typeof v === "string") forwardHeaders[lower] = v;
+      }
+      forwardHeaders["accept-encoding"] = "identity";
+      const upstream = await new Promise((resolve, reject) => {
+        const client = (currentUrl.protocol === "https:" ? https : http).request(currentUrl, {
+          method: req.method,
+          headers: forwardHeaders,
+          timeout: 30000,
+          lookup: (_h, _opts, cb) => cb(null, resolved.address, resolved.family)
+        }, resolve);
+        client.on("timeout", () => client.destroy(Error("Upstream proxy request timed out")));
+        client.on("error", reject);
+        if (reqBody.length && !["GET", "HEAD"].includes(req.method)) client.write(reqBody);
+        client.end();
+      });
+      if (upstream.statusCode >= 300 && upstream.statusCode < 400 && upstream.headers.location && hop < 2) {
+        upstream.resume();
+        const nextUrl = new URL(upstream.headers.location, currentUrl);
+        const nextCheck = isProxyTargetAllowed(nextUrl.href);
+        if (!nextCheck.ok) {
+          res.writeHead(403, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ error: nextCheck.reason }));
+          return;
+        }
+        currentUrl = nextCheck.url;
+        continue;
+      }
+      const outHeaders = {};
+      for (const [k, v] of Object.entries(upstream.headers)) {
+        const lower = k.toLowerCase();
+        if (["connection", "transfer-encoding", "content-length", "access-control-allow-origin", "cross-origin-resource-policy"].includes(lower)) continue;
+        if (v !== void 0) outHeaders[k] = v;
+      }
+      outHeaders["access-control-expose-headers"] = "*";
+      res.writeHead(upstream.statusCode || 502, outHeaders);
+      let respBytes = 0;
+      for await (const chunk of upstream) {
+        respBytes += chunk.length;
+        if (respBytes > 16 * 1024 * 1024) {
+          upstream.destroy();
+          res.destroy();
+          return;
+        }
+        res.write(chunk);
+      }
+      res.end();
+      return;
+    }
+  } catch (error) {
+    if (!res.headersSent) res.writeHead(502, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ error: String(error && error.message || error) }));
+    else res.destroy();
+  }
 }
 var coiWorker = null;
 try {
@@ -4299,7 +4511,16 @@ function origin(req, port, env) {
   return url.origin;
 }
 function cfg(req) {
-  return { ideOrigin: origin(req, base, "BEOWNIR_IDE_ORIGIN"), runtimeOrigin: origin(req, base + 1, "BEOWNIR_RUNTIME_ORIGIN"), previewOrigin: origin(req, base + 2, "BEOWNIR_PREVIEW_ORIGIN"), version };
+  const baseCfg = {
+    ideOrigin: origin(req, base, "BEOWNIR_IDE_ORIGIN"),
+    runtimeOrigin: origin(req, base + 1, "BEOWNIR_RUNTIME_ORIGIN"),
+    previewOrigin: previewPattern ? previewPattern.concreteOrigin : origin(req, base + 2, "BEOWNIR_PREVIEW_ORIGIN"),
+    version
+  };
+  if (previewPattern && previewPattern.isWildcard) baseCfg.previewPattern = previewPattern.raw;
+  if (corsProxyEnabled) baseCfg.corsProxy = baseCfg.ideOrigin + "/__beownir_cors_proxy__";
+  if (allowedFetchDomains.length) baseCfg.allowedFetchDomains = allowedFetchDomains;
+  return baseCfg;
 }
 function security(req, res, role) {
   const c = cfg(req);
@@ -4315,7 +4536,11 @@ function security(req, res, role) {
   res.setHeader("Permissions-Policy", 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), cross-origin-isolated=(self "' + c.runtimeOrigin + '" "' + c.previewOrigin + '")');
   if (role === "runtime") {
     const ws = c.runtimeOrigin.replace(/^http/, "ws");
-    res.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; connect-src 'self' " + ws + " https://registry.wasmer.io https://cdn.wasmer.io; style-src 'unsafe-inline'; frame-ancestors " + c.ideOrigin + "; base-uri 'none'; object-src 'none'");
+    const extraConnect = [
+      ...allowedFetchDomains.map((d) => "https://" + d.replace(/^\*\./, "*.")),
+      corsProxyEnabled ? c.ideOrigin : ""
+    ].filter(Boolean).join(" ");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; connect-src 'self' " + ws + " https://registry.wasmer.io https://cdn.wasmer.io" + (extraConnect ? " " + extraConnect : "") + "; style-src 'unsafe-inline'; frame-ancestors " + c.ideOrigin + "; base-uri 'none'; object-src 'none'");
   }
 }
 function health(req, res, role) {
@@ -4346,14 +4571,17 @@ function idePage(req) {
   ideCache.set(config, entry);
   return entry;
 }
-var ide = serve((req, res) => {
+var ide = serve(async (req, res) => {
   security(req, res, "ide");
   if (req.url === "/healthz") return health(req, res, "ide");
+  const u = new URL(req.url, "http://local.invalid");
+  if (u.pathname === "/__beownir_cors_proxy__" && corsProxyEnabled) {
+    return handleCorsProxy(req, res, cfg(req));
+  }
   if (!["GET", "HEAD"].includes(req.method)) {
     res.writeHead(405, { "allow": "GET, HEAD" }).end();
     return;
   }
-  const u = new URL(req.url, "http://local.invalid");
   if (u.pathname === "/coi-sw.js") {
     if (!coiWorker) {
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" }).end("Not found");
@@ -4443,11 +4671,16 @@ var preview = serve((req, res) => {
     res.setHeader("Cache-Control", "no-store");
     return health(req, res, "preview");
   }
-  return void broker.request(req, res, { ideOrigin: cfg(req).ideOrigin }).catch(() => res.destroy());
+  const resolvePreviewPort = (req) => previewPattern?.isWildcard ? previewPattern.extractPort(req.headers["x-forwarded-host"] || req.headers.host) : null;
+  return void broker.request(req, res, { ideOrigin: cfg(req).ideOrigin, resolvePort: resolvePreviewPort }).catch(() => res.destroy());
 });
 preview.on("upgrade", (req, socket, head) => {
   try {
-    broker.upgrade(req, socket, head, { previewOrigin: cfg(req).previewOrigin });
+    broker.upgrade(req, socket, head, {
+      previewOrigin: cfg(req).previewOrigin,
+      isAllowedPreviewOrigin: previewPattern ? (candidateOrigin) => previewPattern.matches(candidateOrigin) : null,
+      resolvePort: (req2) => previewPattern?.isWildcard ? previewPattern.extractPort(req2.headers["x-forwarded-host"] || req2.headers.host) : null
+    });
   } catch {
     socket.destroy();
   }

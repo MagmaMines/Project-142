@@ -17,6 +17,47 @@ const unsharedView = bytes => (bytes && ArrayBuffer.isView(bytes) && isSharedBuf
 const decodeBytes = (bytes, decoder = td) => decoder.decode(unsharedView(bytes));
 const bridgePost = self.postMessage.bind(self);
 const post = (m) => self.postMessage(m);
+const PROFILER = {
+  enabled: false,
+  maxSpans: 5000,
+  startedAt: 0,
+  spans: [],
+};
+function applyProfilerConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') {
+    PROFILER.enabled = false;
+    return;
+  }
+  PROFILER.enabled = Boolean(cfg.enabled);
+  if (Number(cfg.maxSpans) > 0) PROFILER.maxSpans = Math.min(20000, Math.floor(Number(cfg.maxSpans)));
+  if (cfg.reset) { PROFILER.spans.length = 0; PROFILER.startedAt = Date.now(); }
+}
+function profilerBegin(name, category, metadata) {
+  if (!PROFILER.enabled) return null;
+  return { name, category, startMs: performance.now(), ts: Date.now(), metadata: metadata || undefined };
+}
+function profilerEnd(token, extra) {
+  if (!token || !PROFILER.enabled) return;
+  if (PROFILER.spans.length >= PROFILER.maxSpans) return;
+  const durationMs = Math.max(0, performance.now() - token.startMs);
+  const info = typeof kernelInfo === 'object' && kernelInfo ? kernelInfo : { pid: 1, isThread: false, threadId: 0 };
+  const thread = info.isThread ? 'thread-' + info.threadId : 'pid-' + info.pid;
+  const span = {
+    name: token.name,
+    category: token.category,
+    startTime: token.ts,
+    durationMs: Number(durationMs.toFixed(3)),
+    thread,
+    pid: info.pid,
+    threadId: info.threadId || 0,
+  };
+  if (token.metadata || extra) span.metadata = Object.assign({}, token.metadata || {}, extra || {});
+  PROFILER.spans.push(span);
+}
+function profilerTakeSpans() {
+  if (!PROFILER.spans.length) return [];
+  return PROFILER.spans.splice(0, PROFILER.spans.length);
+}
 let holdSync = 0, syncTimer = null;
 const baseRevisions = Object.create(null);
 // A locked-down worker may not have fetch at all (CSP, or a sandboxed
@@ -25,6 +66,149 @@ const baseRevisions = Object.create(null);
 // failing to boot on `self.fetch.bind`.
 const nativeFetch = typeof self.fetch === 'function' ? self.fetch.bind(self) : null;
 const FETCH_UNAVAILABLE = () => Object.assign(new TypeError('fetch is not available in this browser environment; the network cannot be reached from this worker'), { code: 'ENETUNREACH' });
+// Global SharedArrayBuffer-safe TextDecoder wrapper: native TextDecoder throws
+// TypeError on SharedArrayBuffer views in Chromium/WASM multi-threaded code.
+if (typeof TextDecoder === 'function' && typeof TextDecoder.prototype.decode === 'function' && typeof SharedArrayBuffer === 'function') {
+  const __nativeDecode = TextDecoder.prototype.decode;
+  TextDecoder.prototype.decode = function decode(input, options) {
+    if (input !== undefined && input !== null) {
+      if (input instanceof SharedArrayBuffer) input = new Uint8Array(input).slice();
+      else if (ArrayBuffer.isView(input) && input.buffer instanceof SharedArrayBuffer) {
+        input = new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice();
+      }
+    }
+    return __nativeDecode.call(this, input, options);
+  };
+}
+// Bounded WebAssembly.Module compilation cache keyed by byteLength + 64-bit hash
+// so WASI/Rolldown/OxC worker pools reuse compiled modules instead of recompiling.
+const __wasmModuleCache = new Map();
+function __wasmCacheKey(bytes) {
+  const len = bytes.byteLength >>> 0;
+  let h1 = 0x811c9dc5, h2 = 0x9e3779b9;
+  const step = Math.max(1, Math.floor(len / 4096));
+  for (let i = 0; i < len; i += step) {
+    const b = bytes[i];
+    h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (b + (i & 255)), 0x85ebca6b) >>> 0;
+  }
+  return len + ':' + h1.toString(16) + ':' + h2.toString(16) + ':' + (len ? bytes[0] : 0) + ':' + (len ? bytes[len - 1] : 0);
+}
+if (typeof WebAssembly !== 'undefined' && typeof WebAssembly.compile === 'function') {
+  const __nativeWasmCompile = WebAssembly.compile.bind(WebAssembly);
+  const __nativeWasmInstantiate = typeof WebAssembly.instantiate === 'function' ? WebAssembly.instantiate.bind(WebAssembly) : null;
+  function __wasmBytesView(source) {
+    if (source instanceof ArrayBuffer) return new Uint8Array(source);
+    if (typeof SharedArrayBuffer === 'function' && source instanceof SharedArrayBuffer) return new Uint8Array(source).slice();
+    if (ArrayBuffer.isView(source)) {
+      return typeof SharedArrayBuffer === 'function' && source.buffer instanceof SharedArrayBuffer
+        ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength).slice()
+        : new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    }
+    return null;
+  }
+  WebAssembly.compile = function compile(source) {
+    const view = __wasmBytesView(source);
+    if (!view || view.byteLength < 1024) return __nativeWasmCompile(view || source);
+    const key = __wasmCacheKey(view);
+    const cached = __wasmModuleCache.get(key);
+    if (cached) {
+      __wasmModuleCache.delete(key);
+      __wasmModuleCache.set(key, cached);
+      return Promise.resolve(cached);
+    }
+    return __nativeWasmCompile(view).then(mod => {
+      if (__wasmModuleCache.size >= 16) __wasmModuleCache.delete(__wasmModuleCache.keys().next().value);
+      __wasmModuleCache.set(key, mod);
+      return mod;
+    });
+  };
+  if (__nativeWasmInstantiate) {
+    WebAssembly.instantiate = async function instantiate(source, imports) {
+      if (source instanceof WebAssembly.Module) return __nativeWasmInstantiate(source, imports);
+      const view = __wasmBytesView(source);
+      if (!view || view.byteLength < 1024) return __nativeWasmInstantiate(view || source, imports);
+      const mod = await WebAssembly.compile(view);
+      const instance = await __nativeWasmInstantiate(mod, imports);
+      return { module: mod, instance };
+    };
+  }
+}
+/* Configurable outbound fetch allowlist & CORS proxy policy. */
+const networkPolicy = { allowedFetchDomains: [], corsProxy: null, useHostProxy: false };
+function setNetworkConfig(config) {
+  if (!config || typeof config !== 'object') return;
+  if (Array.isArray(config.allowedFetchDomains)) {
+    const clean = [];
+    for (const raw of config.allowedFetchDomains) {
+      const domain = String(raw || '').trim().toLowerCase().replace(/^\.+/, '');
+      if (!domain || domain === '*' || domain === '*.*') continue;
+      if (/^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(domain)) clean.push(domain);
+    }
+    networkPolicy.allowedFetchDomains = [...new Set(clean)];
+  }
+  if (config.corsProxy !== undefined) {
+    const proxy = config.corsProxy === null || config.corsProxy === '' ? null : String(config.corsProxy).trim();
+    networkPolicy.corsProxy = proxy && (/^https?:\/\//i.test(proxy) || proxy.startsWith('/')) ? proxy : null;
+  }
+  if (config.useHostProxy !== undefined) networkPolicy.useHostProxy = Boolean(config.useHostProxy);
+}
+function configuredFetchPolicy() {
+  const domains = [...networkPolicy.allowedFetchDomains];
+  const envDomains = typeof envStore === 'object' && envStore ? envStore.BEOWNIR_ALLOWED_FETCH_DOMAINS : '';
+  if (envDomains) {
+    for (const part of String(envDomains).split(',')) {
+      const domain = part.trim().toLowerCase().replace(/^\.+/, '');
+      if (domain && domain !== '*' && /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(domain) && domains.indexOf(domain) < 0) domains.push(domain);
+    }
+  }
+  const envProxy = typeof envStore === 'object' && envStore ? String(envStore.BEOWNIR_CORS_PROXY || '').trim() : '';
+  const corsProxy = envProxy && (/^https?:\/\//i.test(envProxy) || envProxy.startsWith('/')) ? envProxy : networkPolicy.corsProxy;
+  return { domains, corsProxy, useHostProxy: networkPolicy.useHostProxy };
+}
+function isPrivateOrUnsafeHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || host === '0.0.0.0' || host === '::' || host === '::1' || host.endsWith('.local') || host.endsWith('.internal')) return true;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    if (a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)) return true;
+  }
+  if (host.includes(':') && (/^(?:fe[89ab]|fc|fd)/i.test(host) || host.startsWith('::ffff:'))) return true;
+  return false;
+}
+function isDomainAllowed(hostname, allowlist) {
+  const host = String(hostname || '').toLowerCase();
+  if (!host || isPrivateOrUnsafeHost(host)) return false;
+  for (const pattern of allowlist) {
+    if (pattern.startsWith('*.')) {
+      const suffix = pattern.slice(2);
+      if (host === suffix || (host.endsWith('.' + suffix) && host.length > suffix.length + 1)) return true;
+    } else if (host === pattern) return true;
+  }
+  return false;
+}
+function rewriteCorsProxyUrl(targetUrl, proxy) {
+  if (!proxy) return targetUrl;
+  if (proxy.includes('{encodedUrl}')) return proxy.replace(/\{encodedUrl\}/g, encodeURIComponent(targetUrl));
+  if (proxy.includes('{url}')) return proxy.replace(/\{url\}/g, encodeURIComponent(targetUrl));
+  if (proxy.endsWith('=') || proxy.endsWith('?url=') || proxy.endsWith('&url=')) return proxy + encodeURIComponent(targetUrl);
+  if (proxy.endsWith('/')) return proxy + targetUrl;
+  const joiner = proxy.includes('?') ? '&' : '?';
+  return proxy + joiner + 'url=' + encodeURIComponent(targetUrl);
+}
+function fileFetchMime(filePath) {
+  const lower = String(filePath || '').toLowerCase();
+  if (lower.endsWith('.wasm')) return 'application/wasm';
+  if (lower.endsWith('.json')) return 'application/json; charset=utf-8';
+  if (lower.endsWith('.mjs') || lower.endsWith('.cjs') || lower.endsWith('.js')) return 'text/javascript; charset=utf-8';
+  if (lower.endsWith('.css')) return 'text/css; charset=utf-8';
+  if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'text/html; charset=utf-8';
+  if (lower.endsWith('.svg')) return 'image/svg+xml';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.txt') || lower.endsWith('.md')) return 'text/plain; charset=utf-8';
+  return 'application/octet-stream';
+}
 /* A worker may run without WebCrypto: in an insecure context `crypto.subtle`
  * is undefined (and a locked-down embedder can remove `crypto` entirely). One
  * captured reference keeps the runtime booting, and every random request goes
@@ -38,7 +222,59 @@ function secureRandomBytes(target) {
   error.code = 'ENOTSUP';
   throw error;
 }
-self.fetch=async(input,init={})=>{const u=new URL(typeof input==='string'||input instanceof URL?String(input):input.url);if(['localhost','127.0.0.1','[::1]'].includes(u.hostname)){const request=new Request(u.href,init),method=request.method,body=['GET','HEAD'].includes(method)?null:await request.arrayBuffer();if(body?.byteLength>1024*1024)throw new Error('Virtual request exceeds 1 MiB.');const result=await new Promise(resolve=>handleHttp({port:Number(u.port)||80,url:u.pathname+u.search,method,headers:Object.fromEntries(request.headers),body},resolve));return new Response([204,205,304].includes(result.status)||method==='HEAD'?null:result.body,{status:result.status,headers:result.headers});}if(u.origin!=='https://registry.npmjs.org'||u.username||u.password)throw new Error('Network restricted to virtual loopback and https://registry.npmjs.org in single-file mode.');if(!nativeFetch)throw FETCH_UNAVAILABLE();return nativeFetch(input,{...init,credentials:'omit',redirect:'error'});};
+async function runtimeFetch(input, init = {}, options = {}) {
+  const rawUrl = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+  let u;
+  try { u = new URL(rawUrl, 'file:///project/'); } catch { throw new TypeError('Invalid URL passed to fetch(): ' + rawUrl); }
+  if (u.protocol === 'file:') {
+    const fsPath = decodeURIComponent(u.pathname || '/');
+    const resolved = typeof tryFiles === 'function' ? tryFiles(fsPath) : null;
+    const entry = resolved ? FS[resolved] : FS[fsPath];
+    if (!entry || entry.d) return new Response('Not found: ' + fsPath, { status: 404, statusText: 'Not Found', headers: { 'content-type': 'text/plain' } });
+    const bytes = typeof unpackFileData === 'function' ? unpackFileData(entry.c) : entry.c;
+    const payload = typeof bytes === 'string' ? Buffer.from(bytes, 'utf8') : bytes;
+    return new Response(payload, { status: 200, statusText: 'OK', headers: { 'content-type': fileFetchMime(resolved || fsPath) } });
+  }
+  if (['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) {
+    const request = new Request(input instanceof Request ? input : u.href, init), method = request.method;
+    const body = ['GET', 'HEAD'].includes(method) ? null : new Uint8Array(await request.arrayBuffer());
+    if (body?.byteLength > 1024 * 1024) throw typeof virtualError === 'function' ? virtualError('EFBIG', 'Virtual request exceeds 1 MiB.') : new Error('Virtual request exceeds 1 MiB.');
+    const port = Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
+    let result;
+    if (typeof SERVERS !== 'undefined' && SERVERS.has(port)) {
+      result = await new Promise(resolve => handleHttp({ port, url: u.pathname + u.search, method, headers: Object.fromEntries(request.headers), body }, resolve));
+    } else if (options.allowKernelHttp && typeof kernelInfo === 'object' && kernelInfo && typeof kernelCall === 'function') {
+      result = await kernelCall('http', { port, url: u.pathname + u.search, method, headers: Object.fromEntries(request.headers), body });
+    } else {
+      result = await new Promise(resolve => handleHttp({ port, url: u.pathname + u.search, method, headers: Object.fromEntries(request.headers), body }, resolve));
+    }
+    return new Response([204, 205, 304].includes(result.status) || method === 'HEAD' ? null : result.body, { status: result.status, headers: result.headers });
+  }
+  if (u.username || u.password) throw new Error('Network fetches with embedded credentials are refused.');
+  if (u.origin === 'https://registry.npmjs.org') {
+    if (!nativeFetch) throw FETCH_UNAVAILABLE();
+    return nativeFetch(input, { ...init, credentials: 'omit', redirect: 'error' });
+  }
+  const policy = configuredFetchPolicy();
+  const domainAllowed = u.protocol === 'https:' && isDomainAllowed(u.hostname, policy.domains);
+  if (!domainAllowed) {
+    throw Object.assign(new Error('Network restricted to virtual loopback, https://registry.npmjs.org, and configured allowedFetchDomains (refused: ' + u.origin + ').'), { code: 'ENOTCAPABLE' });
+  }
+  if (policy.useHostProxy && typeof kernelCall === 'function' && typeof kernelInfo === 'object' && kernelInfo) {
+    const request = new Request(input instanceof Request ? input : u.href, init), method = request.method;
+    const body = ['GET', 'HEAD'].includes(method) ? null : new Uint8Array(await request.arrayBuffer());
+    if (body?.byteLength > 2 * 1024 * 1024) throw virtualError('EFBIG', 'Proxied request exceeds 2 MiB.');
+    const relayed = await kernelCall('host-fetch', { url: u.href, method, headers: Object.fromEntries(request.headers), body });
+    return new Response([204, 205, 304].includes(relayed.status) || method === 'HEAD' ? null : relayed.body, { status: relayed.status, statusText: relayed.statusText || '', headers: relayed.headers || {} });
+  }
+  if (!nativeFetch) throw FETCH_UNAVAILABLE();
+  const targetUrl = policy.corsProxy ? rewriteCorsProxyUrl(u.href, policy.corsProxy) : u.href;
+  const fetchInput = targetUrl !== u.href && typeof Request !== 'undefined' && input instanceof Request
+    ? new Request(targetUrl, { method: input.method, headers: input.headers, body: ['GET', 'HEAD'].includes(input.method) ? undefined : await input.clone().arrayBuffer(), signal: init.signal || input.signal })
+    : targetUrl;
+  return nativeFetch(fetchInput, { ...init, credentials: 'omit', redirect: init.redirect || 'follow' });
+}
+self.fetch = (input, init = {}) => runtimeFetch(input, init, { allowKernelHttp: false });
 let outputStart=performance.now(), outputBytes=0, outputWarned=false;
 function emitOutput(type, value){const now=performance.now();if(now-outputStart>1000){outputStart=now;outputBytes=0;outputWarned=false;}const text=String(value).slice(0,32768);outputBytes+=text.length;if(outputBytes<131072)post({type,data:text});else if(!outputWarned){outputWarned=true;post({type:'stderr',data:'\n[output throttled: 128 KiB per second · pipe through head/tail or redirect with > file to keep the full output]\n'});}}
 let shellCapture=null; // set by the virtual shell while a pipeline stage is captured
@@ -64,6 +300,9 @@ function toFsPath(p){
     const url = p instanceof URL ? p : new URL(p.href);
     if (url.protocol !== 'file:') throw Object.assign(new TypeError('The URL must be of scheme file'), { code: 'ERR_INVALID_URL_SCHEME' });
     return decodeURIComponent(url.pathname);
+  }
+  if (typeof p === 'string' && p.startsWith('file://')) {
+    try { return decodeURIComponent(new URL(p).pathname); } catch { return decodeURIComponent(p.slice(7)); }
   }
   if (typeof p !== 'string') return p === undefined || p === null ? String(p) : String(p);
   return p;
@@ -113,7 +352,7 @@ const NODE_QS_INTERNAL_SOURCE = "'use strict';\n\nconst {\n  Array,\n  Int8Array
 const NODE_QS_SOURCE = "// Copyright Joyent, Inc. and other Node contributors.\n//\n// Permission is hereby granted, free of charge, to any person obtaining a\n// copy of this software and associated documentation files (the\n// \"Software\"), to deal in the Software without restriction, including\n// without limitation the rights to use, copy, modify, merge, publish,\n// distribute, sublicense, and/or sell copies of the Software, and to permit\n// persons to whom the Software is furnished to do so, subject to the\n// following conditions:\n//\n// The above copyright notice and this permission notice shall be included\n// in all copies or substantial portions of the Software.\n//\n// THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS\n// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN\n// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,\n// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR\n// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE\n// USE OR OTHER DEALINGS IN THE SOFTWARE.\n\n// Query String Utilities\n\n'use strict';\n\nconst {\n  Array,\n  ArrayIsArray,\n  Int8Array,\n  MathAbs,\n  NumberIsFinite,\n  ObjectKeys,\n  String,\n  StringPrototypeCharCodeAt,\n  StringPrototypeSlice,\n  decodeURIComponent,\n} = primordials;\n\nconst { Buffer } = require('buffer');\nconst {\n  encodeStr,\n  hexTable,\n  isHexTable,\n} = require('internal/querystring');\nconst QueryString = module.exports = {\n  unescapeBuffer,\n  // `unescape()` is a JS global, so we need to use a different local name\n  unescape: qsUnescape,\n\n  // `escape()` is a JS global, so we need to use a different local name\n  escape: qsEscape,\n\n  stringify,\n  encode: stringify,\n\n  parse,\n  decode: parse,\n};\n\nconst unhexTable = new Int8Array([\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0 - 15\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 16 - 31\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 32 - 47\n  +0, +1, +2, +3, +4, +5, +6, +7, +8, +9, -1, -1, -1, -1, -1, -1, // 48 - 63\n  -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 64 - 79\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 80 - 95\n  -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 96 - 111\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 112 - 127\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 128 ...\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  // ... 255\n]);\n/**\n * A safe fast alternative to decodeURIComponent\n * @param {string} s\n * @param {boolean} decodeSpaces\n * @returns {string}\n */\nfunction unescapeBuffer(s, decodeSpaces) {\n  const out = Buffer.allocUnsafe(s.length);\n  let index = 0;\n  let outIndex = 0;\n  let currentChar;\n  let nextChar;\n  let hexHigh;\n  let hexLow;\n  const maxLength = s.length - 2;\n  // Flag to know if some hex chars have been decoded\n  let hasHex = false;\n  while (index < s.length) {\n    currentChar = StringPrototypeCharCodeAt(s, index);\n    if (currentChar === 43 /* '+' */ && decodeSpaces) {\n      out[outIndex++] = 32; // ' '\n      index++;\n      continue;\n    }\n    if (currentChar === 37 /* '%' */ && index < maxLength) {\n      currentChar = StringPrototypeCharCodeAt(s, ++index);\n      hexHigh = unhexTable[currentChar];\n      if (!(hexHigh >= 0)) {\n        out[outIndex++] = 37; // '%'\n        continue;\n      } else {\n        nextChar = StringPrototypeCharCodeAt(s, ++index);\n        hexLow = unhexTable[nextChar];\n        if (!(hexLow >= 0)) {\n          out[outIndex++] = 37; // '%'\n          index--;\n        } else {\n          hasHex = true;\n          currentChar = hexHigh * 16 + hexLow;\n        }\n      }\n    }\n    out[outIndex++] = currentChar;\n    index++;\n  }\n  return hasHex ? out.slice(0, outIndex) : out;\n}\n\n/**\n * @param {string} s\n * @param {boolean} decodeSpaces\n * @returns {string}\n */\nfunction qsUnescape(s, decodeSpaces) {\n  try {\n    return decodeURIComponent(s);\n  } catch {\n    return QueryString.unescapeBuffer(s, decodeSpaces).toString();\n  }\n}\n\n\n// These characters do not need escaping when generating query strings:\n// ! - . _ ~\n// ' ( ) *\n// digits\n// alpha (uppercase)\n// alpha (lowercase)\nconst noEscape = new Int8Array([\n  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15\n  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31\n  0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 32 - 47\n  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63\n  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64 - 79\n  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 80 - 95\n  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96 - 111\n  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0,  // 112 - 127\n]);\n\n/**\n * QueryString.escape() replaces encodeURIComponent()\n * @see https://www.ecma-international.org/ecma-262/5.1/#sec-15.1.3.4\n * @param {any} str\n * @returns {string}\n */\nfunction qsEscape(str) {\n  if (typeof str !== 'string') {\n    if (typeof str === 'object')\n      str = String(str);\n    else\n      str += '';\n  }\n\n  return encodeStr(str, noEscape, hexTable);\n}\n\n/**\n * @param {string | number | bigint | boolean | symbol | undefined | null} v\n * @returns {string}\n */\nfunction stringifyPrimitive(v) {\n  if (typeof v === 'string')\n    return v;\n  if (typeof v === 'number' && NumberIsFinite(v))\n    return '' + v;\n  if (typeof v === 'bigint')\n    return '' + v;\n  if (typeof v === 'boolean')\n    return v ? 'true' : 'false';\n  return '';\n}\n\n/**\n * @param {string | number | bigint | boolean} v\n * @param {(v: string) => string} encode\n * @returns {string}\n */\nfunction encodeStringified(v, encode) {\n  if (typeof v === 'string')\n    return (v.length ? encode(v) : '');\n  if (typeof v === 'number' && NumberIsFinite(v)) {\n    // Values >= 1e21 automatically switch to scientific notation which requires\n    // escaping due to the inclusion of a '+' in the output\n    return (MathAbs(v) < 1e21 ? '' + v : encode('' + v));\n  }\n  if (typeof v === 'bigint')\n    return '' + v;\n  if (typeof v === 'boolean')\n    return v ? 'true' : 'false';\n  return '';\n}\n\n/**\n * @param {string | number | boolean | null} v\n * @param {(v: string) => string} encode\n * @returns {string}\n */\nfunction encodeStringifiedCustom(v, encode) {\n  return encode(stringifyPrimitive(v));\n}\n\n/**\n * @param {Record<string, string | number | boolean\n * | ReadonlyArray<string | number | boolean> | null>} obj\n * @param {string} [sep]\n * @param {string} [eq]\n * @param {{ encodeURIComponent?: (v: string) => string }} [options]\n * @returns {string}\n */\nfunction stringify(obj, sep, eq, options) {\n  sep ||= '&';\n  eq ||= '=';\n\n  let encode = QueryString.escape;\n  if (options && typeof options.encodeURIComponent === 'function') {\n    encode = options.encodeURIComponent;\n  }\n  const convert =\n    (encode === qsEscape ? encodeStringified : encodeStringifiedCustom);\n\n  if (obj !== null && typeof obj === 'object') {\n    const keys = ObjectKeys(obj);\n    const len = keys.length;\n    let fields = '';\n    for (let i = 0; i < len; ++i) {\n      const k = keys[i];\n      const v = obj[k];\n      let ks = convert(k, encode);\n      ks += eq;\n\n      if (ArrayIsArray(v)) {\n        const vlen = v.length;\n        if (vlen === 0) continue;\n        if (fields)\n          fields += sep;\n        for (let j = 0; j < vlen; ++j) {\n          if (j)\n            fields += sep;\n          fields += ks;\n          fields += convert(v[j], encode);\n        }\n      } else {\n        if (fields)\n          fields += sep;\n        fields += ks;\n        fields += convert(v, encode);\n      }\n    }\n    return fields;\n  }\n  return '';\n}\n\n/**\n * @param {string} str\n * @returns {number[]}\n */\nfunction charCodes(str) {\n  if (str.length === 0) return [];\n  if (str.length === 1) return [StringPrototypeCharCodeAt(str, 0)];\n  const ret = new Array(str.length);\n  for (let i = 0; i < str.length; ++i)\n    ret[i] = StringPrototypeCharCodeAt(str, i);\n  return ret;\n}\nconst defSepCodes = [38]; // &\nconst defEqCodes = [61]; // =\n\nfunction addKeyVal(obj, key, value, keyEncoded, valEncoded, decode) {\n  if (key.length > 0 && keyEncoded)\n    key = decodeStr(key, decode);\n  if (value.length > 0 && valEncoded)\n    value = decodeStr(value, decode);\n\n  if (obj[key] === undefined) {\n    obj[key] = value;\n  } else {\n    const curValue = obj[key];\n    // A simple Array-specific property check is enough here to\n    // distinguish from a string value and is faster and still safe\n    // since we are generating all of the values being assigned.\n    if (curValue.pop)\n      curValue[curValue.length] = value;\n    else\n      obj[key] = [curValue, value];\n  }\n}\n\n/**\n * Parse a key/val string.\n * @param {string} qs\n * @param {string} sep\n * @param {string} eq\n * @param {{\n *   maxKeys?: number;\n *   decodeURIComponent?(v: string): string;\n *   }} [options]\n * @returns {Record<string, string | string[]>}\n */\nfunction parse(qs, sep, eq, options) {\n  const obj = { __proto__: null };\n\n  if (typeof qs !== 'string' || qs.length === 0) {\n    return obj;\n  }\n\n  const sepCodes = (!sep ? defSepCodes : charCodes(String(sep)));\n  const eqCodes = (!eq ? defEqCodes : charCodes(String(eq)));\n  const sepLen = sepCodes.length;\n  const eqLen = eqCodes.length;\n\n  let pairs = 1000;\n  if (options && typeof options.maxKeys === 'number') {\n    // -1 is used in place of a value like Infinity for meaning\n    // \"unlimited pairs\" because of additional checks V8 (at least as of v5.4)\n    // has to do when using variables that contain values like Infinity. Since\n    // `pairs` is always decremented and checked explicitly for 0, -1 works\n    // effectively the same as Infinity, while providing a significant\n    // performance boost.\n    pairs = (options.maxKeys > 0 ? options.maxKeys : -1);\n  }\n\n  let decode = QueryString.unescape;\n  if (options && typeof options.decodeURIComponent === 'function') {\n    decode = options.decodeURIComponent;\n  }\n  const customDecode = (decode !== qsUnescape);\n\n  let lastPos = 0;\n  let sepIdx = 0;\n  let eqIdx = 0;\n  let key = '';\n  let value = '';\n  let keyEncoded = customDecode;\n  let valEncoded = customDecode;\n  const plusChar = (customDecode ? '%20' : ' ');\n  let encodeCheck = 0;\n  for (let i = 0; i < qs.length; ++i) {\n    const code = StringPrototypeCharCodeAt(qs, i);\n\n    // Try matching key/value pair separator (e.g. '&')\n    if (code === sepCodes[sepIdx]) {\n      if (++sepIdx === sepLen) {\n        // Key/value pair separator match!\n        const end = i - sepIdx + 1;\n        if (eqIdx < eqLen) {\n          // We didn't find the (entire) key/value separator\n          if (lastPos < end) {\n            // Treat the substring as part of the key instead of the value\n            key += StringPrototypeSlice(qs, lastPos, end);\n          } else if (key.length === 0) {\n            // We saw an empty substring between separators\n            if (--pairs === 0)\n              return obj;\n            lastPos = i + 1;\n            sepIdx = eqIdx = 0;\n            continue;\n          }\n        } else if (lastPos < end) {\n          value += StringPrototypeSlice(qs, lastPos, end);\n        }\n\n        addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);\n\n        if (--pairs === 0)\n          return obj;\n        keyEncoded = valEncoded = customDecode;\n        key = value = '';\n        encodeCheck = 0;\n        lastPos = i + 1;\n        sepIdx = eqIdx = 0;\n      }\n    } else {\n      sepIdx = 0;\n      // Try matching key/value separator (e.g. '=') if we haven't already\n      if (eqIdx < eqLen) {\n        if (code === eqCodes[eqIdx]) {\n          if (++eqIdx === eqLen) {\n            // Key/value separator match!\n            const end = i - eqIdx + 1;\n            if (lastPos < end)\n              key += StringPrototypeSlice(qs, lastPos, end);\n            encodeCheck = 0;\n            lastPos = i + 1;\n          }\n          continue;\n        } else {\n          eqIdx = 0;\n          if (!keyEncoded) {\n            // Try to match an (valid) encoded byte once to minimize unnecessary\n            // calls to string decoding functions\n            if (code === 37/* % */) {\n              encodeCheck = 1;\n              continue;\n            } else if (encodeCheck > 0) {\n              if (isHexTable[code] === 1) {\n                if (++encodeCheck === 3)\n                  keyEncoded = true;\n                continue;\n              } else {\n                encodeCheck = 0;\n              }\n            }\n          }\n        }\n        if (code === 43/* + */) {\n          if (lastPos < i)\n            key += StringPrototypeSlice(qs, lastPos, i);\n          key += plusChar;\n          lastPos = i + 1;\n          continue;\n        }\n      }\n      if (code === 43/* + */) {\n        if (lastPos < i)\n          value += StringPrototypeSlice(qs, lastPos, i);\n        value += plusChar;\n        lastPos = i + 1;\n      } else if (!valEncoded) {\n        // Try to match an (valid) encoded byte (once) to minimize unnecessary\n        // calls to string decoding functions\n        if (code === 37/* % */) {\n          encodeCheck = 1;\n        } else if (encodeCheck > 0) {\n          if (isHexTable[code] === 1) {\n            if (++encodeCheck === 3)\n              valEncoded = true;\n          } else {\n            encodeCheck = 0;\n          }\n        }\n      }\n    }\n  }\n\n  // Deal with any leftover key or value data\n  if (lastPos < qs.length) {\n    if (eqIdx < eqLen)\n      key += StringPrototypeSlice(qs, lastPos);\n    else if (sepIdx < sepLen)\n      value += StringPrototypeSlice(qs, lastPos);\n  } else if (eqIdx === 0 && key.length === 0) {\n    // We ended on an empty substring\n    return obj;\n  }\n\n  addKeyVal(obj, key, value, keyEncoded, valEncoded, decode);\n\n  return obj;\n}\n\n\n/**\n * V8 does not optimize functions with try-catch blocks, so we isolate them here\n * to minimize the damage (Note: no longer true as of V8 5.4 -- but still will\n * not be inlined).\n * @param {string} s\n * @param {(v: string) => string} decoder\n * @returns {string}\n */\nfunction decodeStr(s, decoder) {\n  try {\n    return decoder(s);\n  } catch {\n    return QueryString.unescape(s, true);\n  }\n}\n";
 /* END generated: node-querystring */
 /* BEGIN generated: wasi (tools/gen-wasi.mjs - do not edit) */
-const NODE_WASI_SOURCE = "'use strict';\n// Beownir WASI host: the WASI class from Node's `wasi` module (preview1), implemented on the\n// runtime's own file system and virtual loopback network. Every system call is plain JavaScript,\n// so each one can be tested. Only unsupported process-level calls return ENOSYS.\nconst { Buffer } = require('buffer');\nconst process = require('process');\nconst fs = require('fs');\nconst nodePath = require('path');\nconst crypto = require('crypto');\n\nlet netModule = null;\nfunction getNet() {\n  if (!netModule) netModule = require('net');\n  return netModule;\n}\n\nconst ERRNO = {\n  SUCCESS: 0,\n  ACCES: 2,\n  ADDRINUSE: 3,\n  ADDRNOTAVAIL: 4,\n  AFNOSUPPORT: 5,\n  AGAIN: 6,\n  BADF: 8,\n  CONNABORTED: 13,\n  CONNREFUSED: 14,\n  CONNRESET: 15,\n  EXIST: 20,\n  INVAL: 28,\n  IO: 29,\n  ISCONN: 30,\n  ISDIR: 31,\n  NOBUFS: 42,\n  NOENT: 44,\n  NOSYS: 52,\n  NOTCONN: 53,\n  NOTDIR: 54,\n  NOTEMPTY: 55,\n  NOTSOCK: 57,\n  NOTSUP: 58,\n  PIPE: 64,\n  TIMEDOUT: 73,\n  NOTCAPABLE: 76,\n};\nconst FILETYPE = { UNKNOWN: 0, DIRECTORY: 3, REGULAR_FILE: 4, SOCKET_DGRAM: 5, SOCKET_STREAM: 6, SYMBOLIC_LINK: 7 };\nconst OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 };\nconst FDFLAGS = { APPEND: 1, DSYNC: 2, NONBLOCK: 4, RSYNC: 8, SYNC: 16 };\nconst FSTFLAGS = { ATIM: 1, ATIM_NOW: 2, MTIM: 4, MTIM_NOW: 8 };\nconst SOCK_RECV_PEEK = 1;\nconst SOCK_RECV_WAITALL = 2;\nconst SDFLAGS = { RD: 1, WR: 2 };\nconst WHENCE = { SET: 0, CUR: 1, END: 2 };\nconst ALL_RIGHTS = (1n << 64n) - 1n;\nconst ERRNO_BY_CODE = {\n  EACCES: ERRNO.ACCES,\n  EADDRINUSE: ERRNO.ADDRINUSE,\n  EADDRNOTAVAIL: ERRNO.ADDRNOTAVAIL,\n  EAFNOSUPPORT: ERRNO.AFNOSUPPORT,\n  EAGAIN: ERRNO.AGAIN,\n  EWOULDBLOCK: ERRNO.AGAIN,\n  EBADF: ERRNO.BADF,\n  ECONNABORTED: ERRNO.CONNABORTED,\n  ECONNREFUSED: ERRNO.CONNREFUSED,\n  ECONNRESET: ERRNO.CONNRESET,\n  EEXIST: ERRNO.EXIST,\n  EINVAL: ERRNO.INVAL,\n  EISCONN: ERRNO.ISCONN,\n  EISDIR: ERRNO.ISDIR,\n  ENOENT: ERRNO.NOENT,\n  ENOTCONN: ERRNO.NOTCONN,\n  ENOTDIR: ERRNO.NOTDIR,\n  ENOTEMPTY: ERRNO.NOTEMPTY,\n  ENOTSOCK: ERRNO.NOTSOCK,\n  ENOTSUP: ERRNO.NOTSUP,\n  EOPNOTSUPP: ERRNO.NOTSUP,\n  EPIPE: ERRNO.PIPE,\n  ETIMEDOUT: ERRNO.TIMEDOUT,\n  ENOTCAPABLE: ERRNO.NOTCAPABLE,\n  EPERM: ERRNO.NOTCAPABLE,\n};\nconst UNSUPPORTED = ['proc_raise', 'fd_readdir_cookie'];\n\nfunction normalizeLoopbackHost(host) {\n  const value = host === undefined || host === null || host === '' ? '127.0.0.1' : String(host).trim().toLowerCase();\n  if (value === '127.0.0.1' || value === 'localhost' || value === '::1') return value;\n  throw Object.assign(\n    new Error('WASI sockets are restricted to virtual loopback hosts (127.0.0.1, localhost, ::1); refused: ' + host),\n    { code: 'ENOTCAPABLE' },\n  );\n}\n\n// Errors have the same codes and messages as Node's WASI class, so code that handles them works unchanged.\nfunction nodeError(code, message) {\n  const error = new TypeError(message);\n  error.code = code;\n  return error;\n}\nfunction describe(value) {\n  if (value === undefined) return 'undefined';\n  if (value === null) return 'null';\n  return typeof value === 'string' ? `'${value}'` : String(value);\n}\nfunction invalidType(name, type, value) {\n  return nodeError('ERR_INVALID_ARG_TYPE', `The \"${name}\" property must be of type ${type}. Received ${describe(value)}`);\n}\n\n// Thrown by proc_exit. start() turns it into an exit code instead of unwinding the host.\nclass WASIExit extends Error {\n  constructor(code) { super('WASI process exited with code ' + code); this.name = 'WASIExit'; this.code = code; }\n}\n\nfunction errnoFor(error) {\n  if (error instanceof WASIExit) throw error;\n  return ERRNO_BY_CODE[error && error.code] || ERRNO.IO;\n}\n\nfunction makeSocketEntry(opts = {}) {\n  return {\n    kind: 'socket',\n    listening: !!opts.listening,\n    connected: !!opts.connected,\n    fdFlags: opts.fdFlags ? (opts.fdFlags & FDFLAGS.NONBLOCK) : 0,\n    shutRd: false,\n    shutWr: false,\n    eof: false,\n    peerClosed: false,\n    closed: false,\n    recvChunks: [],\n    acceptQueue: [],\n    netSocket: opts.netSocket || null,\n    netServer: opts.netServer || null,\n    peerEntry: opts.peerEntry || null,\n    localAddress: opts.localAddress || '127.0.0.1',\n    localPort: opts.localPort || 0,\n    remoteAddress: opts.remoteAddress || '127.0.0.1',\n    remotePort: opts.remotePort || 0,\n  };\n}\n\nfunction attachNetSocket(netSock, entry) {\n  entry.netSocket = netSock;\n  entry.connected = true;\n  entry.localAddress = netSock.localAddress || entry.localAddress || '127.0.0.1';\n  entry.localPort = netSock.localPort || entry.localPort || 0;\n  entry.remoteAddress = netSock.remoteAddress || entry.remoteAddress || '127.0.0.1';\n  entry.remotePort = netSock.remotePort || entry.remotePort || 0;\n  netSock.on('data', chunk => {\n    if (!entry.shutRd && !entry.closed) entry.recvChunks.push(Buffer.from(chunk));\n  });\n  netSock.on('end', () => { entry.eof = true; });\n  netSock.on('close', () => { entry.eof = true; entry.peerClosed = true; });\n  netSock.on('error', () => { entry.eof = true; entry.peerClosed = true; });\n}\n\nclass WASI {\n  constructor(options) {\n    if (options === undefined || options === null || typeof options !== 'object') {\n      throw nodeError('ERR_INVALID_ARG_TYPE', `The \"options\" argument must be of type object. Received ${describe(options)}`);\n    }\n    if (typeof options.version !== 'string') throw invalidType('options.version', 'string', options.version);\n    if (options.version !== 'preview1' && options.version !== 'unstable') {\n      throw nodeError('ERR_INVALID_ARG_VALUE', `The property 'options.version' unsupported WASI version. Received '${options.version}'`);\n    }\n    this._moduleName = options.version === 'unstable' ? 'wasi_unstable' : 'wasi_snapshot_preview1';\n    this._args = (options.args || []).map(String);\n    this._env = Object.entries(options.env || {}).map(([key, value]) => key + '=' + value);\n    this._stdout = typeof options.stdout === 'function' ? options.stdout : null;\n    this._stderr = typeof options.stderr === 'function' ? options.stderr : null;\n    this._stdinBuf = options.stdin !== undefined && options.stdin !== null\n      ? (Buffer.isBuffer(options.stdin) ? options.stdin : Buffer.from(options.stdin))\n      : null;\n    this._stdinPos = 0;\n    this._memory = typeof WebAssembly !== 'undefined' && options.memory instanceof WebAssembly.Memory ? options.memory : null;\n    this._fds = new Map([\n      [0, { kind: 'stdin' }],\n      [1, { kind: 'stdout' }],\n      [2, { kind: 'stderr' }],\n    ]);\n    this._nextFd = 3;\n    for (const [guest, host] of Object.entries(options.preopens || {})) {\n      this._fds.set(this._nextFd++, { kind: 'dir', host: nodePath.resolve(host), preopen: guest });\n    }\n    if (Array.isArray(options.sockets)) {\n      for (const spec of options.sockets) {\n        if (!spec) continue;\n        const entry = makeSocketEntry({\n          listening: !!spec.listening,\n          connected: !!spec.connected || !!spec.socket,\n          fdFlags: spec.fdFlags || 0,\n        });\n        if (spec.socket) attachNetSocket(spec.socket, entry);\n        this._fds.set(this._nextFd++, entry);\n      }\n    }\n    this._imports = this._buildImports();\n    this.wasiImport = this._imports;\n  }\n\n  getImportObject() {\n    return { [this._moduleName]: this._imports };\n  }\n\n  // Open a virtual-loopback listening socket fd on (host, port) inside the WASI descriptor table.\n  // Restricted strictly to loopback addresses (127.0.0.1, localhost, ::1).\n  openListener(options = {}) {\n    const host = normalizeLoopbackHost(options.host);\n    const requestedPort = options.port === undefined ? 0 : Number(options.port);\n    if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {\n      throw Object.assign(new RangeError('Invalid loopback port: ' + options.port), { code: 'EINVAL' });\n    }\n    const net = getNet();\n    const entry = makeSocketEntry({ listening: true, localAddress: host, fdFlags: options.fdFlags || 0 });\n    const fd = this._allocFd(entry);\n    return new Promise((resolve, reject) => {\n      const server = net.createServer(clientSock => {\n        if (entry.closed) {\n          try { clientSock.destroy(); } catch {}\n          return;\n        }\n        // Buffer incoming bytes immediately so nothing is lost between TCP accept and sock_accept.\n        const earlyChunks = [];\n        const state = { ended: false, closed: false };\n        const onData = chunk => earlyChunks.push(Buffer.from(chunk));\n        const onEnd = () => { state.ended = true; };\n        const onClose = () => { state.closed = true; };\n        clientSock.on('data', onData);\n        clientSock.on('end', onEnd);\n        clientSock.on('close', onClose);\n        entry.acceptQueue.push({ clientSock, earlyChunks, state, onData, onEnd, onClose });\n      });\n      entry.netServer = server;\n      const onError = err => {\n        this._fds.delete(fd);\n        reject(err);\n      };\n      server.once('error', onError);\n      server.listen(requestedPort, host, () => {\n        server.removeListener('error', onError);\n        const addr = typeof server.address === 'function' ? server.address() : null;\n        entry.localPort = addr && typeof addr === 'object' && addr.port ? addr.port : requestedPort;\n        resolve({ fd, host, port: entry.localPort, close: () => { try { callsCloseEntry(this, fd); } catch {} } });\n      });\n    });\n  }\n\n  // Connect a virtual-loopback TCP client socket fd to (host, port).\n  connectSocket(options = {}) {\n    const host = normalizeLoopbackHost(options.host);\n    const port = Number(options.port);\n    if (!Number.isInteger(port) || port < 1 || port > 65535) {\n      throw Object.assign(new RangeError('Invalid loopback port: ' + options.port), { code: 'EINVAL' });\n    }\n    const net = getNet();\n    const entry = makeSocketEntry({\n      connected: false,\n      remoteAddress: host,\n      remotePort: port,\n      fdFlags: options.fdFlags || 0,\n    });\n    const fd = this._allocFd(entry);\n    return new Promise((resolve, reject) => {\n      const sock = net.connect({ host, port });\n      attachNetSocket(sock, entry);\n      const onErr = err => {\n        this._fds.delete(fd);\n        reject(err);\n      };\n      sock.once('error', onErr);\n      sock.once('connect', () => {\n        sock.removeListener('error', onErr);\n        entry.connected = true;\n        entry.localAddress = sock.localAddress || host;\n        entry.localPort = sock.localPort || 0;\n        resolve({ fd, host, port });\n      });\n    });\n  }\n\n  // Create a synchronous bidirectional virtual-loopback socket pair [fdA, fdB].\n  openSocketPair() {\n    const a = makeSocketEntry({ connected: true });\n    const b = makeSocketEntry({ connected: true });\n    a.peerEntry = b;\n    b.peerEntry = a;\n    return [this._allocFd(a), this._allocFd(b)];\n  }\n\n  // Close all open socket fds and flush dirty files (used for clean teardown).\n  close() {\n    for (const [fd, entry] of [...this._fds.entries()]) {\n      if (fd < 3) continue;\n      if (entry.kind === 'socket') callsCloseEntry(this, fd);\n      else {\n        this._flush(entry);\n        this._fds.delete(fd);\n      }\n    }\n  }\n\n  // Runs a command module: calls _start and returns its exit code. Node requires _start here.\n  start(instance) {\n    this._memory = this._checkInstance(instance);\n    if (typeof instance.exports._start !== 'function') throw invalidType('instance.exports._start', 'function', instance.exports._start);\n    if (instance.exports._initialize !== undefined) throw invalidType('instance.exports._initialize', 'undefined', instance.exports._initialize);\n    try {\n      instance.exports._start();\n      return 0;\n    } catch (error) {\n      if (error instanceof WASIExit) return error.code;\n      throw error;\n    }\n  }\n\n  // Prepares a reactor module: calls _initialize if it exists. Node forbids _start here.\n  initialize(instance) {\n    this._memory = this._checkInstance(instance);\n    if (instance.exports._start !== undefined) throw invalidType('instance.exports._start', 'undefined', instance.exports._start);\n    if (typeof instance.exports._initialize === 'function') instance.exports._initialize();\n  }\n\n  // Execute one WASI command module as a child of the current runtime. This is\n  // an in-runtime WebAssembly task, not an operating-system process. The new\n  // WASI instance has independent descriptors and returns proc_exit to parent.\n  static async runChild(source, options = {}) {\n    if (!(source instanceof WebAssembly.Module) && !(source instanceof ArrayBuffer) && !ArrayBuffer.isView(source)) {\n      throw invalidType('source', 'WebAssembly.Module, ArrayBuffer, or typed array', source);\n    }\n    const maxOutputBytes = options.maxOutputBytes === undefined ? 1024 * 1024 : Number(options.maxOutputBytes);\n    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0 || maxOutputBytes > 32 * 1024 * 1024) {\n      throw nodeError('ERR_OUT_OF_RANGE', 'maxOutputBytes must be between 0 and 33554432');\n    }\n    const output = { stdout: [], stderr: [], bytes: 0, truncated: false };\n    const capture = stream => text => {\n      const value = String(text);\n      const bytes = Buffer.from(value);\n      const room = Math.max(0, maxOutputBytes - output.bytes);\n      const kept = bytes.subarray(0, room);\n      if (kept.length) output[stream].push(kept.toString('utf8'));\n      output.bytes += kept.length;\n      if (kept.length < bytes.length) output.truncated = true;\n    };\n    const wasi = new WASI({ ...options, stdout: capture('stdout'), stderr: capture('stderr') });\n    try {\n      const module = source instanceof WebAssembly.Module ? source : await WebAssembly.compile(source);\n      const instance = await WebAssembly.instantiate(module, wasi.getImportObject());\n      const status = wasi.start(instance);\n      return { status, stdout: output.stdout.join(''), stderr: output.stderr.join(''), outputLimitExceeded: output.truncated };\n    } finally {\n      wasi.close();\n    }\n  }\n\n  _checkInstance(instance) {\n    const exports = instance && instance.exports;\n    if (typeof exports !== 'object' || exports === null) throw invalidType('instance.exports', 'object', exports);\n    if (exports.memory instanceof WebAssembly.Memory) return exports.memory;\n    if (this._memory instanceof WebAssembly.Memory) return this._memory;\n    throw nodeError('ERR_INVALID_ARG_TYPE', `\"instance.exports.memory\" property must be a WebAssembly.Memory object. Received ${describe(exports.memory)}`);\n  }\n\n  // Memory is read through the buffer each time, because a memory that grows replaces its buffer.\n  _bytes(ptr, len) { return new Uint8Array(this._memory.buffer, ptr, len); }\n  _view() { return new DataView(this._memory.buffer); }\n  _text(ptr, len) {\n    const view = this._bytes(ptr, len);\n    return new TextDecoder().decode(typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer ? view.slice() : view);\n  }\n\n  _entry(fd, kind) {\n    const entry = this._fds.get(fd);\n    if (!entry) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n    if (kind && entry.kind !== kind) {\n      const code = entry.kind === 'dir' ? 'EISDIR' : kind === 'socket' ? 'ENOTSOCK' : 'EBADF';\n      throw Object.assign(new Error('wrong kind of fd'), { code });\n    }\n    return entry;\n  }\n\n  // Path calls read the disk, so every open file with unsaved changes is written first.\n  _flushAll() {\n    for (const entry of this._fds.values()) this._flush(entry);\n  }\n\n  _resolve(dirfd, relative) {\n    this._flushAll();\n    const dir = this._entry(dirfd, 'dir');\n    const host = nodePath.resolve(dir.host, relative);\n    const prefix = dir.host.endsWith('/') ? dir.host : dir.host + '/';\n    if (host !== dir.host && !host.startsWith(prefix)) throw Object.assign(new Error('path escapes the preopened directory'), { code: 'ENOTCAPABLE' });\n    return host;\n  }\n\n  // Reads from entry.data at `position` into the iovecs. Returns the byte count.\n  _readInto(entry, iovs, iovsLen, position) {\n    let total = 0, at = position;\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      const count = Math.max(0, Math.min(len, entry.data.length - at));\n      this._bytes(ptr, count).set(entry.data.subarray(at, at + count));\n      at += count;\n      total += count;\n      if (count < len) break;\n    }\n    return total;\n  }\n\n  // Reads from buffered socket chunks into iovecs. When peek=true, leaves recvChunks intact.\n  _readSocketChunks(entry, iovs, iovsLen, peek) {\n    let total = 0;\n    let chunkIdx = 0;\n    let chunkOff = 0;\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      let wrote = 0;\n      while (wrote < len && chunkIdx < entry.recvChunks.length) {\n        const chunk = entry.recvChunks[chunkIdx];\n        const avail = chunk.length - chunkOff;\n        if (avail <= 0) { chunkIdx++; chunkOff = 0; continue; }\n        const take = Math.min(len - wrote, avail);\n        this._bytes(ptr + wrote, take).set(chunk.subarray(chunkOff, chunkOff + take));\n        wrote += take;\n        total += take;\n        chunkOff += take;\n        if (chunkOff >= chunk.length) { chunkIdx++; chunkOff = 0; }\n      }\n      if (wrote < len) break;\n    }\n    if (!peek && total > 0) {\n      if (chunkOff > 0 && chunkIdx < entry.recvChunks.length) {\n        entry.recvChunks = [entry.recvChunks[chunkIdx].subarray(chunkOff), ...entry.recvChunks.slice(chunkIdx + 1)];\n      } else {\n        entry.recvChunks = entry.recvChunks.slice(chunkIdx);\n      }\n    }\n    return total;\n  }\n\n  _socketBufferedBytes(entry) {\n    let n = 0;\n    for (let i = 0; i < entry.recvChunks.length; i++) n += entry.recvChunks[i].length;\n    return n;\n  }\n\n  // Gathers the iovecs into one buffer.\n  _gather(iovs, iovsLen) {\n    const chunks = [];\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      chunks.push(Buffer.from(this._bytes(ptr, len)));\n    }\n    return Buffer.concat(chunks);\n  }\n\n  // Writes data into a file's buffer at `position`, growing the file with zeros if needed.\n  _writeAt(entry, data, position) {\n    const end = position + data.length;\n    const grown = Buffer.alloc(Math.max(entry.data.length, end));\n    entry.data.copy(grown, 0);\n    data.copy(grown, position);\n    entry.data = grown;\n    entry.dirty = true;\n  }\n\n  _allocFd(entry) {\n    const fd = this._nextFd++;\n    this._fds.set(fd, entry);\n    return fd;\n  }\n\n  _flush(entry) {\n    if (entry.kind === 'file' && entry.dirty) {\n      fs.writeFileSync(entry.host, entry.data);\n      entry.dirty = false;\n    }\n  }\n\n  _writeFilestat(ptr, type, size, mtimeMs) {\n    const view = this._view();\n    view.setBigUint64(ptr, 0n, true);\n    view.setBigUint64(ptr + 8, 0n, true);\n    view.setUint8(ptr + 16, type);\n    view.setBigUint64(ptr + 24, 1n, true);\n    view.setBigUint64(ptr + 32, BigInt(size), true);\n    const time = BigInt(Math.round(mtimeMs)) * 1000000n;\n    view.setBigUint64(ptr + 40, time, true);\n    view.setBigUint64(ptr + 48, time, true);\n    view.setBigUint64(ptr + 56, time, true);\n  }\n\n  _writeSockPayload(entry, data) {\n    if (entry.shutWr || entry.peerClosed) throw Object.assign(new Error('socket write after shutdown'), { code: 'EPIPE' });\n    if (entry.peerEntry) {\n      if (entry.peerEntry.shutRd || entry.peerEntry.closed) {\n        throw Object.assign(new Error('peer closed'), { code: 'EPIPE' });\n      }\n      if (data.length) entry.peerEntry.recvChunks.push(data);\n      return data.length;\n    }\n    if (!entry.netSocket || entry.netSocket.destroyed) {\n      throw Object.assign(new Error('socket closed'), { code: 'EPIPE' });\n    }\n    if (data.length) entry.netSocket.write(data);\n    return data.length;\n  }\n\n  _buildImports() {\n    const self = this;\n    const guard = fn => function (...args) {\n      try { return fn.apply(self, args); } catch (error) { return errnoFor(error); }\n    };\n    const calls = {\n      args_sizes_get(countPtr, sizePtr) {\n        const size = this._args.reduce((total, arg) => total + Buffer.byteLength(arg) + 1, 0);\n        this._view().setUint32(countPtr, this._args.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      args_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._args, argvPtr, bufPtr);\n      },\n      environ_sizes_get(countPtr, sizePtr) {\n        const size = this._env.reduce((total, item) => total + Buffer.byteLength(item) + 1, 0);\n        this._view().setUint32(countPtr, this._env.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      environ_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._env, argvPtr, bufPtr);\n      },\n      clock_res_get(id, outPtr) {\n        this._view().setBigUint64(outPtr, 1000000n, true);\n        return ERRNO.SUCCESS;\n      },\n      clock_time_get(id, precision, outPtr) {\n        this._view().setBigUint64(outPtr, BigInt(Date.now()) * 1000000n, true);\n        return ERRNO.SUCCESS;\n      },\n      random_get(ptr, len) {\n        this._bytes(ptr, len).set(crypto.randomBytes(len));\n        return ERRNO.SUCCESS;\n      },\n      sched_yield() { return ERRNO.SUCCESS; },\n      poll_oneoff(inPtr, outPtr, nsubscriptions, neventsPtr) {\n        const count = Number(nsubscriptions);\n        if (!Number.isInteger(count) || count <= 0) return ERRNO.INVAL;\n        const view = this._view();\n        const ready = [];\n        const clocks = [];\n        const nowMs = Date.now();\n        for (let i = 0; i < count; i++) {\n          const base = inPtr + i * 48;\n          const userdata = view.getBigUint64(base, true);\n          const type = view.getUint8(base + 8);\n          if (type === 0) {\n            const timeoutNs = view.getBigUint64(base + 24, true);\n            const flags = view.getUint16(base + 40, true);\n            const delayMs = (flags & 1) ? Math.max(0, Number(timeoutNs) / 1e6 - nowMs) : Math.max(0, Number(timeoutNs) / 1e6);\n            clocks.push({ userdata, type, delayMs });\n          } else if (type === 1 || type === 2) {\n            const fd = view.getInt32(base + 16, true);\n            const entry = this._fds.get(fd);\n            if (!entry) {\n              ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n, flags: 0 });\n            } else if (type === 1) {\n              if (entry.kind === 'file') {\n                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(Math.max(0, entry.data.length - entry.pos)), flags: 0 });\n              } else if (entry.kind === 'stdin') {\n                if (this._stdinBuf) {\n                  const avail = Math.max(0, this._stdinBuf.length - this._stdinPos);\n                  if (avail > 0 || count === 1) ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(avail), flags: avail === 0 ? 1 : 0 });\n                } else if (count === 1) {\n                  ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 0n, flags: 0 });\n                }\n              } else if (entry.kind === 'socket') {\n                if (entry.listening) {\n                  if (entry.acceptQueue.length > 0) {\n                    ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(entry.acceptQueue.length), flags: 0 });\n                  }\n                } else {\n                  const buffered = this._socketBufferedBytes(entry);\n                  const hangup = entry.eof || entry.shutRd || entry.peerClosed;\n                  if (buffered > 0 || hangup) {\n                    ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(buffered), flags: hangup ? 1 : 0 });\n                  }\n                }\n              } else {\n                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n, flags: 0 });\n              }\n            } else {\n              if (entry.kind === 'file' || entry.kind === 'stdout' || entry.kind === 'stderr') {\n                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 65536n, flags: 0 });\n              } else if (entry.kind === 'socket') {\n                if (entry.listening) {\n                  ready.push({ userdata, type, error: ERRNO.INVAL, nbytes: 0n, flags: 0 });\n                } else {\n                  const closedWr = entry.shutWr || entry.peerClosed;\n                  ready.push({ userdata, type, error: closedWr ? ERRNO.PIPE : ERRNO.SUCCESS, nbytes: closedWr ? 0n : 65536n, flags: closedWr ? 1 : 0 });\n                }\n              } else {\n                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n, flags: 0 });\n              }\n            }\n          } else {\n            return ERRNO.INVAL;\n          }\n        }\n        if (!ready.length && clocks.length) {\n          let minDelay = Infinity;\n          for (const c of clocks) if (c.delayMs < minDelay) minDelay = c.delayMs;\n          const waitMs = Math.max(0, Math.min(30000, Math.ceil(minDelay)));\n          if (waitMs > 0) {\n            let slept = false;\n            if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {\n              try {\n                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);\n                slept = true;\n              } catch {}\n            }\n            if (!slept) {\n              const until = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + waitMs;\n              while ((typeof performance !== 'undefined' ? performance.now() : Date.now()) < until) {}\n            }\n          }\n          for (const c of clocks) {\n            if (c.delayMs <= minDelay + 1) ready.push({ userdata: c.userdata, type: 0, error: ERRNO.SUCCESS, nbytes: 0n, flags: 0 });\n          }\n        }\n        const outView = this._view();\n        for (let i = 0; i < ready.length; i++) {\n          const ev = ready[i];\n          const ptr = outPtr + i * 32;\n          this._bytes(ptr, 32).fill(0);\n          outView.setBigUint64(ptr, ev.userdata, true);\n          outView.setUint16(ptr + 8, ev.error, true);\n          outView.setUint8(ptr + 10, ev.type);\n          if (ev.type === 1 || ev.type === 2) {\n            outView.setBigUint64(ptr + 16, ev.nbytes, true);\n            if (ev.flags) outView.setUint16(ptr + 24, ev.flags, true);\n          }\n        }\n        outView.setUint32(neventsPtr, ready.length, true);\n        return ERRNO.SUCCESS;\n      },\n      proc_exit(code) { throw new WASIExit(code); },\n      fd_write(fd, iovs, iovsLen, writtenPtr) {\n        const entry = this._entry(fd);\n        const data = this._gather(iovs, iovsLen);\n        if (entry.kind === 'stdout') (this._stdout || (text => process.stdout.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'stderr') (this._stderr || (text => process.stderr.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'file') {\n          this._writeAt(entry, data, entry.pos);\n          entry.pos += data.length;\n        } else if (entry.kind === 'socket') {\n          if (entry.listening || !entry.connected) throw Object.assign(new Error('socket not connected'), { code: 'ENOTCONN' });\n          this._writeSockPayload(entry, data);\n        } else throw Object.assign(new Error('fd is not writable'), { code: entry.kind === 'dir' ? 'EISDIR' : 'EBADF' });\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_read(fd, iovs, iovsLen, readPtr) {\n        const entry = this._entry(fd);\n        let total = 0;\n        if (entry.kind === 'file') {\n          total = this._readInto(entry, iovs, iovsLen, entry.pos);\n          entry.pos += total;\n        } else if (entry.kind === 'stdin') {\n          if (this._stdinBuf) {\n            total = this._readInto({ data: this._stdinBuf }, iovs, iovsLen, this._stdinPos);\n            this._stdinPos += total;\n          }\n        } else if (entry.kind === 'socket') {\n          if (entry.listening || !entry.connected) throw Object.assign(new Error('socket not connected'), { code: 'ENOTCONN' });\n          if (!entry.shutRd) {\n            const avail = this._socketBufferedBytes(entry);\n            if (avail === 0 && !(entry.eof || entry.peerClosed)) return ERRNO.AGAIN;\n            total = this._readSocketChunks(entry, iovs, iovsLen, false);\n          }\n        } else if (entry.kind === 'dir') throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        else throw Object.assign(new Error('fd is not readable'), { code: 'EBADF' });\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_seek(fd, offset, whence, newPtr) {\n        const entry = this._entry(fd, 'file');\n        const base = whence === WHENCE.SET ? 0 : whence === WHENCE.CUR ? entry.pos : whence === WHENCE.END ? entry.data.length : -1;\n        if (base < 0) return ERRNO.INVAL;\n        const position = base + Number(offset);\n        if (position < 0) return ERRNO.INVAL;\n        entry.pos = position;\n        this._view().setBigUint64(newPtr, BigInt(position), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pread(fd, iovs, iovsLen, offset, readPtr) {\n        const entry = this._entry(fd, 'file');\n        const total = this._readInto(entry, iovs, iovsLen, Number(offset));\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pwrite(fd, iovs, iovsLen, offset, writtenPtr) {\n        const entry = this._entry(fd, 'file');\n        const data = this._gather(iovs, iovsLen);\n        this._writeAt(entry, data, Number(offset));\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_set_size(fd, size) {\n        const entry = this._entry(fd, 'file');\n        const length = Number(size);\n        const resized = Buffer.alloc(length);\n        entry.data.copy(resized, 0, 0, Math.min(length, entry.data.length));\n        entry.data = resized;\n        entry.dirty = true;\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_set_times(fd, atim, mtim, fstFlags) {\n        const entry = this._entry(fd);\n        if (entry.kind !== 'file' && entry.kind !== 'dir') return ERRNO.INVAL;\n        this._flush(entry);\n        const st = fs.statSync(entry.host);\n        const now = Date.now();\n        const atime = (fstFlags & FSTFLAGS.ATIM_NOW) ? now : (fstFlags & FSTFLAGS.ATIM) ? Number(atim) / 1e6 : st.atimeMs;\n        const mtime = (fstFlags & FSTFLAGS.MTIM_NOW) ? now : (fstFlags & FSTFLAGS.MTIM) ? Number(mtim) / 1e6 : st.mtimeMs;\n        fs.utimesSync(entry.host, new Date(atime), new Date(mtime));\n        return ERRNO.SUCCESS;\n      },\n      fd_allocate(fd, offset, length) {\n        const entry = this._entry(fd, 'file');\n        const end = Number(offset) + Number(length);\n        if (end > entry.data.length) {\n          const grown = Buffer.alloc(end);\n          entry.data.copy(grown, 0);\n          entry.data = grown;\n          entry.dirty = true;\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_advise() { return ERRNO.SUCCESS; },\n      fd_renumber(from, to) {\n        const entry = this._entry(from);\n        if (from < 3 || to < 0) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n        if (from === to) return ERRNO.SUCCESS;\n        if (this._fds.has(to)) {\n          const prev = this._fds.get(to);\n          if (prev.kind === 'socket') callsCloseEntry(this, to);\n          else this._flush(prev);\n        }\n        this._fds.delete(from);\n        this._fds.set(to, entry);\n        return ERRNO.SUCCESS;\n      },\n      fd_tell(fd, outPtr) {\n        this._view().setBigUint64(outPtr, BigInt(this._entry(fd, 'file').pos), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_close(fd) {\n        if (fd < 3) throw Object.assign(new Error('standard streams stay open'), { code: 'EBADF' });\n        const entry = this._entry(fd);\n        if (entry.kind === 'socket') {\n          callsCloseEntry(this, fd);\n          return ERRNO.SUCCESS;\n        }\n        this._flush(entry);\n        this._fds.delete(fd);\n        return ERRNO.SUCCESS;\n      },\n      fd_sync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_datasync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        const type = entry.kind === 'dir'\n          ? FILETYPE.DIRECTORY\n          : entry.kind === 'file'\n            ? FILETYPE.REGULAR_FILE\n            : entry.kind === 'socket'\n              ? FILETYPE.SOCKET_STREAM\n              : FILETYPE.UNKNOWN;\n        const view = this._view();\n        view.setUint8(statPtr, type);\n        view.setUint16(statPtr + 2, entry.kind === 'socket' ? (entry.fdFlags || 0) : 0, true);\n        view.setBigUint64(statPtr + 8, ALL_RIGHTS, true);\n        view.setBigUint64(statPtr + 16, ALL_RIGHTS, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_set_flags(fd, flags) {\n        const entry = this._entry(fd);\n        if (entry.kind === 'socket') entry.fdFlags = flags & FDFLAGS.NONBLOCK;\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        if (entry.kind === 'file') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.REGULAR_FILE, entry.data.length, st.mtimeMs);\n        } else if (entry.kind === 'dir') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.DIRECTORY, 0, st.mtimeMs);\n        } else if (entry.kind === 'socket') {\n          this._writeFilestat(statPtr, FILETYPE.SOCKET_STREAM, this._socketBufferedBytes(entry), Date.now());\n        } else {\n          this._writeFilestat(statPtr, FILETYPE.UNKNOWN, 0, Date.now());\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_get(fd, ptr) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._view().setUint8(ptr, 0);\n        this._view().setUint32(ptr + 4, Buffer.byteLength(entry.preopen), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_dir_name(fd, pathPtr, pathLen) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._bytes(pathPtr, pathLen).set(Buffer.from(entry.preopen).subarray(0, pathLen));\n        return ERRNO.SUCCESS;\n      },\n      fd_readdir(fd, bufPtr, bufLen, cookie, usedPtr) {\n        const entry = this._entry(fd, 'dir');\n        const names = fs.readdirSync(entry.host);\n        let used = 0;\n        for (let index = Number(cookie); index < names.length; index++) {\n          const name = Buffer.from(names[index]);\n          const childPath = nodePath.join(entry.host, names[index]);\n          const child = typeof fs.lstatSync === 'function' ? fs.lstatSync(childPath) : fs.statSync(childPath);\n          const childType = typeof child.isSymbolicLink === 'function' && child.isSymbolicLink()\n            ? FILETYPE.SYMBOLIC_LINK\n            : child.isDirectory()\n              ? FILETYPE.DIRECTORY\n              : FILETYPE.REGULAR_FILE;\n          const header = Buffer.alloc(24);\n          header.writeBigUInt64LE(BigInt(index + 1), 0);\n          header.writeBigUInt64LE(0n, 8);\n          header.writeUInt32LE(name.length, 16);\n          header.writeUInt8(childType, 20);\n          const record = Buffer.concat([header, name]);\n          const room = Math.max(0, Number(bufLen) - used);\n          this._bytes(bufPtr + used, Math.min(room, record.length)).set(record.subarray(0, Math.min(room, record.length)));\n          used += Math.min(room, record.length);\n          if (room < record.length) break;\n        }\n        this._view().setUint32(usedPtr, used, true);\n        return ERRNO.SUCCESS;\n      },\n      path_open(dirfd, dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, fdflags, fdPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        let exists = fs.existsSync(host);\n        if (!exists && typeof fs.lstatSync === 'function') {\n          try { fs.lstatSync(host); exists = true; } catch {}\n        }\n        if (exists && (oflags & OFLAGS.EXCL)) throw Object.assign(new Error('file exists'), { code: 'EEXIST' });\n        if (!exists) {\n          if (!(oflags & OFLAGS.CREAT)) throw Object.assign(new Error('no such file'), { code: 'ENOENT' });\n          fs.writeFileSync(host, '');\n        }\n        const st = fs.statSync(host);\n        let fd;\n        if (st.isDirectory()) {\n          if (oflags & OFLAGS.TRUNC) throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n          fd = this._allocFd({ kind: 'dir', host });\n        } else {\n          if (oflags & OFLAGS.DIRECTORY) throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });\n          const truncate = (oflags & OFLAGS.TRUNC) !== 0;\n          const data = truncate ? Buffer.alloc(0) : Buffer.from(fs.readFileSync(host));\n          fd = this._allocFd({ kind: 'file', host, data, pos: 0, dirty: truncate });\n        }\n        this._view().setUint32(fdPtr, fd, true);\n        return ERRNO.SUCCESS;\n      },\n      path_filestat_get(dirfd, flags, pathPtr, pathLen, statPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const st = (flags & 1) === 0 && typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);\n        const type = typeof st.isSymbolicLink === 'function' && st.isSymbolicLink()\n          ? FILETYPE.SYMBOLIC_LINK\n          : st.isDirectory()\n            ? FILETYPE.DIRECTORY\n            : FILETYPE.REGULAR_FILE;\n        this._writeFilestat(statPtr, type, st.size, st.mtimeMs);\n        return ERRNO.SUCCESS;\n      },\n      path_filestat_set_times(dirfd, flags, pathPtr, pathLen, atim, mtim, fstFlags) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const follow = (flags & 1) !== 0;\n        const st = !follow && typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);\n        const now = Date.now();\n        const atime = (fstFlags & FSTFLAGS.ATIM_NOW) ? now : (fstFlags & FSTFLAGS.ATIM) ? Number(atim) / 1e6 : st.atimeMs;\n        const mtime = (fstFlags & FSTFLAGS.MTIM_NOW) ? now : (fstFlags & FSTFLAGS.MTIM) ? Number(mtim) / 1e6 : st.mtimeMs;\n        if (!follow && typeof fs.lutimesSync === 'function') fs.lutimesSync(host, new Date(atime), new Date(mtime));\n        else fs.utimesSync(host, new Date(atime), new Date(mtime));\n        return ERRNO.SUCCESS;\n      },\n      path_create_directory(dirfd, pathPtr, pathLen) {\n        fs.mkdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_remove_directory(dirfd, pathPtr, pathLen) {\n        fs.rmdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_unlink_file(dirfd, pathPtr, pathLen) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const st = typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);\n        if (st.isDirectory()) throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        fs.unlinkSync(host);\n        return ERRNO.SUCCESS;\n      },\n      path_rename(oldDirfd, oldPtr, oldLen, newDirfd, newPtr, newLen) {\n        fs.renameSync(this._resolve(oldDirfd, this._text(oldPtr, oldLen)), this._resolve(newDirfd, this._text(newPtr, newLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_link(oldDirfd, oldFlags, oldPtr, oldLen, newDirfd, newPtr, newLen) {\n        const oldHost = this._resolve(oldDirfd, this._text(oldPtr, oldLen));\n        const newHost = this._resolve(newDirfd, this._text(newPtr, newLen));\n        fs.linkSync(oldHost, newHost);\n        return ERRNO.SUCCESS;\n      },\n      path_symlink(oldPtr, oldLen, dirfd, newPtr, newLen) {\n        const target = this._text(oldPtr, oldLen);\n        if (nodePath.isAbsolute(target)) throw Object.assign(new Error('symlink target escapes preopen'), { code: 'ENOTCAPABLE' });\n        const linkHost = this._resolve(dirfd, this._text(newPtr, newLen));\n        const dir = this._entry(dirfd, 'dir');\n        const resolvedTarget = nodePath.resolve(nodePath.dirname(linkHost), target);\n        const prefix = dir.host.endsWith('/') ? dir.host : dir.host + '/';\n        if (resolvedTarget !== dir.host && !resolvedTarget.startsWith(prefix)) {\n          throw Object.assign(new Error('symlink target escapes preopen'), { code: 'ENOTCAPABLE' });\n        }\n        fs.symlinkSync(target, linkHost);\n        return ERRNO.SUCCESS;\n      },\n      path_readlink(dirfd, pathPtr, pathLen, bufPtr, bufLen, usedPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const target = Buffer.from(String(fs.readlinkSync(host)));\n        const count = Math.min(target.length, Number(bufLen));\n        if (count > 0) this._bytes(bufPtr, count).set(target.subarray(0, count));\n        this._view().setUint32(usedPtr, count, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_accept(fd, fdFlags, outFdPtr) {\n        const entry = this._entry(fd, 'socket');\n        if (!entry.listening) return ERRNO.INVAL;\n        if (!outFdPtr) return ERRNO.INVAL;\n        if (!entry.acceptQueue.length) return ERRNO.AGAIN;\n        const accepted = entry.acceptQueue.shift();\n        const child = makeSocketEntry({\n          listening: false,\n          connected: true,\n          fdFlags: fdFlags || 0,\n        });\n        if (accepted && accepted.clientSock) {\n          const { clientSock, earlyChunks, state, onData, onEnd, onClose } = accepted;\n          clientSock.removeListener('data', onData);\n          clientSock.removeListener('end', onEnd);\n          clientSock.removeListener('close', onClose);\n          for (let i = 0; i < earlyChunks.length; i++) child.recvChunks.push(earlyChunks[i]);\n          if (state.ended) child.eof = true;\n          if (state.closed) { child.eof = true; child.peerClosed = true; }\n          attachNetSocket(clientSock, child);\n        } else if (accepted) {\n          attachNetSocket(accepted, child);\n        }\n        const childFd = this._allocFd(child);\n        this._view().setUint32(outFdPtr, childFd, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_recv(fd, riDataPtr, riDataLen, riFlags, roDataLenPtr, roFlagsPtr) {\n        const entry = this._entry(fd, 'socket');\n        if (entry.listening || !entry.connected) return ERRNO.NOTCONN;\n        if (!roDataLenPtr) return ERRNO.INVAL;\n        if ((riFlags & ~(SOCK_RECV_PEEK | SOCK_RECV_WAITALL)) !== 0) return ERRNO.NOTSUP;\n        if (entry.shutRd) {\n          this._view().setUint32(roDataLenPtr, 0, true);\n          if (roFlagsPtr) this._view().setUint32(roFlagsPtr, 0, true);\n          return ERRNO.SUCCESS;\n        }\n        const avail = this._socketBufferedBytes(entry);\n        if (avail === 0) {\n          this._view().setUint32(roDataLenPtr, 0, true);\n          if (roFlagsPtr) this._view().setUint32(roFlagsPtr, 0, true);\n          return (entry.eof || entry.peerClosed) ? ERRNO.SUCCESS : ERRNO.AGAIN;\n        }\n        const peek = (riFlags & SOCK_RECV_PEEK) !== 0;\n        const total = this._readSocketChunks(entry, riDataPtr, riDataLen, peek);\n        this._view().setUint32(roDataLenPtr, total, true);\n        if (roFlagsPtr) this._view().setUint32(roFlagsPtr, 0, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_send(fd, siDataPtr, siDataLen, siFlags, soDataLenPtr) {\n        const entry = this._entry(fd, 'socket');\n        if (entry.listening || !entry.connected) return ERRNO.NOTCONN;\n        if (siFlags !== 0) return ERRNO.NOTSUP;\n        if (!soDataLenPtr) return ERRNO.INVAL;\n        const data = this._gather(siDataPtr, siDataLen);\n        const sent = this._writeSockPayload(entry, data);\n        this._view().setUint32(soDataLenPtr, sent, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_shutdown(fd, how) {\n        const entry = this._entry(fd, 'socket');\n        if (entry.listening || !entry.connected) return ERRNO.NOTCONN;\n        if ((how & ~(SDFLAGS.RD | SDFLAGS.WR)) !== 0 || how === 0) return ERRNO.INVAL;\n        if (how & SDFLAGS.RD) {\n          entry.shutRd = true;\n          entry.recvChunks.length = 0;\n          if (entry.netSocket && typeof entry.netSocket.pause === 'function') {\n            try { entry.netSocket.pause(); } catch {}\n          }\n        }\n        if (how & SDFLAGS.WR) {\n          entry.shutWr = true;\n          if (entry.peerEntry) entry.peerEntry.eof = true;\n          if (entry.netSocket && typeof entry.netSocket.end === 'function') {\n            try { entry.netSocket.end(); } catch {}\n          }\n        }\n        return ERRNO.SUCCESS;\n      },\n    };\n    const imports = {};\n    for (const [name, fn] of Object.entries(calls)) imports[name] = guard(fn).bind(this);\n    for (const name of UNSUPPORTED) imports[name] = () => ERRNO.NOSYS;\n    return imports;\n  }\n\n  _writeStrings(items, listPtr, bufPtr) {\n    let offset = bufPtr;\n    items.forEach((item, index) => {\n      this._view().setUint32(listPtr + index * 4, offset, true);\n      const encoded = Buffer.from(item + '\\0');\n      this._bytes(offset, encoded.length).set(encoded);\n      offset += encoded.length;\n    });\n    return ERRNO.SUCCESS;\n  }\n}\n\nfunction callsCloseEntry(wasi, fd) {\n  const entry = wasi._fds.get(fd);\n  if (!entry) return;\n  entry.closed = true;\n  if (entry.peerEntry) {\n    entry.peerEntry.eof = true;\n    entry.peerEntry.peerClosed = true;\n  }\n  while (entry.acceptQueue && entry.acceptQueue.length) {\n    const accepted = entry.acceptQueue.shift();\n    const sock = accepted && accepted.clientSock ? accepted.clientSock : accepted;\n    try { if (sock && typeof sock.destroy === 'function') sock.destroy(); } catch {}\n  }\n  if (entry.netSocket && typeof entry.netSocket.destroy === 'function') {\n    try { entry.netSocket.destroy(); } catch {}\n  }\n  if (entry.netServer && typeof entry.netServer.close === 'function') {\n    try { entry.netServer.close(); } catch {}\n  }\n  wasi._fds.delete(fd);\n}\n\nmodule.exports = { WASI, WASIExit, ERRNO };\n";
+const NODE_WASI_SOURCE = "'use strict';\n// Beownir WASI host: the WASI class from Node's `wasi` module (preview1), implemented on the\n// runtime's own file system and virtual loopback network. Every system call is plain JavaScript,\n// so each one can be tested. Only unsupported process-level calls return ENOSYS.\nconst { Buffer } = require('buffer');\nconst process = require('process');\nconst fs = require('fs');\nconst nodePath = require('path');\nconst crypto = require('crypto');\n\nlet netModule = null;\nfunction getNet() {\n  if (!netModule) netModule = require('net');\n  return netModule;\n}\n\nconst ERRNO = {\n  SUCCESS: 0,\n  ACCES: 2,\n  ADDRINUSE: 3,\n  ADDRNOTAVAIL: 4,\n  AFNOSUPPORT: 5,\n  AGAIN: 6,\n  BADF: 8,\n  CONNABORTED: 13,\n  CONNREFUSED: 14,\n  CONNRESET: 15,\n  EXIST: 20,\n  INVAL: 28,\n  IO: 29,\n  ISCONN: 30,\n  ISDIR: 31,\n  NOBUFS: 42,\n  NOENT: 44,\n  NOSYS: 52,\n  NOTCONN: 53,\n  NOTDIR: 54,\n  NOTEMPTY: 55,\n  NOTSOCK: 57,\n  NOTSUP: 58,\n  PIPE: 64,\n  TIMEDOUT: 73,\n  NOTCAPABLE: 76,\n};\nconst FILETYPE = { UNKNOWN: 0, DIRECTORY: 3, REGULAR_FILE: 4, SOCKET_DGRAM: 5, SOCKET_STREAM: 6, SYMBOLIC_LINK: 7 };\nconst OFLAGS = { CREAT: 1, DIRECTORY: 2, EXCL: 4, TRUNC: 8 };\nconst FDFLAGS = { APPEND: 1, DSYNC: 2, NONBLOCK: 4, RSYNC: 8, SYNC: 16 };\nconst FSTFLAGS = { ATIM: 1, ATIM_NOW: 2, MTIM: 4, MTIM_NOW: 8 };\nconst SOCK_RECV_PEEK = 1;\nconst SOCK_RECV_WAITALL = 2;\nconst SDFLAGS = { RD: 1, WR: 2 };\nconst WHENCE = { SET: 0, CUR: 1, END: 2 };\nconst ALL_RIGHTS = (1n << 64n) - 1n;\nconst ERRNO_BY_CODE = {\n  EACCES: ERRNO.ACCES,\n  EADDRINUSE: ERRNO.ADDRINUSE,\n  EADDRNOTAVAIL: ERRNO.ADDRNOTAVAIL,\n  EAFNOSUPPORT: ERRNO.AFNOSUPPORT,\n  EAGAIN: ERRNO.AGAIN,\n  EWOULDBLOCK: ERRNO.AGAIN,\n  EBADF: ERRNO.BADF,\n  ECONNABORTED: ERRNO.CONNABORTED,\n  ECONNREFUSED: ERRNO.CONNREFUSED,\n  ECONNRESET: ERRNO.CONNRESET,\n  EEXIST: ERRNO.EXIST,\n  EINVAL: ERRNO.INVAL,\n  EISCONN: ERRNO.ISCONN,\n  EISDIR: ERRNO.ISDIR,\n  ENOENT: ERRNO.NOENT,\n  ENOTCONN: ERRNO.NOTCONN,\n  ENOTDIR: ERRNO.NOTDIR,\n  ENOTEMPTY: ERRNO.NOTEMPTY,\n  ENOTSOCK: ERRNO.NOTSOCK,\n  ENOTSUP: ERRNO.NOTSUP,\n  EOPNOTSUPP: ERRNO.NOTSUP,\n  EPIPE: ERRNO.PIPE,\n  ETIMEDOUT: ERRNO.TIMEDOUT,\n  ENOTCAPABLE: ERRNO.NOTCAPABLE,\n  EPERM: ERRNO.NOTCAPABLE,\n};\nconst UNSUPPORTED = ['proc_raise', 'fd_readdir_cookie'];\n\nfunction normalizeLoopbackHost(host) {\n  const value = host === undefined || host === null || host === '' ? '127.0.0.1' : String(host).trim().toLowerCase();\n  if (value === '127.0.0.1' || value === 'localhost' || value === '::1') return value;\n  throw Object.assign(\n    new Error('WASI sockets are restricted to virtual loopback hosts (127.0.0.1, localhost, ::1); refused: ' + host),\n    { code: 'ENOTCAPABLE' },\n  );\n}\n\n// Errors have the same codes and messages as Node's WASI class, so code that handles them works unchanged.\nfunction nodeError(code, message) {\n  const error = new TypeError(message);\n  error.code = code;\n  return error;\n}\nfunction describe(value) {\n  if (value === undefined) return 'undefined';\n  if (value === null) return 'null';\n  return typeof value === 'string' ? `'${value}'` : String(value);\n}\nfunction invalidType(name, type, value) {\n  return nodeError('ERR_INVALID_ARG_TYPE', `The \"${name}\" property must be of type ${type}. Received ${describe(value)}`);\n}\n\n// Thrown by proc_exit. start() turns it into an exit code instead of unwinding the host.\nclass WASIExit extends Error {\n  constructor(code) { super('WASI process exited with code ' + code); this.name = 'WASIExit'; this.code = code; }\n}\n\nfunction errnoFor(error) {\n  if (error instanceof WASIExit) throw error;\n  return ERRNO_BY_CODE[error && error.code] || ERRNO.IO;\n}\n\nfunction makeSocketEntry(opts = {}) {\n  return {\n    kind: 'socket',\n    listening: !!opts.listening,\n    connected: !!opts.connected,\n    fdFlags: opts.fdFlags ? (opts.fdFlags & FDFLAGS.NONBLOCK) : 0,\n    shutRd: false,\n    shutWr: false,\n    eof: false,\n    peerClosed: false,\n    closed: false,\n    recvChunks: [],\n    acceptQueue: [],\n    netSocket: opts.netSocket || null,\n    netServer: opts.netServer || null,\n    peerEntry: opts.peerEntry || null,\n    localAddress: opts.localAddress || '127.0.0.1',\n    localPort: opts.localPort || 0,\n    remoteAddress: opts.remoteAddress || '127.0.0.1',\n    remotePort: opts.remotePort || 0,\n  };\n}\n\nfunction attachNetSocket(netSock, entry) {\n  entry.netSocket = netSock;\n  entry.connected = true;\n  entry.localAddress = netSock.localAddress || entry.localAddress || '127.0.0.1';\n  entry.localPort = netSock.localPort || entry.localPort || 0;\n  entry.remoteAddress = netSock.remoteAddress || entry.remoteAddress || '127.0.0.1';\n  entry.remotePort = netSock.remotePort || entry.remotePort || 0;\n  netSock.on('data', chunk => {\n    if (!entry.shutRd && !entry.closed) entry.recvChunks.push(Buffer.from(chunk));\n  });\n  netSock.on('end', () => { entry.eof = true; });\n  netSock.on('close', () => { entry.eof = true; entry.peerClosed = true; });\n  netSock.on('error', () => { entry.eof = true; entry.peerClosed = true; });\n}\n\nclass WASI {\n  constructor(options) {\n    if (options === undefined || options === null || typeof options !== 'object') {\n      throw nodeError('ERR_INVALID_ARG_TYPE', `The \"options\" argument must be of type object. Received ${describe(options)}`);\n    }\n    if (typeof options.version !== 'string') throw invalidType('options.version', 'string', options.version);\n    if (options.version !== 'preview1' && options.version !== 'unstable') {\n      throw nodeError('ERR_INVALID_ARG_VALUE', `The property 'options.version' unsupported WASI version. Received '${options.version}'`);\n    }\n    this._moduleName = options.version === 'unstable' ? 'wasi_unstable' : 'wasi_snapshot_preview1';\n    this._args = (options.args || []).map(String);\n    this._env = Object.entries(options.env || {}).map(([key, value]) => key + '=' + value);\n    this._stdout = typeof options.stdout === 'function' ? options.stdout : null;\n    this._stderr = typeof options.stderr === 'function' ? options.stderr : null;\n    this._stdinBuf = options.stdin !== undefined && options.stdin !== null\n      ? (Buffer.isBuffer(options.stdin) ? options.stdin : Buffer.from(options.stdin))\n      : null;\n    this._stdinPos = 0;\n    this._memory = typeof WebAssembly !== 'undefined' && options.memory instanceof WebAssembly.Memory ? options.memory : null;\n    this._fds = new Map([\n      [0, { kind: 'stdin' }],\n      [1, { kind: 'stdout' }],\n      [2, { kind: 'stderr' }],\n    ]);\n    this._nextFd = 3;\n    for (const [guest, host] of Object.entries(options.preopens || {})) {\n      this._fds.set(this._nextFd++, { kind: 'dir', host: nodePath.resolve(host), preopen: guest });\n    }\n    if (Array.isArray(options.sockets)) {\n      for (const spec of options.sockets) {\n        if (!spec) continue;\n        const entry = makeSocketEntry({\n          listening: !!spec.listening,\n          connected: !!spec.connected || !!spec.socket,\n          fdFlags: spec.fdFlags || 0,\n        });\n        if (spec.socket) attachNetSocket(spec.socket, entry);\n        this._fds.set(this._nextFd++, entry);\n      }\n    }\n    this._imports = this._buildImports();\n    this.wasiImport = this._imports;\n  }\n\n  getImportObject() {\n    return { [this._moduleName]: this._imports };\n  }\n\n  // Open a virtual-loopback listening socket fd on (host, port) inside the WASI descriptor table.\n  // Restricted strictly to loopback addresses (127.0.0.1, localhost, ::1).\n  openListener(options = {}) {\n    const host = normalizeLoopbackHost(options.host);\n    const requestedPort = options.port === undefined ? 0 : Number(options.port);\n    if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {\n      throw Object.assign(new RangeError('Invalid loopback port: ' + options.port), { code: 'EINVAL' });\n    }\n    const net = getNet();\n    const entry = makeSocketEntry({ listening: true, localAddress: host, fdFlags: options.fdFlags || 0 });\n    const fd = this._allocFd(entry);\n    return new Promise((resolve, reject) => {\n      const server = net.createServer(clientSock => {\n        if (entry.closed) {\n          try { clientSock.destroy(); } catch {}\n          return;\n        }\n        // Buffer incoming bytes immediately so nothing is lost between TCP accept and sock_accept.\n        const earlyChunks = [];\n        const state = { ended: false, closed: false };\n        const onData = chunk => earlyChunks.push(Buffer.from(chunk));\n        const onEnd = () => { state.ended = true; };\n        const onClose = () => { state.closed = true; };\n        clientSock.on('data', onData);\n        clientSock.on('end', onEnd);\n        clientSock.on('close', onClose);\n        entry.acceptQueue.push({ clientSock, earlyChunks, state, onData, onEnd, onClose });\n      });\n      entry.netServer = server;\n      const onError = err => {\n        this._fds.delete(fd);\n        reject(err);\n      };\n      server.once('error', onError);\n      server.listen(requestedPort, host, () => {\n        server.removeListener('error', onError);\n        const addr = typeof server.address === 'function' ? server.address() : null;\n        entry.localPort = addr && typeof addr === 'object' && addr.port ? addr.port : requestedPort;\n        resolve({ fd, host, port: entry.localPort, close: () => { try { callsCloseEntry(this, fd); } catch {} } });\n      });\n    });\n  }\n\n  // Connect a virtual-loopback TCP client socket fd to (host, port).\n  connectSocket(options = {}) {\n    const host = normalizeLoopbackHost(options.host);\n    const port = Number(options.port);\n    if (!Number.isInteger(port) || port < 1 || port > 65535) {\n      throw Object.assign(new RangeError('Invalid loopback port: ' + options.port), { code: 'EINVAL' });\n    }\n    const net = getNet();\n    const entry = makeSocketEntry({\n      connected: false,\n      remoteAddress: host,\n      remotePort: port,\n      fdFlags: options.fdFlags || 0,\n    });\n    const fd = this._allocFd(entry);\n    return new Promise((resolve, reject) => {\n      const sock = net.connect({ host, port });\n      attachNetSocket(sock, entry);\n      const onErr = err => {\n        this._fds.delete(fd);\n        reject(err);\n      };\n      sock.once('error', onErr);\n      sock.once('connect', () => {\n        sock.removeListener('error', onErr);\n        entry.connected = true;\n        entry.localAddress = sock.localAddress || host;\n        entry.localPort = sock.localPort || 0;\n        resolve({ fd, host, port });\n      });\n    });\n  }\n\n  // Create a synchronous bidirectional virtual-loopback socket pair [fdA, fdB].\n  openSocketPair() {\n    const a = makeSocketEntry({ connected: true });\n    const b = makeSocketEntry({ connected: true });\n    a.peerEntry = b;\n    b.peerEntry = a;\n    return [this._allocFd(a), this._allocFd(b)];\n  }\n\n  // Close all open socket fds and flush dirty files (used for clean teardown).\n  close() {\n    for (const [fd, entry] of [...this._fds.entries()]) {\n      if (fd < 3) continue;\n      if (entry.kind === 'socket') callsCloseEntry(this, fd);\n      else {\n        this._flush(entry);\n        this._fds.delete(fd);\n      }\n    }\n  }\n\n  // Runs a command module: calls _start and returns its exit code. Node requires _start here.\n  start(instance) {\n    this._memory = this._checkInstance(instance);\n    if (typeof instance.exports._start !== 'function') throw invalidType('instance.exports._start', 'function', instance.exports._start);\n    if (instance.exports._initialize !== undefined) throw invalidType('instance.exports._initialize', 'undefined', instance.exports._initialize);\n    try {\n      instance.exports._start();\n      return 0;\n    } catch (error) {\n      if (error instanceof WASIExit) return error.code;\n      throw error;\n    }\n  }\n\n  // Prepares a reactor module: calls _initialize if it exists. Node forbids _start here.\n  initialize(instance) {\n    this._memory = this._checkInstance(instance);\n    if (instance.exports._start !== undefined) throw invalidType('instance.exports._start', 'undefined', instance.exports._start);\n    if (typeof instance.exports._initialize === 'function') instance.exports._initialize();\n  }\n\n  // Execute one WASI command module as a child of the current runtime. This is\n  // an in-runtime WebAssembly task, not an operating-system process. The new\n  // WASI instance has independent descriptors and returns proc_exit to parent.\n  static async runChild(source, options = {}) {\n    if (!(source instanceof WebAssembly.Module) && !(source instanceof ArrayBuffer) && !ArrayBuffer.isView(source)) {\n      throw invalidType('source', 'WebAssembly.Module, ArrayBuffer, or typed array', source);\n    }\n    const maxOutputBytes = options.maxOutputBytes === undefined ? 1024 * 1024 : Number(options.maxOutputBytes);\n    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0 || maxOutputBytes > 32 * 1024 * 1024) {\n      throw nodeError('ERR_OUT_OF_RANGE', 'maxOutputBytes must be between 0 and 33554432');\n    }\n    const output = { stdout: [], stderr: [], bytes: 0, truncated: false };\n    const capture = stream => text => {\n      const value = String(text);\n      const bytes = Buffer.from(value);\n      const room = Math.max(0, maxOutputBytes - output.bytes);\n      const kept = bytes.subarray(0, room);\n      if (kept.length) output[stream].push(kept.toString('utf8'));\n      output.bytes += kept.length;\n      if (kept.length < bytes.length) output.truncated = true;\n    };\n    const wasi = new WASI({ ...options, stdout: capture('stdout'), stderr: capture('stderr') });\n    try {\n      const module = source instanceof WebAssembly.Module ? source : await WebAssembly.compile(source);\n      const instance = await WebAssembly.instantiate(module, wasi.getImportObject());\n      const status = wasi.start(instance);\n      return { status, stdout: output.stdout.join(''), stderr: output.stderr.join(''), outputLimitExceeded: output.truncated };\n    } finally {\n      wasi.close();\n    }\n  }\n\n  _checkInstance(instance) {\n    const exports = instance && instance.exports;\n    if (typeof exports !== 'object' || exports === null) throw invalidType('instance.exports', 'object', exports);\n    if (exports.memory instanceof WebAssembly.Memory) return exports.memory;\n    if (this._memory instanceof WebAssembly.Memory) return this._memory;\n    throw nodeError('ERR_INVALID_ARG_TYPE', `\"instance.exports.memory\" property must be a WebAssembly.Memory object. Received ${describe(exports.memory)}`);\n  }\n\n  // Memory is read through the buffer each time, because a memory that grows replaces its buffer.\n  _bytes(ptr, len) { return new Uint8Array(this._memory.buffer, ptr, len); }\n  _view() { return new DataView(this._memory.buffer); }\n  _text(ptr, len) {\n    const view = this._bytes(ptr, len);\n    return new TextDecoder().decode(typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer ? view.slice() : view);\n  }\n\n  _entry(fd, kind) {\n    const entry = this._fds.get(fd);\n    if (!entry) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n    if (kind && entry.kind !== kind) {\n      const code = entry.kind === 'dir' ? 'EISDIR' : kind === 'socket' ? 'ENOTSOCK' : 'EBADF';\n      throw Object.assign(new Error('wrong kind of fd'), { code });\n    }\n    return entry;\n  }\n\n  // Path calls read the disk, so every open file with unsaved changes is written first.\n  _flushAll() {\n    for (const entry of this._fds.values()) this._flush(entry);\n  }\n\n  _resolve(dirfd, relative) {\n    this._flushAll();\n    const dir = this._entry(dirfd, 'dir');\n    const host = nodePath.resolve(dir.host, relative);\n    const prefix = dir.host.endsWith('/') ? dir.host : dir.host + '/';\n    if (host !== dir.host && !host.startsWith(prefix)) throw Object.assign(new Error('path escapes the preopened directory'), { code: 'ENOTCAPABLE' });\n    return host;\n  }\n\n  // Reads from entry.data at `position` into the iovecs. Returns the byte count.\n  _readInto(entry, iovs, iovsLen, position) {\n    let total = 0, at = position;\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      const count = Math.max(0, Math.min(len, entry.data.length - at));\n      this._bytes(ptr, count).set(entry.data.subarray(at, at + count));\n      at += count;\n      total += count;\n      if (count < len) break;\n    }\n    return total;\n  }\n\n  // Reads from buffered socket chunks into iovecs. When peek=true, leaves recvChunks intact.\n  _readSocketChunks(entry, iovs, iovsLen, peek) {\n    let total = 0;\n    let chunkIdx = 0;\n    let chunkOff = 0;\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      let wrote = 0;\n      while (wrote < len && chunkIdx < entry.recvChunks.length) {\n        const chunk = entry.recvChunks[chunkIdx];\n        const avail = chunk.length - chunkOff;\n        if (avail <= 0) { chunkIdx++; chunkOff = 0; continue; }\n        const take = Math.min(len - wrote, avail);\n        this._bytes(ptr + wrote, take).set(chunk.subarray(chunkOff, chunkOff + take));\n        wrote += take;\n        total += take;\n        chunkOff += take;\n        if (chunkOff >= chunk.length) { chunkIdx++; chunkOff = 0; }\n      }\n      if (wrote < len) break;\n    }\n    if (!peek && total > 0) {\n      if (chunkOff > 0 && chunkIdx < entry.recvChunks.length) {\n        entry.recvChunks = [entry.recvChunks[chunkIdx].subarray(chunkOff), ...entry.recvChunks.slice(chunkIdx + 1)];\n      } else {\n        entry.recvChunks = entry.recvChunks.slice(chunkIdx);\n      }\n    }\n    return total;\n  }\n\n  _socketBufferedBytes(entry) {\n    let n = 0;\n    for (let i = 0; i < entry.recvChunks.length; i++) n += entry.recvChunks[i].length;\n    return n;\n  }\n\n  // Gathers the iovecs into one buffer.\n  _gather(iovs, iovsLen) {\n    const chunks = [];\n    for (let i = 0; i < iovsLen; i++) {\n      const ptr = this._view().getUint32(iovs + i * 8, true);\n      const len = this._view().getUint32(iovs + i * 8 + 4, true);\n      chunks.push(Buffer.from(this._bytes(ptr, len)));\n    }\n    return Buffer.concat(chunks);\n  }\n\n  // Writes data into a file's buffer at `position`, growing the file with zeros if needed.\n  _writeAt(entry, data, position) {\n    const end = position + data.length;\n    const grown = Buffer.alloc(Math.max(entry.data.length, end));\n    entry.data.copy(grown, 0);\n    data.copy(grown, position);\n    entry.data = grown;\n    entry.dirty = true;\n  }\n\n  _allocFd(entry) {\n    const fd = this._nextFd++;\n    this._fds.set(fd, entry);\n    return fd;\n  }\n\n  _flush(entry) {\n    if (entry.kind === 'file' && entry.dirty) {\n      fs.writeFileSync(entry.host, entry.data);\n      entry.dirty = false;\n    }\n  }\n\n  _writeFilestat(ptr, type, size, mtimeMs) {\n    const view = this._view();\n    view.setBigUint64(ptr, 0n, true);\n    view.setBigUint64(ptr + 8, 0n, true);\n    view.setUint8(ptr + 16, type);\n    view.setBigUint64(ptr + 24, 1n, true);\n    view.setBigUint64(ptr + 32, BigInt(size), true);\n    const time = BigInt(Math.round(mtimeMs)) * 1000000n;\n    view.setBigUint64(ptr + 40, time, true);\n    view.setBigUint64(ptr + 48, time, true);\n    view.setBigUint64(ptr + 56, time, true);\n  }\n\n  _writeSockPayload(entry, data) {\n    if (entry.shutWr || entry.peerClosed) throw Object.assign(new Error('socket write after shutdown'), { code: 'EPIPE' });\n    if (entry.peerEntry) {\n      if (entry.peerEntry.shutRd || entry.peerEntry.closed) {\n        throw Object.assign(new Error('peer closed'), { code: 'EPIPE' });\n      }\n      if (data.length) entry.peerEntry.recvChunks.push(data);\n      return data.length;\n    }\n    if (!entry.netSocket || entry.netSocket.destroyed) {\n      throw Object.assign(new Error('socket closed'), { code: 'EPIPE' });\n    }\n    if (data.length) entry.netSocket.write(data);\n    return data.length;\n  }\n\n  _buildImports() {\n    const self = this;\n    const guard = fn => function (...args) {\n      try { return fn.apply(self, args); } catch (error) { return errnoFor(error); }\n    };\n    const calls = {\n      args_sizes_get(countPtr, sizePtr) {\n        const size = this._args.reduce((total, arg) => total + Buffer.byteLength(arg) + 1, 0);\n        this._view().setUint32(countPtr, this._args.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      args_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._args, argvPtr, bufPtr);\n      },\n      environ_sizes_get(countPtr, sizePtr) {\n        const size = this._env.reduce((total, item) => total + Buffer.byteLength(item) + 1, 0);\n        this._view().setUint32(countPtr, this._env.length, true);\n        this._view().setUint32(sizePtr, size, true);\n        return ERRNO.SUCCESS;\n      },\n      environ_get(argvPtr, bufPtr) {\n        return this._writeStrings(this._env, argvPtr, bufPtr);\n      },\n      clock_res_get(id, outPtr) {\n        if (id < 0 || id > 3) return ERRNO.INVAL;\n        this._view().setBigUint64(outPtr, id === 0 ? 1000000n : 1000n, true);\n        return ERRNO.SUCCESS;\n      },\n      clock_time_get(id, precision, outPtr) {\n        if (id < 0 || id > 3) return ERRNO.INVAL;\n        const ns = id === 0\n          ? BigInt(Date.now()) * 1000000n\n          : (typeof performance !== 'undefined' && performance\n            ? BigInt(Math.max(0, Math.round(performance.now() * 1000))) * 1000n\n            : BigInt(Date.now()) * 1000000n);\n        this._view().setBigUint64(outPtr, ns, true);\n        return ERRNO.SUCCESS;\n      },\n      random_get(ptr, len) {\n        this._bytes(ptr, len).set(crypto.randomBytes(len));\n        return ERRNO.SUCCESS;\n      },\n      sched_yield() { return ERRNO.SUCCESS; },\n      poll_oneoff(inPtr, outPtr, nsubscriptions, neventsPtr) {\n        const count = Number(nsubscriptions);\n        if (!Number.isInteger(count) || count <= 0) return ERRNO.INVAL;\n        const view = this._view();\n        const ready = [];\n        const clocks = [];\n        const nowMs = Date.now();\n        const nowMonoMs = typeof performance !== 'undefined' && performance ? performance.now() : nowMs;\n        for (let i = 0; i < count; i++) {\n          const base = inPtr + i * 48;\n          const userdata = view.getBigUint64(base, true);\n          const type = view.getUint8(base + 8);\n          if (type === 0) {\n            const clockId = view.getUint32(base + 16, true);\n            const timeoutNs = view.getBigUint64(base + 24, true);\n            const flags = view.getUint16(base + 40, true);\n            const refMs = clockId === 0 ? nowMs : nowMonoMs;\n            const delayMs = (flags & 1) ? Math.max(0, Number(timeoutNs) / 1e6 - refMs) : Math.max(0, Number(timeoutNs) / 1e6);\n            clocks.push({ userdata, type, delayMs });\n          } else if (type === 1 || type === 2) {\n            const fd = view.getInt32(base + 16, true);\n            const entry = this._fds.get(fd);\n            if (!entry) {\n              ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n, flags: 0 });\n            } else if (type === 1) {\n              if (entry.kind === 'file') {\n                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(Math.max(0, entry.data.length - entry.pos)), flags: 0 });\n              } else if (entry.kind === 'stdin') {\n                if (this._stdinBuf) {\n                  const avail = Math.max(0, this._stdinBuf.length - this._stdinPos);\n                  if (avail > 0 || count === 1) ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(avail), flags: avail === 0 ? 1 : 0 });\n                } else if (count === 1) {\n                  ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 0n, flags: 0 });\n                }\n              } else if (entry.kind === 'socket') {\n                if (entry.listening) {\n                  if (entry.acceptQueue.length > 0) {\n                    ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(entry.acceptQueue.length), flags: 0 });\n                  }\n                } else {\n                  const buffered = this._socketBufferedBytes(entry);\n                  const hangup = entry.eof || entry.shutRd || entry.peerClosed;\n                  if (buffered > 0 || hangup) {\n                    ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: BigInt(buffered), flags: hangup ? 1 : 0 });\n                  }\n                }\n              } else {\n                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n, flags: 0 });\n              }\n            } else {\n              if (entry.kind === 'file' || entry.kind === 'stdout' || entry.kind === 'stderr') {\n                ready.push({ userdata, type, error: ERRNO.SUCCESS, nbytes: 65536n, flags: 0 });\n              } else if (entry.kind === 'socket') {\n                if (entry.listening) {\n                  ready.push({ userdata, type, error: ERRNO.INVAL, nbytes: 0n, flags: 0 });\n                } else {\n                  const closedWr = entry.shutWr || entry.peerClosed;\n                  ready.push({ userdata, type, error: closedWr ? ERRNO.PIPE : ERRNO.SUCCESS, nbytes: closedWr ? 0n : 65536n, flags: closedWr ? 1 : 0 });\n                }\n              } else {\n                ready.push({ userdata, type, error: ERRNO.BADF, nbytes: 0n, flags: 0 });\n              }\n            }\n          } else {\n            return ERRNO.INVAL;\n          }\n        }\n        if (!ready.length && clocks.length) {\n          let minDelay = Infinity;\n          for (const c of clocks) if (c.delayMs < minDelay) minDelay = c.delayMs;\n          const waitMs = Math.max(0, Math.min(30000, Math.ceil(minDelay)));\n          if (waitMs > 0) {\n            let slept = false;\n            if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {\n              try {\n                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);\n                slept = true;\n              } catch {}\n            }\n            if (!slept) {\n              const until = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + waitMs;\n              while ((typeof performance !== 'undefined' ? performance.now() : Date.now()) < until) {}\n            }\n          }\n          for (const c of clocks) {\n            if (c.delayMs <= minDelay + 1) ready.push({ userdata: c.userdata, type: 0, error: ERRNO.SUCCESS, nbytes: 0n, flags: 0 });\n          }\n        }\n        const outView = this._view();\n        for (let i = 0; i < ready.length; i++) {\n          const ev = ready[i];\n          const ptr = outPtr + i * 32;\n          this._bytes(ptr, 32).fill(0);\n          outView.setBigUint64(ptr, ev.userdata, true);\n          outView.setUint16(ptr + 8, ev.error, true);\n          outView.setUint8(ptr + 10, ev.type);\n          if (ev.type === 1 || ev.type === 2) {\n            outView.setBigUint64(ptr + 16, ev.nbytes, true);\n            if (ev.flags) outView.setUint16(ptr + 24, ev.flags, true);\n          }\n        }\n        outView.setUint32(neventsPtr, ready.length, true);\n        return ERRNO.SUCCESS;\n      },\n      proc_exit(code) { throw new WASIExit(code); },\n      fd_write(fd, iovs, iovsLen, writtenPtr) {\n        const entry = this._entry(fd);\n        const data = this._gather(iovs, iovsLen);\n        if (entry.kind === 'stdout') (this._stdout || (text => process.stdout.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'stderr') (this._stderr || (text => process.stderr.write(text)))(data.toString('utf8'));\n        else if (entry.kind === 'file') {\n          this._writeAt(entry, data, entry.pos);\n          entry.pos += data.length;\n        } else if (entry.kind === 'socket') {\n          if (entry.listening || !entry.connected) throw Object.assign(new Error('socket not connected'), { code: 'ENOTCONN' });\n          this._writeSockPayload(entry, data);\n        } else throw Object.assign(new Error('fd is not writable'), { code: entry.kind === 'dir' ? 'EISDIR' : 'EBADF' });\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_read(fd, iovs, iovsLen, readPtr) {\n        const entry = this._entry(fd);\n        let total = 0;\n        if (entry.kind === 'file') {\n          total = this._readInto(entry, iovs, iovsLen, entry.pos);\n          entry.pos += total;\n        } else if (entry.kind === 'stdin') {\n          if (this._stdinBuf) {\n            total = this._readInto({ data: this._stdinBuf }, iovs, iovsLen, this._stdinPos);\n            this._stdinPos += total;\n          }\n        } else if (entry.kind === 'socket') {\n          if (entry.listening || !entry.connected) throw Object.assign(new Error('socket not connected'), { code: 'ENOTCONN' });\n          if (!entry.shutRd) {\n            const avail = this._socketBufferedBytes(entry);\n            if (avail === 0 && !(entry.eof || entry.peerClosed)) return ERRNO.AGAIN;\n            total = this._readSocketChunks(entry, iovs, iovsLen, false);\n          }\n        } else if (entry.kind === 'dir') throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        else throw Object.assign(new Error('fd is not readable'), { code: 'EBADF' });\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_seek(fd, offset, whence, newPtr) {\n        const entry = this._entry(fd, 'file');\n        const base = whence === WHENCE.SET ? 0 : whence === WHENCE.CUR ? entry.pos : whence === WHENCE.END ? entry.data.length : -1;\n        if (base < 0) return ERRNO.INVAL;\n        const position = base + Number(offset);\n        if (position < 0) return ERRNO.INVAL;\n        entry.pos = position;\n        this._view().setBigUint64(newPtr, BigInt(position), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pread(fd, iovs, iovsLen, offset, readPtr) {\n        const entry = this._entry(fd, 'file');\n        const total = this._readInto(entry, iovs, iovsLen, Number(offset));\n        this._view().setUint32(readPtr, total, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_pwrite(fd, iovs, iovsLen, offset, writtenPtr) {\n        const entry = this._entry(fd, 'file');\n        const data = this._gather(iovs, iovsLen);\n        this._writeAt(entry, data, Number(offset));\n        this._view().setUint32(writtenPtr, data.length, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_set_size(fd, size) {\n        const entry = this._entry(fd, 'file');\n        const length = Number(size);\n        const resized = Buffer.alloc(length);\n        entry.data.copy(resized, 0, 0, Math.min(length, entry.data.length));\n        entry.data = resized;\n        entry.dirty = true;\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_set_times(fd, atim, mtim, fstFlags) {\n        const entry = this._entry(fd);\n        if (entry.kind !== 'file' && entry.kind !== 'dir') return ERRNO.INVAL;\n        this._flush(entry);\n        const st = fs.statSync(entry.host);\n        const now = Date.now();\n        const atime = (fstFlags & FSTFLAGS.ATIM_NOW) ? now : (fstFlags & FSTFLAGS.ATIM) ? Number(atim) / 1e6 : st.atimeMs;\n        const mtime = (fstFlags & FSTFLAGS.MTIM_NOW) ? now : (fstFlags & FSTFLAGS.MTIM) ? Number(mtim) / 1e6 : st.mtimeMs;\n        fs.utimesSync(entry.host, new Date(atime), new Date(mtime));\n        return ERRNO.SUCCESS;\n      },\n      fd_allocate(fd, offset, length) {\n        const entry = this._entry(fd, 'file');\n        const end = Number(offset) + Number(length);\n        if (end > entry.data.length) {\n          const grown = Buffer.alloc(end);\n          entry.data.copy(grown, 0);\n          entry.data = grown;\n          entry.dirty = true;\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_advise() { return ERRNO.SUCCESS; },\n      fd_renumber(from, to) {\n        const entry = this._entry(from);\n        if (from < 3 || to < 0) throw Object.assign(new Error('bad fd'), { code: 'EBADF' });\n        if (from === to) return ERRNO.SUCCESS;\n        if (this._fds.has(to)) {\n          const prev = this._fds.get(to);\n          if (prev.kind === 'socket') callsCloseEntry(this, to);\n          else this._flush(prev);\n        }\n        this._fds.delete(from);\n        this._fds.set(to, entry);\n        return ERRNO.SUCCESS;\n      },\n      fd_tell(fd, outPtr) {\n        this._view().setBigUint64(outPtr, BigInt(this._entry(fd, 'file').pos), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_close(fd) {\n        if (fd < 3) throw Object.assign(new Error('standard streams stay open'), { code: 'EBADF' });\n        const entry = this._entry(fd);\n        if (entry.kind === 'socket') {\n          callsCloseEntry(this, fd);\n          return ERRNO.SUCCESS;\n        }\n        this._flush(entry);\n        this._fds.delete(fd);\n        return ERRNO.SUCCESS;\n      },\n      fd_sync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_datasync(fd) {\n        this._flush(this._entry(fd));\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        const type = entry.kind === 'dir'\n          ? FILETYPE.DIRECTORY\n          : entry.kind === 'file'\n            ? FILETYPE.REGULAR_FILE\n            : entry.kind === 'socket'\n              ? FILETYPE.SOCKET_STREAM\n              : FILETYPE.UNKNOWN;\n        const view = this._view();\n        view.setUint8(statPtr, type);\n        view.setUint16(statPtr + 2, entry.kind === 'socket' ? (entry.fdFlags || 0) : 0, true);\n        view.setBigUint64(statPtr + 8, ALL_RIGHTS, true);\n        view.setBigUint64(statPtr + 16, ALL_RIGHTS, true);\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_set_flags(fd, flags) {\n        const entry = this._entry(fd);\n        if (entry.kind === 'socket') entry.fdFlags = flags & FDFLAGS.NONBLOCK;\n        return ERRNO.SUCCESS;\n      },\n      fd_fdstat_set_rights(fd) {\n        this._entry(fd);\n        return ERRNO.SUCCESS;\n      },\n      fd_filestat_get(fd, statPtr) {\n        const entry = this._entry(fd);\n        if (entry.kind === 'file') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.REGULAR_FILE, entry.data.length, st.mtimeMs);\n        } else if (entry.kind === 'dir') {\n          const st = fs.statSync(entry.host);\n          this._writeFilestat(statPtr, FILETYPE.DIRECTORY, 0, st.mtimeMs);\n        } else if (entry.kind === 'socket') {\n          this._writeFilestat(statPtr, FILETYPE.SOCKET_STREAM, this._socketBufferedBytes(entry), Date.now());\n        } else {\n          this._writeFilestat(statPtr, FILETYPE.UNKNOWN, 0, Date.now());\n        }\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_get(fd, ptr) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._view().setUint8(ptr, 0);\n        this._view().setUint32(ptr + 4, Buffer.byteLength(entry.preopen), true);\n        return ERRNO.SUCCESS;\n      },\n      fd_prestat_dir_name(fd, pathPtr, pathLen) {\n        const entry = this._entry(fd, 'dir');\n        if (entry.preopen === undefined) throw Object.assign(new Error('not a preopened directory'), { code: 'EBADF' });\n        this._bytes(pathPtr, pathLen).set(Buffer.from(entry.preopen).subarray(0, pathLen));\n        return ERRNO.SUCCESS;\n      },\n      fd_readdir(fd, bufPtr, bufLen, cookie, usedPtr) {\n        const entry = this._entry(fd, 'dir');\n        const cap = Math.max(0, Number(bufLen));\n        if (cap === 0) {\n          this._view().setUint32(usedPtr, 0, true);\n          return ERRNO.SUCCESS;\n        }\n        const names = fs.readdirSync(entry.host);\n        let used = 0;\n        for (let index = Number(cookie); index < names.length; index++) {\n          const name = Buffer.from(names[index]);\n          const childPath = nodePath.join(entry.host, names[index]);\n          const child = typeof fs.lstatSync === 'function' ? fs.lstatSync(childPath) : fs.statSync(childPath);\n          const childType = typeof child.isSymbolicLink === 'function' && child.isSymbolicLink()\n            ? FILETYPE.SYMBOLIC_LINK\n            : child.isDirectory()\n              ? FILETYPE.DIRECTORY\n              : FILETYPE.REGULAR_FILE;\n          const header = Buffer.alloc(24);\n          header.writeBigUInt64LE(BigInt(index + 1), 0);\n          header.writeBigUInt64LE(0n, 8);\n          header.writeUInt32LE(name.length, 16);\n          header.writeUInt8(childType, 20);\n          const record = Buffer.concat([header, name]);\n          const room = Math.max(0, cap - used);\n          if (room > 0) this._bytes(bufPtr + used, Math.min(room, record.length)).set(record.subarray(0, Math.min(room, record.length)));\n          used += Math.min(room, record.length);\n          if (room < record.length) break;\n        }\n        this._view().setUint32(usedPtr, used, true);\n        return ERRNO.SUCCESS;\n      },\n      path_open(dirfd, dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, fdflags, fdPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        let exists = fs.existsSync(host);\n        if (!exists && typeof fs.lstatSync === 'function') {\n          try { fs.lstatSync(host); exists = true; } catch {}\n        }\n        if (exists && (oflags & OFLAGS.EXCL)) throw Object.assign(new Error('file exists'), { code: 'EEXIST' });\n        if (!exists) {\n          if (!(oflags & OFLAGS.CREAT)) throw Object.assign(new Error('no such file'), { code: 'ENOENT' });\n          fs.writeFileSync(host, '');\n        }\n        const st = fs.statSync(host);\n        let fd;\n        if (st.isDirectory()) {\n          if (oflags & OFLAGS.TRUNC) throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n          fd = this._allocFd({ kind: 'dir', host });\n        } else {\n          if (oflags & OFLAGS.DIRECTORY) throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });\n          const truncate = (oflags & OFLAGS.TRUNC) !== 0;\n          const data = truncate ? Buffer.alloc(0) : Buffer.from(fs.readFileSync(host));\n          fd = this._allocFd({ kind: 'file', host, data, pos: 0, dirty: truncate });\n        }\n        this._view().setUint32(fdPtr, fd, true);\n        return ERRNO.SUCCESS;\n      },\n      path_filestat_get(dirfd, flags, pathPtr, pathLen, statPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const st = (flags & 1) === 0 && typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);\n        const type = typeof st.isSymbolicLink === 'function' && st.isSymbolicLink()\n          ? FILETYPE.SYMBOLIC_LINK\n          : st.isDirectory()\n            ? FILETYPE.DIRECTORY\n            : FILETYPE.REGULAR_FILE;\n        this._writeFilestat(statPtr, type, st.size, st.mtimeMs);\n        return ERRNO.SUCCESS;\n      },\n      path_filestat_set_times(dirfd, flags, pathPtr, pathLen, atim, mtim, fstFlags) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const follow = (flags & 1) !== 0;\n        const st = !follow && typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);\n        const now = Date.now();\n        const atime = (fstFlags & FSTFLAGS.ATIM_NOW) ? now : (fstFlags & FSTFLAGS.ATIM) ? Number(atim) / 1e6 : st.atimeMs;\n        const mtime = (fstFlags & FSTFLAGS.MTIM_NOW) ? now : (fstFlags & FSTFLAGS.MTIM) ? Number(mtim) / 1e6 : st.mtimeMs;\n        if (!follow && typeof fs.lutimesSync === 'function') fs.lutimesSync(host, new Date(atime), new Date(mtime));\n        else fs.utimesSync(host, new Date(atime), new Date(mtime));\n        return ERRNO.SUCCESS;\n      },\n      path_create_directory(dirfd, pathPtr, pathLen) {\n        fs.mkdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_remove_directory(dirfd, pathPtr, pathLen) {\n        fs.rmdirSync(this._resolve(dirfd, this._text(pathPtr, pathLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_unlink_file(dirfd, pathPtr, pathLen) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const st = typeof fs.lstatSync === 'function' ? fs.lstatSync(host) : fs.statSync(host);\n        if (st.isDirectory()) throw Object.assign(new Error('is a directory'), { code: 'EISDIR' });\n        fs.unlinkSync(host);\n        return ERRNO.SUCCESS;\n      },\n      path_rename(oldDirfd, oldPtr, oldLen, newDirfd, newPtr, newLen) {\n        fs.renameSync(this._resolve(oldDirfd, this._text(oldPtr, oldLen)), this._resolve(newDirfd, this._text(newPtr, newLen)));\n        return ERRNO.SUCCESS;\n      },\n      path_link(oldDirfd, oldFlags, oldPtr, oldLen, newDirfd, newPtr, newLen) {\n        const oldHost = this._resolve(oldDirfd, this._text(oldPtr, oldLen));\n        const newHost = this._resolve(newDirfd, this._text(newPtr, newLen));\n        fs.linkSync(oldHost, newHost);\n        return ERRNO.SUCCESS;\n      },\n      path_symlink(oldPtr, oldLen, dirfd, newPtr, newLen) {\n        const target = this._text(oldPtr, oldLen);\n        if (nodePath.isAbsolute(target)) throw Object.assign(new Error('symlink target escapes preopen'), { code: 'ENOTCAPABLE' });\n        const linkHost = this._resolve(dirfd, this._text(newPtr, newLen));\n        const dir = this._entry(dirfd, 'dir');\n        const resolvedTarget = nodePath.resolve(nodePath.dirname(linkHost), target);\n        const prefix = dir.host.endsWith('/') ? dir.host : dir.host + '/';\n        if (resolvedTarget !== dir.host && !resolvedTarget.startsWith(prefix)) {\n          throw Object.assign(new Error('symlink target escapes preopen'), { code: 'ENOTCAPABLE' });\n        }\n        fs.symlinkSync(target, linkHost);\n        return ERRNO.SUCCESS;\n      },\n      path_readlink(dirfd, pathPtr, pathLen, bufPtr, bufLen, usedPtr) {\n        const host = this._resolve(dirfd, this._text(pathPtr, pathLen));\n        const target = Buffer.from(String(fs.readlinkSync(host)));\n        const count = Math.min(target.length, Number(bufLen));\n        if (count > 0) this._bytes(bufPtr, count).set(target.subarray(0, count));\n        this._view().setUint32(usedPtr, count, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_accept(fd, fdFlags, outFdPtr) {\n        const entry = this._entry(fd, 'socket');\n        if (!entry.listening) return ERRNO.INVAL;\n        if (!outFdPtr) return ERRNO.INVAL;\n        if (!entry.acceptQueue.length) return ERRNO.AGAIN;\n        const accepted = entry.acceptQueue.shift();\n        const child = makeSocketEntry({\n          listening: false,\n          connected: true,\n          fdFlags: fdFlags || 0,\n        });\n        if (accepted && accepted.clientSock) {\n          const { clientSock, earlyChunks, state, onData, onEnd, onClose } = accepted;\n          clientSock.removeListener('data', onData);\n          clientSock.removeListener('end', onEnd);\n          clientSock.removeListener('close', onClose);\n          for (let i = 0; i < earlyChunks.length; i++) child.recvChunks.push(earlyChunks[i]);\n          if (state.ended) child.eof = true;\n          if (state.closed) { child.eof = true; child.peerClosed = true; }\n          attachNetSocket(clientSock, child);\n        } else if (accepted) {\n          attachNetSocket(accepted, child);\n        }\n        const childFd = this._allocFd(child);\n        this._view().setUint32(outFdPtr, childFd, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_recv(fd, riDataPtr, riDataLen, riFlags, roDataLenPtr, roFlagsPtr) {\n        const entry = this._entry(fd, 'socket');\n        if (entry.listening || !entry.connected) return ERRNO.NOTCONN;\n        if (!roDataLenPtr) return ERRNO.INVAL;\n        if ((riFlags & ~(SOCK_RECV_PEEK | SOCK_RECV_WAITALL)) !== 0) return ERRNO.NOTSUP;\n        if (entry.shutRd) {\n          this._view().setUint32(roDataLenPtr, 0, true);\n          if (roFlagsPtr) this._view().setUint32(roFlagsPtr, 0, true);\n          return ERRNO.SUCCESS;\n        }\n        const avail = this._socketBufferedBytes(entry);\n        if (avail === 0) {\n          this._view().setUint32(roDataLenPtr, 0, true);\n          if (roFlagsPtr) this._view().setUint32(roFlagsPtr, 0, true);\n          return (entry.eof || entry.peerClosed) ? ERRNO.SUCCESS : ERRNO.AGAIN;\n        }\n        const peek = (riFlags & SOCK_RECV_PEEK) !== 0;\n        const total = this._readSocketChunks(entry, riDataPtr, riDataLen, peek);\n        this._view().setUint32(roDataLenPtr, total, true);\n        if (roFlagsPtr) this._view().setUint32(roFlagsPtr, 0, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_send(fd, siDataPtr, siDataLen, siFlags, soDataLenPtr) {\n        const entry = this._entry(fd, 'socket');\n        if (entry.listening || !entry.connected) return ERRNO.NOTCONN;\n        if (siFlags !== 0) return ERRNO.NOTSUP;\n        if (!soDataLenPtr) return ERRNO.INVAL;\n        const data = this._gather(siDataPtr, siDataLen);\n        const sent = this._writeSockPayload(entry, data);\n        this._view().setUint32(soDataLenPtr, sent, true);\n        return ERRNO.SUCCESS;\n      },\n      sock_shutdown(fd, how) {\n        const entry = this._entry(fd, 'socket');\n        if (entry.listening || !entry.connected) return ERRNO.NOTCONN;\n        if ((how & ~(SDFLAGS.RD | SDFLAGS.WR)) !== 0 || how === 0) return ERRNO.INVAL;\n        if (how & SDFLAGS.RD) {\n          entry.shutRd = true;\n          entry.recvChunks.length = 0;\n          if (entry.netSocket && typeof entry.netSocket.pause === 'function') {\n            try { entry.netSocket.pause(); } catch {}\n          }\n        }\n        if (how & SDFLAGS.WR) {\n          entry.shutWr = true;\n          if (entry.peerEntry) entry.peerEntry.eof = true;\n          if (entry.netSocket && typeof entry.netSocket.end === 'function') {\n            try { entry.netSocket.end(); } catch {}\n          }\n        }\n        return ERRNO.SUCCESS;\n      },\n    };\n    const imports = {};\n    for (const [name, fn] of Object.entries(calls)) imports[name] = guard(fn).bind(this);\n    for (const name of UNSUPPORTED) imports[name] = () => ERRNO.NOSYS;\n    return imports;\n  }\n\n  _writeStrings(items, listPtr, bufPtr) {\n    let offset = bufPtr;\n    items.forEach((item, index) => {\n      this._view().setUint32(listPtr + index * 4, offset, true);\n      const encoded = Buffer.from(item + '\\0');\n      this._bytes(offset, encoded.length).set(encoded);\n      offset += encoded.length;\n    });\n    return ERRNO.SUCCESS;\n  }\n}\n\nfunction callsCloseEntry(wasi, fd) {\n  const entry = wasi._fds.get(fd);\n  if (!entry) return;\n  entry.closed = true;\n  if (entry.peerEntry) {\n    entry.peerEntry.eof = true;\n    entry.peerEntry.peerClosed = true;\n  }\n  while (entry.acceptQueue && entry.acceptQueue.length) {\n    const accepted = entry.acceptQueue.shift();\n    const sock = accepted && accepted.clientSock ? accepted.clientSock : accepted;\n    try { if (sock && typeof sock.destroy === 'function') sock.destroy(); } catch {}\n  }\n  if (entry.netSocket && typeof entry.netSocket.destroy === 'function') {\n    try { entry.netSocket.destroy(); } catch {}\n  }\n  if (entry.netServer && typeof entry.netServer.close === 'function') {\n    try { entry.netServer.close(); } catch {}\n  }\n  wasi._fds.delete(fd);\n}\n\nmodule.exports = { WASI, WASIExit, ERRNO };\n";
 /* END generated: wasi */
 // The path module is Node 22's own lib/path.js (see the node-path region), so path.posix and
 // path.win32 behave exactly like Node's. Internal helpers below keep the fast virtual-FS paths.
@@ -883,6 +1122,12 @@ const NATIVE_FALLBACK_RULES=[
   [/^@next\/swc-(?!wasm)/,'@next/swc-wasm-nodejs'],
   // @swc/core's optional per-platform bindings; @swc/wasm serves the same API.
   [/^@swc\/core-(?!wasm)/,'@swc/wasm'],
+  // Rolldown & Oxc platform bindings fall back to official WASI bindings when installed.
+  [/^@rolldown\/binding-(?!wasm)/,'@rolldown/binding-wasm32-wasi'],
+  [/^@oxc-parser\/binding-(?!wasm)/,'@oxc-parser/binding-wasm32-wasi'],
+  [/^@oxc-transform\/binding-(?!wasm)/,'@oxc-transform/binding-wasm32-wasi'],
+  [/^oxc-resolver-(?!wasm)/,'@oxc-resolver/binding-wasm32-wasi'],
+  [/^unrs-resolver-(?!wasm)/,'@unrs-resolver/binding-wasm32-wasi'],
 ];
 function nativeFallbackFor(name){
   if(!name)return null;
@@ -898,10 +1143,22 @@ function owningPackage(file){
 }
 function loadNativeFallback(file){
   const owner=owningPackage(file),fallback=nativeFallbackFor(owner);
-  if(!fallback)return null;
-  let resolved=null;
-  try{resolved=resolveModule(fallback,file);}catch(e){resolved=null;}
-  if(resolved&&resolved.file){try{return loadFile(resolved.file);}catch(e){return null;}}
+  if(fallback){
+    let resolved=null;
+    try{resolved=resolveModule(fallback,file);}catch(e){resolved=null;}
+    if(resolved&&resolved.file){try{return loadFile(resolved.file);}catch(e){return null;}}
+    return null;
+  }
+  // Auto-probe installed -wasm32-wasi or -wasm platform sibling only when present in VFS.
+  if(owner&&!owner.endsWith('-wasm')&&!owner.includes('wasm32-wasi')){
+    const baseName=owner.replace(/-(?:linux|darwin|win32|freebsd|android)(?:-[a-z0-9_]+)*$/i,'');
+    const candidates=baseName!==owner?[baseName+'-wasm32-wasi',baseName+'-wasm',owner+'-wasm32-wasi',owner+'-wasm']:[owner+'-wasm32-wasi',owner+'-wasm'];
+    for(const cand of candidates){
+      let resolved=null;
+      try{resolved=resolveModule(cand,file);}catch(e){resolved=null;}
+      if(resolved&&resolved.file){try{return loadFile(resolved.file);}catch(e){}}
+    }
+  }
   return null;
 }
 // libuv reports a negative errno next to the code string; programmes branch on
@@ -1332,10 +1589,12 @@ class Server extends EventEmitter {
   setTimeout(){ return this; }
 }
 function handleHttp(msg,callback){
+  const __prof = profilerBegin('http.serve', 'http', { method: msg.method, port: msg.port, path: String(msg.url || '/').slice(0, 120) });
   const srv = SERVERS.get(msg.port);
   let requestTimer = null;
   const reply=(r)=>{
     if(requestTimer){ runtimeNativeClearTimeout(requestTimer); requestTimer = null; }
+    profilerEnd(__prof, { status: r.status });
     const response={type:'httpres',id:msg.id,status:r.status,statusMessage:r.statusMessage,headers:r.headers,body:ArrayBuffer.isView(r.body)?Buffer.from(r.body):Buffer.from(String(r.body||''))};
     if(callback)callback(response);else post(response);
   };
@@ -1728,7 +1987,12 @@ class ClientRequest extends EventEmitter {
     const response = await request(this._target.href, { method: this.method, headers: this._headers, body: this.method === 'GET' || this.method === 'HEAD' ? undefined : body, signal: this._abort.signal, credentials: 'omit', redirect: 'follow' });
     if (this.destroyed) return;
     const bytes = Buffer.from(await response.arrayBuffer());
-    this._response(response.status, response.statusText, Object.fromEntries(response.headers.entries()), bytes);
+    const headers = Object.fromEntries(response.headers.entries());
+    if (typeof response.headers.getSetCookie === 'function') {
+      const cookies = response.headers.getSetCookie();
+      if (cookies && cookies.length) headers['set-cookie'] = cookies.length === 1 ? cookies[0] : cookies;
+    }
+    this._response(response.status, response.statusText, headers, bytes);
   }
 }
 
@@ -3122,8 +3386,14 @@ const isCloneRegExp = value => value instanceof RegExp || cloneTagOf(value) === 
 const isCloneArrayBuffer = value => value instanceof ArrayBuffer || cloneTagOf(value) === '[object ArrayBuffer]';
 const isCloneError = value => value instanceof Error || cloneTagOf(value) === '[object Error]';
 const isCloneMessagePort = value => typeof MessagePort !== 'undefined' && (value instanceof MessagePort || cloneTagOf(value) === '[object MessagePort]');
+const isCloneWasm = value => typeof WebAssembly !== 'undefined' && (
+  (typeof WebAssembly.Module === 'function' && value instanceof WebAssembly.Module) ||
+  (typeof WebAssembly.Memory === 'function' && value instanceof WebAssembly.Memory) ||
+  cloneTagOf(value) === '[object WebAssembly.Module]' ||
+  cloneTagOf(value) === '[object WebAssembly.Memory]'
+);
 
-function validateCloneAndCollectPorts(value, allowedPorts, seen, portWrappers) {
+function validateCloneAndCollectPorts(value, allowedPorts, seen, portWrappers, state) {
   if (value === null || value === undefined) return;
   const t = typeof value;
   if (t === 'boolean' || t === 'number' || t === 'string' || t === 'bigint') return;
@@ -3138,22 +3408,26 @@ function validateCloneAndCollectPorts(value, allowedPorts, seen, portWrappers) {
     if (!allowedPorts.has(value)) throw dataCloneError('MessagePort could not be cloned.');
     return;
   }
+  if (isCloneWasm(value)) {
+    if (state) state.hasWasm = true;
+    return;
+  }
   if (isSharedBuffer(value) || isCloneArrayBuffer(value) || ArrayBuffer.isView(value) || isCloneDate(value) || isCloneRegExp(value)) return;
   if (seen.has(value)) return;
   seen.add(value);
-  if (isCloneMap(value)) { for (const [k, v] of value.entries()) { validateCloneAndCollectPorts(k, allowedPorts, seen, portWrappers); validateCloneAndCollectPorts(v, allowedPorts, seen, portWrappers); } return; }
-  if (isCloneSet(value)) { for (const v of value.values()) validateCloneAndCollectPorts(v, allowedPorts, seen, portWrappers); return; }
-  if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) if (i in value) validateCloneAndCollectPorts(value[i], allowedPorts, seen, portWrappers); return; }
+  if (isCloneMap(value)) { for (const [k, v] of value.entries()) { validateCloneAndCollectPorts(k, allowedPorts, seen, portWrappers, state); validateCloneAndCollectPorts(v, allowedPorts, seen, portWrappers, state); } return; }
+  if (isCloneSet(value)) { for (const v of value.values()) validateCloneAndCollectPorts(v, allowedPorts, seen, portWrappers, state); return; }
+  if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) if (i in value) validateCloneAndCollectPorts(value[i], allowedPorts, seen, portWrappers, state); return; }
   if (isCloneError(value)) {
-    if (value.cause !== undefined) validateCloneAndCollectPorts(value.cause, allowedPorts, seen, portWrappers);
+    if (value.cause !== undefined) validateCloneAndCollectPorts(value.cause, allowedPorts, seen, portWrappers, state);
     return;
   }
-  for (const key of Object.keys(value)) validateCloneAndCollectPorts(value[key], allowedPorts, seen, portWrappers);
+  for (const key of Object.keys(value)) validateCloneAndCollectPorts(value[key], allowedPorts, seen, portWrappers, state);
 }
 function replaceNodePortsForPost(value, seen, map) {
   if (value === null || typeof value !== 'object') return value;
   if (value instanceof NodeMessagePort) return { __beownirPort: true, native: value._native, txSab: value._txSab, rxSab: value._rxSab };
-  if (isSharedBuffer(value) || isCloneArrayBuffer(value) || ArrayBuffer.isView(value) || isCloneDate(value) || isCloneRegExp(value) || isCloneError(value) || isCloneMessagePort(value)) return value;
+  if (isSharedBuffer(value) || isCloneArrayBuffer(value) || ArrayBuffer.isView(value) || isCloneDate(value) || isCloneRegExp(value) || isCloneError(value) || isCloneMessagePort(value) || isCloneWasm(value)) return value;
   if (map.has(value)) return map.get(value);
   if (isCloneMap(value)) {
     const out = new Map(); map.set(value, out);
@@ -3179,7 +3453,7 @@ function reviveNodePortsFromPost(value, map = new WeakMap()) {
   if (value.__beownirPort === true) {
     return new NodeMessagePort(value.native || null, { txSab: value.txSab || null, rxSab: value.rxSab || null });
   }
-  if (isSharedBuffer(value) || ArrayBuffer.isView(value) || isCloneMessagePort(value)) return value;
+  if (isSharedBuffer(value) || ArrayBuffer.isView(value) || isCloneMessagePort(value) || isCloneWasm(value)) return value;
   if (isCloneArrayBuffer(value)) return value instanceof ArrayBuffer ? value : value.slice(0);
   if (isCloneDate(value)) return value instanceof Date ? value : new Date(value.getTime());
   if (isCloneRegExp(value)) return value instanceof RegExp ? value : new RegExp(value.source, value.flags);
@@ -3229,7 +3503,8 @@ function prepareTransferPayload(value, transferList) {
     }
   }
   const portWrappers = new Set();
-  validateCloneAndCollectPorts(value, allowedPorts, new Set(), portWrappers);
+  const state = { hasWasm: false };
+  validateCloneAndCollectPorts(value, allowedPorts, new Set(), portWrappers, state);
   for (const port of allowedPorts) {
     if (port instanceof NodeMessagePort) {
       port._transferred = true;
@@ -3240,7 +3515,7 @@ function prepareTransferPayload(value, transferList) {
     }
   }
   const encodedValue = portWrappers.size ? replaceNodePortsForPost(value, new Set(), new Map()) : value;
-  return { value: encodedValue, nativeTransfers, hasPorts: portWrappers.size > 0 };
+  return { value: encodedValue, nativeTransfers, hasPorts: portWrappers.size > 0, hasWasm: state.hasWasm };
 }
 function cloneSameRealmValue(value, transferList, map = new WeakMap()) {
   const allowedPorts = new Set();
@@ -3257,7 +3532,7 @@ function cloneSameRealmValue(value, transferList, map = new WeakMap()) {
   validateCloneAndCollectPorts(value, allowedPorts, new Set(), new Set());
   const clone = v => {
     if (v === null || typeof v !== 'object') return v;
-    if (isSharedBuffer(v) || v instanceof NodeMessagePort) return v;
+    if (isSharedBuffer(v) || v instanceof NodeMessagePort || isCloneWasm(v)) return v;
     if (isCloneArrayBuffer(v)) return v.slice(0);
     if (ArrayBuffer.isView(v)) {
       if (isSharedBuffer(v.buffer)) return new v.constructor(v.buffer, v.byteOffset, v.length || Math.floor(v.byteLength / (v.BYTES_PER_ELEMENT || 1)));
@@ -3293,6 +3568,8 @@ class NodeMessagePort extends EventEmitter {
     this._localSeq = 0;
     this._flushScheduled = false;
     this._onmessage = null;
+    this._childCache = null;
+    this._domListeners = new Map();
     if (this._native) {
       this._native.onmessage = ev => this._onNativeMessage(ev?.data);
       this._native.onmessageerror = () => {};
@@ -3341,10 +3618,19 @@ class NodeMessagePort extends EventEmitter {
   }
   _deliver(value) {
     if (this._closed) return;
-    if (typeof this._onmessage === 'function') {
-      try { this._onmessage({ data: value, target: this }); } catch (e) { kernelUnhandled(e); }
+    const run = () => {
+      if (typeof this._onmessage === 'function' && this.listenerCount('message') === 0) {
+        try { this._onmessage({ data: value, target: this }); } catch (e) { kernelUnhandled(e); }
+      }
+      try { this.emit('message', value); } catch (e) { kernelUnhandled(e); }
+    };
+    if (this._childCache) {
+      const prev = CHILD_MODULE_CACHE;
+      CHILD_MODULE_CACHE = this._childCache;
+      try { run(); } finally { CHILD_MODULE_CACHE = prev; }
+    } else {
+      run();
     }
-    try { this.emit('message', value); } catch (e) { kernelUnhandled(e); }
   }
   _scheduleFlush() {
     if (this._flushScheduled || !this._started || this._closed) return;
@@ -3376,7 +3662,7 @@ class NodeMessagePort extends EventEmitter {
         return;
       }
       let seq = 0;
-      if (!prepared.hasPorts && !prepared.nativeTransfers.length && this._txSab) {
+      if (!prepared.hasPorts && !prepared.hasWasm && !prepared.nativeTransfers.length && this._txSab) {
         seq = ringTryPush(this._txSab, value);
       }
       if (seq > 0) this._native.postMessage({ __beownirSeq: seq, payload: prepared.value }, prepared.nativeTransfers);
@@ -3399,8 +3685,22 @@ class NodeMessagePort extends EventEmitter {
   ref() { this._referenced = true; return this; }
   unref() { this._referenced = false; kernelMaybeIdle(); return this; }
   hasRef() { return this._referenced && !this._closed; }
-  addEventListener(type, fn) { return this.on(type, ev => fn(type === 'message' ? { data: ev } : ev)); }
-  removeEventListener(type, fn) { return this.off(type, fn); }
+  addEventListener(type, fn, opts) {
+    if (typeof fn !== 'function') return this;
+    const key = String(type) + ':' + fn.toString();
+    let byFn = this._domListeners.get(type);
+    if (!byFn) { byFn = new Map(); this._domListeners.set(type, byFn); }
+    if (byFn.has(fn)) return this;
+    const wrapper = ev => fn(type === 'message' ? { data: ev, type: 'message', target: this } : ev);
+    byFn.set(fn, wrapper);
+    return opts && opts.once ? this.once(type, wrapper) : this.on(type, wrapper);
+  }
+  removeEventListener(type, fn) {
+    const byFn = this._domListeners.get(type);
+    const wrapper = byFn && byFn.get(fn);
+    if (wrapper) { byFn.delete(fn); return this.off(type, wrapper); }
+    return this.off(type, fn);
+  }
 }
 
 class NodeMessageChannel {
@@ -3512,7 +3812,7 @@ class KernelThreadWorker extends EventEmitter {
         this._completePendingExit();
         return;
       }
-      if (typeof this.onmessage === 'function') { try { this.onmessage({ data: msg }); } catch (e) { kernelUnhandled(e); } }
+      if (typeof this.onmessage === 'function' && this.listenerCount('message') === 0) { try { this.onmessage({ data: msg }); } catch (e) { kernelUnhandled(e); } }
       this.emit('message', msg);
     });
     const shareEnv = options?.env === SHARE_ENV_SYMBOL;
@@ -3605,6 +3905,22 @@ class KernelThreadWorker extends EventEmitter {
   }
   unref() { this._referenced = false; kernelMaybeIdle(); }
   ref() { this._referenced = true; }
+  addEventListener(type, fn, opts) {
+    if (typeof fn !== 'function') return this;
+    this._domListeners ||= new Map();
+    let byFn = this._domListeners.get(type);
+    if (!byFn) { byFn = new Map(); this._domListeners.set(type, byFn); }
+    if (byFn.has(fn)) return this;
+    const wrapper = ev => fn(type === 'message' ? { data: ev, type: 'message', target: this } : ev);
+    byFn.set(fn, wrapper);
+    return opts && opts.once ? this.once(type, wrapper) : this.on(type, wrapper);
+  }
+  removeEventListener(type, fn) {
+    const byFn = this._domListeners && this._domListeners.get(type);
+    const wrapper = byFn && byFn.get(fn);
+    if (wrapper) { byFn.delete(fn); return this.off(type, wrapper); }
+    return this.off(type, fn);
+  }
   getHeapCodeStatistics() { return {}; }
   get performance() { return { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) }; }
 }
@@ -3627,12 +3943,13 @@ class VirtualNodeWorker extends EventEmitter {
     this._exitCode = null;
     this._terminateWaiters = [];
     this._timers = new Set();
+    this._domListeners = new Map();
     const ch = new NodeMessageChannel();
     this._port = ch.port1;
     const childPort = ch.port2;
     this._port.start();
     this._port.on('message', msg => {
-      if (typeof this.onmessage === 'function') { try { this.onmessage({ data: msg }); } catch (e) { this.emit('error', e); } }
+      if (typeof this.onmessage === 'function' && this.listenerCount('message') === 0) { try { this.onmessage({ data: msg }); } catch (e) { this.emit('error', e); } }
       this.emit('message', msg);
     });
     const worker = this;
@@ -3657,13 +3974,19 @@ class VirtualNodeWorker extends EventEmitter {
     const task = async () => {
       if (worker._exited) return;
       const childCache = Object.create(null);
+      childPort._childCache = childCache;
+      const withScope = (fn, args) => {
+        const prev = CHILD_MODULE_CACHE;
+        CHILD_MODULE_CACHE = childCache;
+        try { return fn(...args); } finally { CHILD_MODULE_CACHE = prev; }
+      };
       const trackTimeout = (fn, ms, ...args) => {
-        const t = setTimeout((...a) => { worker._timers.delete(t); if (!worker._exited) fn(...a); }, ms, ...args);
+        const t = setTimeout((...a) => { worker._timers.delete(t); if (!worker._exited) withScope(fn, a); }, ms, ...args);
         worker._timers.add(t);
         return t;
       };
       const trackInterval = (fn, ms, ...args) => {
-        const t = setInterval((...a) => { if (!worker._exited) fn(...a); }, ms, ...args);
+        const t = setInterval((...a) => { if (!worker._exited) withScope(fn, a); }, ms, ...args);
         worker._timers.add(t);
         return t;
       };
@@ -3754,6 +4077,22 @@ class VirtualNodeWorker extends EventEmitter {
   ref() {
     this._referenced = true;
     if (typeof this._settleTimer?.ref === 'function') this._settleTimer.ref();
+  }
+  addEventListener(type, fn, opts) {
+    if (typeof fn !== 'function') return this;
+    this._domListeners ||= new Map();
+    let byFn = this._domListeners.get(type);
+    if (!byFn) { byFn = new Map(); this._domListeners.set(type, byFn); }
+    if (byFn.has(fn)) return this;
+    const wrapper = ev => fn(type === 'message' ? { data: ev, type: 'message', target: this } : ev);
+    byFn.set(fn, wrapper);
+    return opts && opts.once ? this.once(type, wrapper) : this.on(type, wrapper);
+  }
+  removeEventListener(type, fn) {
+    const byFn = this._domListeners && this._domListeners.get(type);
+    const wrapper = byFn && byFn.get(fn);
+    if (wrapper) { byFn.delete(fn); return this.off(type, wrapper); }
+    return this.off(type, fn);
   }
   getHeapCodeStatistics() { return {}; }
   get performance() { return { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) }; }
@@ -6426,7 +6765,11 @@ let pendingQuestion = null;
       const other = bigFrom(otherPublicKey);
       if (this._private === null) throw Object.assign(new Error('No private key has been generated'), { code: 'ERR_CRYPTO_INVALID_STATE' });
       const secret = bigPow(other, this._private, this._prime);
-      return encodeBig(secret, typeof outputEncoding === 'string' ? outputEncoding : (typeof inputEncoding === 'string' ? inputEncoding : undefined));
+      const outEnc = typeof outputEncoding === 'string' ? outputEncoding : (typeof inputEncoding === 'string' ? inputEncoding : undefined);
+      const raw = encodeBig(secret);
+      const primeBytes = Math.max(1, Math.ceil(this._prime.toString(2).length / 8));
+      const padded = raw.length < primeBytes ? Buffer.concat([Buffer.alloc(primeBytes - raw.length), raw]) : raw;
+      return outEnc ? padded.toString(outEnc) : padded;
     }
     getPrime(encoding) { return encodeBig(this._prime, encoding); }
     getGenerator(encoding) { return encodeBig(this._generator, encoding); }
@@ -8071,7 +8414,7 @@ b: 0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e15619395
     if (encoded[0] !== 0x00 || encoded[1] !== blockType) throw Object.assign(new Error('pkcs1 decoding error'), { code: blockType === 2 ? 'ERR_OSSL_PKCS1_PADDING_TOO_SHORT' : 'ERR_OSSL_PKCS1_PADDING_TOO_LONG' });
     let at = 2;
     while (at < encoded.length && encoded[at] !== 0) at++;
-    if (at < 10) throw Object.assign(new Error('pkcs1 decoding error'), { code: 'ERR_OSSL_PKCS1_PADDING_TOO_SHORT' });
+    if (at < 10 || at >= encoded.length || encoded[at] !== 0) throw Object.assign(new Error('pkcs1 decoding error'), { code: 'ERR_OSSL_PKCS1_PADDING_TOO_SHORT' });
     return encoded.subarray(at + 1);
   }
 
@@ -9419,7 +9762,19 @@ function makeRequire(fromFile, ownerCache = activeModuleCache()){
 }
 function loadWasmModule(file){
   const bytes=readFileSync(file);
-  const wasmModule=new WebAssembly.Module(bytes);
+  const view=bytes instanceof Uint8Array?bytes:new Uint8Array(bytes);
+  let wasmModule=null;
+  if(view.byteLength>=1024&&typeof __wasmCacheKey==='function'&&typeof __wasmModuleCache!=='undefined'){
+    const key=__wasmCacheKey(view);
+    wasmModule=__wasmModuleCache.get(key)||null;
+    if(!wasmModule){
+      wasmModule=new WebAssembly.Module(view);
+      if(__wasmModuleCache.size>=16)__wasmModuleCache.delete(__wasmModuleCache.keys().next().value);
+      __wasmModuleCache.set(key,wasmModule);
+    }
+  }else{
+    wasmModule=new WebAssembly.Module(view);
+  }
   const imports=self.__beownirWasmImports||{};
   return new WebAssembly.Instance(wasmModule,imports).exports;
 }
@@ -10134,11 +10489,17 @@ async function dynamicImportEsm(spec, fromFile, ownerCache = activeModuleCache()
   }
 }
 function importMetaFor(file) {
+  const cleanPath = String(file || '').replace(/\0/g, '');
+  const cleanUrl = cleanPath.startsWith('/') ? 'file://' + cleanPath : 'file:///' + cleanPath;
   return {
-    url: 'file://' + file,
-    filename: file,
-    dirname: dirname(file),
-    resolve: spec => { const resolved = resolveModule(spec, file); return 'file://' + (resolved.file || spec); },
+    url: cleanUrl,
+    filename: cleanPath,
+    dirname: dirname(cleanPath),
+    resolve: spec => {
+      const resolved = resolveModule(spec, file);
+      const target = String(resolved.file || spec).replace(/\0/g, '');
+      return target.startsWith('/') ? 'file://' + target : 'file:///' + target;
+    },
   };
 }
 
@@ -11778,6 +12139,8 @@ function createPackageSink(base, progress) {
   };
 }
 async function extractPackage(base, dist, options = {}) {
+  const __prof = typeof profilerBegin === 'function' ? profilerBegin('npm.extract', 'packages', { package: base.split('/node_modules/').pop() || base }) : null;
+  try {
   if (!dist || typeof dist.tarball !== 'string') throw new Error('Package metadata has no tarball URL.');
   const kit = installKit(), integrity = dist.integrity || (dist.shasum ? 'sha1-' + Buffer.from(dist.shasum, 'hex').toString('base64') : null);
   if (!integrity) throw new Error('Package has no integrity hash. Refusing an unverified download.');
@@ -11826,6 +12189,9 @@ async function extractPackage(base, dist, options = {}) {
   });
   installBytes += result.expandedBytes;
   return result.integrity;
+  } finally {
+    if (__prof && typeof profilerEnd === 'function') profilerEnd(__prof);
+  }
 }
 function collectLock(pkg) {
   const packages = { '': { name: pkg.name || 'app', version: pkg.version || '1.0.0', dependencies: pkg.dependencies || {}, devDependencies: pkg.devDependencies || {} } };
@@ -11884,19 +12250,22 @@ async function installTransaction(task) {
   }
   finally { holdSync--; syncBack(); }
 }
-const IGNORED_INSTALL_FLAGS = new Set(['-D', '--save-dev', '--save', '--save-exact', '--ignore-scripts', '--no-save', '--no-audit', '--no-fund', '--no-package-lock', '--legacy-peer-deps', '--force', '--prefer-offline', '--omit=dev', '--production', '--progress=false', '--frozen-lockfile', '--no-frozen-lockfile', '--prefer-frozen-lockfile', '--shamefully-hoist', '--offline', '--silent', '-s', '--reporter=silent']);
+const IGNORED_INSTALL_FLAGS = new Set(['-D', '--save-dev', '-d', '--dev', '--save', '--save-exact', '-E', '--exact', '--ignore-scripts', '--ignore-engines', '--non-interactive', '--no-lockfile', '--no-save', '--no-audit', '--no-fund', '--no-package-lock', '--legacy-peer-deps', '--force', '--prefer-offline', '--omit=dev', '--production', '--progress=false', '--frozen-lockfile', '--no-frozen-lockfile', '--prefer-frozen-lockfile', '--shamefully-hoist', '--offline', '--silent', '-s', '--reporter=silent']);
 async function npmInstall(args) {
-  return installTransaction(async () => {
+  const __prof = typeof profilerBegin === 'function' ? profilerBegin('npm.install', 'packages', { args: args.slice(0, 6).join(' ') }) : null;
+  try {
+  return await installTransaction(async () => {
     const path = '/project/package.json';
     const pkg = FS[path] ? JSON.parse(readFileSync(path, 'utf8')) : { name: 'app', version: '1.0.0', scripts: {}, dependencies: {} };
-    const dev = args.includes('-D') || args.includes('--save-dev');
+    const dev = args.includes('-D') || args.includes('--save-dev') || args.includes('-d') || args.includes('--dev');
+    const exact = args.includes('--save-exact') || args.includes('-E') || args.includes('--exact');
     for (const flag of args.filter(x => x.startsWith('-'))) if (!IGNORED_INSTALL_FLAGS.has(flag)) throw new Error('Unsupported install flag: ' + flag);
     const explicit = args.filter(x => !x.startsWith('-'));
     for (const spec of explicit) {
       const at = spec.lastIndexOf('@'), name = at > 0 ? spec.slice(0, at) : spec, range = at > 0 ? spec.slice(at + 1) : 'latest';
       if (!validPackageName(name)) throw new Error('Invalid package name: ' + name);
       const meta = await fetchMeta(name), version = pickVersion(meta, range), field = dev ? 'devDependencies' : 'dependencies';
-      pkg[field] ||= {}; pkg[field][name] = args.includes('--save-exact') ? version : (range === 'latest' || range === '*' ? '^' + version : range);
+      pkg[field] ||= {}; pkg[field][name] = exact ? version : (range === 'latest' || range === '*' ? '^' + version : range);
       const other = dev ? 'dependencies' : 'devDependencies'; if (pkg[other]) delete pkg[other][name];
     }
     const declared = Object.entries({ ...pkg.dependencies, ...pkg.devDependencies });
@@ -11914,6 +12283,9 @@ async function npmInstall(args) {
       + ' Optional/peer dependencies are not auto-installed. Use npm ci to restore exact locked versions.\n');
     post({ type: 'pkgprogress', done: true, packages: installCount, bytes: installBytes });
   }).then(() => { scheduleDependencyCheckpoint(); });
+  } finally {
+    if (__prof && typeof profilerEnd === 'function') profilerEnd(__prof, { packages: installCount, bytes: installBytes });
+  }
 }
 function validateLockPath(path) {
   archivePath(path);
@@ -12360,15 +12732,15 @@ const USAGE = {
   xargs: 'xargs [-n N] [command…]', env: 'env', export: 'export NAME=value…', unset: 'unset NAME…',
   source: 'source <script>', which: 'which <command>', curl: 'curl [-I] [-o file] <https://registry.npmjs.org/…>',
   wget: 'wget [-O file] <https://registry.npmjs.org/…>', node: 'node <file> | node -e "code" | node -p "expression"',
-  npm: 'npm install|ci|run <script>|ls|init', pnpm: 'pnpm install|add|run <script>|dlx|exec', npx: 'npx <tool> [arguments…]', esbuild: 'esbuild <entry> --bundle --outfile=<file>',
+  npm: 'npm install|ci|run <script>|ls|init', pnpm: 'pnpm install|add|run <script>|dlx|exec', yarn: 'yarn [install|add|remove|run <script>|dlx|exec]', bun: 'bun [install|add|remove|run <script|file>|x <pkg>]', bunx: 'bunx <tool> [arguments…]', npx: 'npx <tool> [arguments…]', esbuild: 'esbuild <entry> --bundle --outfile=<file>',
   ps: 'ps', kill: 'kill [-SIGNAL] <pid>', ports: 'ports', open: 'open <port>', 'close-port': 'close-port <port>',
   history: 'history', test: 'test <expression>', time: 'time <command…>', offline: 'offline [status|clear]',
 };
 const SHELL_HELP = `Beownir shell · a virtual POSIX-flavoured shell (not a native OS shell)
 
 node <file> | node -e "code" | node -p "expression"      run JavaScript here
-npm / pnpm install [pkg] | ci | run <script>             registry client
-npx serve --port 3000 | npx esbuild <entry> --bundle     preview / bundler
+npm / pnpm / yarn / bun install [pkg] | run <script>     registry client
+npx / bunx serve --port 3000 | esbuild <entry> --bundle  preview / bundler
 ls cd pwd cat head tail wc grep sort uniq sed find stat  files
 touch mkdir rm cp mv ln chmod du df storage tree         files, continued
 echo printf basename dirname realpath date sleep xargs   utilities
@@ -12999,7 +13371,7 @@ async function executeCommand(input) {
       return 0;
     }
     case 'which': {
-      const known = ['node', 'npm', 'pnpm', 'npx', 'esbuild'];
+      const known = ['node', 'npm', 'pnpm', 'yarn', 'bun', 'bunx', 'npx', 'esbuild'];
       if (!args[0]) throw new Error('Usage: ' + USAGE.which);
       if (known.includes(args[0])) { out('/usr/bin/' + args[0] + ' (virtual)\n'); return 0; }
       errOut(args[0] + ': not found\n');
@@ -13032,6 +13404,9 @@ async function executeCommand(input) {
     case 'node': case 'nodejs': return runNode(args);
     case 'npm': return runNpm(args);
     case 'pnpm': return runPnpm(args);
+    case 'yarn': return runYarn(args);
+    case 'bun': return runBun(args);
+    case 'bunx': return runNpx(args);
     case 'npx': return runNpx(args);
     case 'esbuild': return runEsbuild(args);
     case 'serve': case 'vite': return runNpx([command, ...args]);
@@ -13153,11 +13528,17 @@ async function storageReport(args, sub) {
 /** Entry point used by the host for every terminal command. */
 async function runCommand(line, id) {
   let code = 0;
+  const __prof = profilerBegin('shell.command', 'commands', { command: String(line).trim().split(/\s+/)[0] || '' });
   try { code = await executeLine(String(line).slice(0, 16384)); }
   catch (error) {
     if (error && error.__exit !== undefined) code = Number(error.__exit) || 0;
     else { code = 1; errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); }
-  } finally { syncBack(); post({ type: 'done', id, cwd: CWD, code }); }
+  } finally {
+    profilerEnd(__prof, { code });
+    if (PROFILER.enabled && PROFILER.spans.length) post({ type: 'profiler-spans', spans: profilerTakeSpans() });
+    syncBack();
+    post({ type: 'done', id, cwd: CWD, code });
+  }
 }
 async function runCommandInline(line) { return executeLine(line); }
 function printTree(path, prefix, depth = 0) {
@@ -13188,9 +13569,14 @@ async function prepareModules(file, seen = new Set()) {
   if (preparedModules.get(file)?.source === source) code = preparedModules.get(file).code;
   else if (!needsTransform(file, source)) { code = source; preparedModules.set(file, { source, code }); }
   else {
-    const api = await getEsbuildApi(), ext = extname(file);
-    const result = await api.transform(source, { loader: ({ '.ts': 'ts', '.tsx': 'tsx', '.jsx': 'jsx' })[ext] || 'js', format: 'cjs', target: 'es2020', sourcefile: file, sourcemap: 'inline', jsxFactory: '__h', jsxFragment: '__Fragment' });
-    code = result.code; preparedModules.set(file, { source, code });
+    const __profTransform = profilerBegin('esbuild.transform', 'modules', { file });
+    try {
+      const api = await getEsbuildApi(), ext = extname(file);
+      const result = await api.transform(source, { loader: ({ '.ts': 'ts', '.tsx': 'tsx', '.jsx': 'jsx' })[ext] || 'js', format: 'cjs', target: 'es2020', sourcefile: file, sourcemap: 'inline', jsxFactory: '__h', jsxFragment: '__Fragment' });
+      code = result.code; preparedModules.set(file, { source, code });
+    } finally {
+      profilerEnd(__profTransform);
+    }
   }
   const specs = [...code.matchAll(/\brequire\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g)].map(m => m[1]);
   for (const spec of new Set(specs)) {
@@ -13223,6 +13609,8 @@ async function settleEntryWork() {
 async function runNode(args) {
   if (args[0] === '-v' || args[0] === '--version') { out('v' + String(processObj.versions.node) + '\n'); return 0; }
   if (args[0] === '--beownir') { out('Beownir 3.0 · Node-compatible worker runtime in a browser (not native Node.js) · reports v' + String(processObj.versions.node) + '\n'); return 0; }
+  const __profNode = profilerBegin('node.run', 'commands', { target: String(args[0] || '') });
+  try {
   if (['-e', '--eval', '-p'].includes(args[0])) {
     if (args[1] === undefined) throw new Error('node -e requires a quoted code argument.');
     self.require = makeRequire(CWD + '/__eval__.js');
@@ -13312,6 +13700,9 @@ async function runNode(args) {
   const exitCode = processObj.exitCode;
   processObj.exitCode = undefined;
   return exitCode === undefined ? 0 : exitCode;
+  } finally {
+    profilerEnd(__profNode);
+  }
 }
 /* Node prints `<file>:<line>`, the source line, a caret and the stack. */
 function reportUncaught(error, file) {
@@ -13393,6 +13784,112 @@ async function runPnpm(args) {
     } catch {}
   }
   throw new Error('Unsupported pnpm command: ' + sub + '. This is a constrained registry client; type pnpm help.');
+}
+const YARN_HELP = `Beownir registry client — yarn-compatible CLI surface (not the yarn executable)
+  yarn                        install dependencies from package.json
+  yarn add <pkg…> [-D] [-E]   add dependencies (--dev / --exact supported)
+  yarn remove <pkg…>          remove dependencies
+  yarn run <script> | yarn <script>
+  yarn exec <cmd…> | dlx <tool…>
+  yarn list | info <name> | init [-y]
+`;
+async function runYarn(args) {
+  const clean = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i]);
+    if (a === '--silent' || a === '-s' || a === '--non-interactive') continue;
+    clean.push(a);
+  }
+  const sub = clean[0];
+  if (!sub) { await npmInstall([]); return 0; }
+  if (['help', '--help', '-h'].includes(sub)) { out(YARN_HELP); return 0; }
+  if (['-v', '--version'].includes(sub)) { out('1.22.22\n'); return 0; }
+  if (sub === '--beownir') { out('Beownir registry client 3.0 · yarn-compatible CLI surface (not the yarn executable)\n'); return 0; }
+  if (sub === 'dlx') return runNpx(clean.slice(1));
+  if (sub === 'exec') return runNpm(['exec', ...clean.slice(1)]);
+  if (sub === 'create') {
+    const tpl = clean[1];
+    if (!tpl) throw new Error('Usage: yarn create <starter-kit> [args…]');
+    const pkgName = tpl.startsWith('create-') ? tpl : 'create-' + tpl;
+    return runNpx([pkgName, ...clean.slice(2)]);
+  }
+  if (sub === 'init') return runNpm(['init']);
+  if (['install', 'i', 'add'].includes(sub)) return runNpm([sub === 'add' ? 'add' : 'install', ...clean.slice(1)]);
+  if (['remove', 'rm', 'uninstall'].includes(sub)) return runNpm(['uninstall', ...clean.slice(1)]);
+  if (['list', 'ls'].includes(sub)) return runNpm(['ls', ...clean.slice(1)]);
+  if (['info', 'view'].includes(sub)) return runNpm(['view', ...clean.slice(1)]);
+  if (['run', 'start', 'dev', 'build', 'test'].includes(sub)) return runNpm([sub, ...clean.slice(1)]);
+  if (!String(sub).startsWith('-')) {
+    try {
+      const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
+      if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...clean.slice(1)]);
+    } catch {}
+  }
+  throw new Error('Unsupported yarn command: ' + sub + '. This is a constrained registry client; type yarn help.');
+}
+const BUN_HELP = `Beownir virtual CLI — bun-compatible CLI surface (runs JS/TS via Beownir runtime)
+  bun install | i             install dependencies from package.json
+  bun add <pkg…> [-d] [-E]    add dependencies (-d/--dev, -E/--exact)
+  bun remove <pkg…>           remove dependencies
+  bun run <script|file>       run a package.json script or JS/TS/ESM file
+  bun <file.ts|file.js>       execute a JS/TS/ESM file
+  bun x <tool…> | bunx <tool> run an installed package binary
+  bun pm ls | init            list packages or initialize package.json
+`;
+async function runBun(args) {
+  const sub = args[0];
+  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(BUN_HELP); return 0; }
+  if (['-v', '--version'].includes(sub)) { out('1.2.0\n'); return 0; }
+  if (sub === '--beownir') { out('Beownir virtual CLI 3.0 · bun-compatible CLI surface (not the native bun executable)\n'); return 0; }
+  if (['-e', '--eval', '-p'].includes(sub)) return runNode(args);
+  if (sub === 'x') return runNpx(args.slice(1));
+  if (sub === 'create') {
+    const tpl = args[1];
+    if (!tpl) throw new Error('Usage: bun create <template> [args…]');
+    const pkgName = tpl.startsWith('create-') ? tpl : 'create-' + tpl;
+    return runNpx([pkgName, ...args.slice(2)]);
+  }
+  if (sub === 'pm') {
+    const pmSub = args[1];
+    if (pmSub === 'ls' || pmSub === 'list') return runNpm(['ls']);
+    if (pmSub === 'cache') { out('Browser cache is managed automatically via IndexedDB/HTTP cache.\n'); return 0; }
+    throw new Error('Unsupported bun pm subcommand: ' + String(pmSub || ''));
+  }
+  if (['install', 'i', 'add', 'update', 'up'].includes(sub)) {
+    return runNpm([sub === 'up' ? 'update' : sub, ...args.slice(1)]);
+  }
+  if (['remove', 'rm', 'uninstall'].includes(sub)) return runNpm(['uninstall', ...args.slice(1)]);
+  if (sub === 'init') return runNpm(['init']);
+  if (sub === 'run') {
+    const target = args[1];
+    if (!target) return runNpm(['run']);
+    const looksLikeFile = /\.(?:[cm]?js|jsx|[cm]?ts|tsx)$/.test(target) || target.startsWith('/') || target.startsWith('./') || target.startsWith('../');
+    if (looksLikeFile || tryFiles(resolve(target))) return runNode([target, ...args.slice(2)]);
+    return runNpm(['run', target, ...args.slice(2)]);
+  }
+  if (sub === 'test' || sub === 't') {
+    const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
+    if (typeof pkg?.scripts?.test === 'string') return runNpm(['run', 'test', ...args.slice(1)]);
+    const fileArgs = args.slice(1).filter(a => !String(a).startsWith('-'));
+    if (fileArgs.length) {
+      for (const fileArg of fileArgs) {
+        const code = await runNode([fileArg]);
+        if (code) return code;
+      }
+      return 0;
+    }
+    throw new Error('No package script named test and no test file argument provided.');
+  }
+  if (['start', 'dev', 'build'].includes(sub)) return runNpm([sub, ...args.slice(1)]);
+  if (!String(sub).startsWith('-')) {
+    const looksLikeFile = /\.(?:[cm]?js|jsx|[cm]?ts|tsx)$/.test(sub) || sub.startsWith('/') || sub.startsWith('./') || sub.startsWith('../');
+    if (looksLikeFile || tryFiles(resolve(sub))) return runNode(args);
+    try {
+      const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
+      if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
+    } catch {}
+  }
+  throw new Error('Unsupported bun command: ' + sub + '. This is a virtual CLI surface; type bun help.');
 }
 async function runViteCLI(args) {
   const vite = makeRequire(CWD + '/package.json')('vite');
@@ -13592,8 +14089,8 @@ const HELP=`Beownir 3.0 · browser worker runtime
 This is a Node-compatible worker runtime, not native Node.js.
 
 node <file> | node -e "code" | node -p "expression"
-npm / pnpm install [pkg] | ci | run <script> | npm help
-npx esbuild <entry> --bundle --outfile=dist/app.js
+npm / pnpm / yarn / bun install [pkg] | ci | run <script> | npm help
+npx / bunx esbuild <entry> --bundle --outfile=dist/app.js
 npx serve --port 5173        preview HTML / bundled browser modules
 ls cat head tail grep sort sed find du df storage tree cp mv rm chmod
 echo printf date sleep xargs env export history test curl wget clear
@@ -13681,6 +14178,7 @@ function kernelThreadExit(code = 0, failure = null) {
     if (pp && !pp._closed) { pp.postMessage({ __beownirThreadFlush: true }); pp.close(); }
   } catch {}
   syncBack();
+  if (PROFILER.enabled && PROFILER.spans.length) post({ type: 'profiler-spans', spans: profilerTakeSpans() });
   const errPayload = failure ? { name: failure.name || 'Error', code: failure.code, message: String(failure.message || failure) } : null;
   kernelCall('barrier').catch(() => {}).then(() => post({ type: 'thread-exit', code: exitCode, error: errPayload }));
 }
@@ -13690,6 +14188,7 @@ function kernelExit(code = 0, signal = null) {
   kernelExiting = true; runtimeNativeClearTimeout(kernelIdleTimer);
   try { processEvents.emit('exit', Number(code) || 0); } catch {}
   syncBack();
+  if (PROFILER.enabled && PROFILER.spans.length) post({ type: 'profiler-spans', spans: profilerTakeSpans() });
   kernelCall('barrier').catch(() => {}).then(() => post({ type: 'kernel-exit', code: Number(code) || 0, signal }));
 }
 function kernelUnhandled(e) {
@@ -13836,19 +14335,7 @@ Server.prototype.close = function(callback) {
 };
 Server.prototype.ref = function() { this._beownirUnref = false; return this; };
 Server.prototype.unref = function() { this._beownirUnref = true; kernelMaybeIdle(); return this; };
-self.fetch = async (input, init = {}) => {
-  const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
-  if (['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
-    const request = new Request(input instanceof Request ? input : url.href, init), method = request.method;
-    const body = ['GET', 'HEAD'].includes(method) ? null : new Uint8Array(await request.arrayBuffer());
-    if (body?.byteLength > 1024 * 1024) throw virtualError('EFBIG', 'Virtual request exceeds 1 MiB.');
-    const result = await kernelCall('http', { port: Number(url.port) || 80, url: url.pathname + url.search, method, headers: Object.fromEntries(request.headers), body });
-    return new Response([204, 205, 304].includes(result.status) || method === 'HEAD' ? null : result.body, { status: result.status, headers: result.headers });
-  }
-  if (url.origin !== 'https://registry.npmjs.org' || url.username || url.password) throw new Error('Network restricted to virtual loopback and https://registry.npmjs.org in single-file mode.');
-  if (!nativeFetch) throw FETCH_UNAVAILABLE();
-  return nativeFetch(input, { ...init, credentials: 'omit', redirect: 'error' });
-};
+self.fetch = (input, init = {}) => runtimeFetch(input, init, { allowKernelHttp: true });
 
 class WorkerChildProcess extends EventEmitter {
   constructor(command, args, options = {}) {
@@ -14231,6 +14718,10 @@ self.onmessage = async event => {
   try {
     if (message.type === 'init') {
       kernelInfo = message.kernel || kernelInfo; CWD = kernelInfo.cwd || '/project';
+      if (message.profiler) applyProfilerConfig(message.profiler);
+      else if (kernelInfo && kernelInfo.profiler) applyProfilerConfig(kernelInfo.profiler);
+      if (message.network) setNetworkConfig(message.network);
+      else if (kernelInfo && kernelInfo.network) setNetworkConfig(kernelInfo.network);
       kernelEpoch = typeof kernelInfo.epoch === 'number' ? kernelInfo.epoch : null; kernelRefreshNeeded = false;
       for (const [k, v] of kernelInfo.envData || []) ENV_DATA.set(k, v);
       processObj.env = { ...(kernelInfo.pid === 1 && !kernelInfo.isThread ? processObj.env : {}), ...(kernelInfo.env || {}), PWD: CWD }; processObj.connected = !!kernelInfo.ipc;
@@ -14308,6 +14799,17 @@ self.onmessage = async event => {
       return;
     }
     if (message.type === 'setfiles') { applyKernelFiles(message.files || {}, message.versions); if (typeof message.kernelEpoch === 'number') kernelEpoch = message.kernelEpoch; return; }
+    if (message.type === 'set-network') { setNetworkConfig(message.network); return; }
+    if (message.type === 'profiler') {
+      if (message.action === 'start') {
+        applyProfilerConfig({ enabled: true, maxSpans: message.maxSpans, reset: true });
+      } else if (message.action === 'stop' || message.action === 'snapshot') {
+        const spans = profilerTakeSpans();
+        if (message.action === 'stop') PROFILER.enabled = false;
+        post({ type: 'profiler-data', collectId: message.collectId, spans });
+      }
+      return;
+    }
     if (message.type === 'kernel-reply') {
       const pending = kernelPending.get(message.id); if (!pending) return; kernelPending.delete(message.id); runtimeNativeClearTimeout(pending.timer);
       if (message.error) pending.reject(virtualError(message.error.code, message.error.message)); else pending.resolve(message.result); kernelMaybeIdle(); return;

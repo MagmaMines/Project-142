@@ -72,7 +72,8 @@ fails fast with a name you can branch on.
 
 - `kernel.run(command, [{timeoutMs, onData}])` → `{code, stdout, stderr, cwd}`.
   Runs in a Node-compatible shell: `node file.js`, `node -e "…"`, `npm install`,
-  `npm run …`, `npx …`, `ls`, `cat`, `mkdir`, `echo`, pipes and redirects work.
+  `pnpm`, `yarn`, `bun`, `bunx`, `npm run …`, `npx …`, `ls`, `cat`, `mkdir`,
+  `echo`, pipes and redirects work.
   Output streams through `onData({stream: 'stdout'|'stderr', data})` and the
   `stdout`/`stderr` events while the promise is pending.
   `run('node server.js')` **resolves once the entry file is evaluated**, even
@@ -80,6 +81,39 @@ fails fast with a name you can branch on.
   keep running commands.
 - `kernel.sendInput(text)` — stdin for a program that is reading (prompts, REPLs).
 - `kernel.kill(pidOrPort?)` — sends a signal through the kernel.
+
+### Preview Mounting & Inspection
+
+- `kernel.mountPreview(iframe, { port, path, inspector })` → `{ port, path, inspector, reload, destroy }` —
+  fetches HTML and local scripts/stylesheets from the virtual server on `port`,
+  mounts a sandboxed `srcdoc` preview frame (`allow-scripts` + strict CSP),
+  bridges virtual `fetch`/cookies/WebSocket/HMR over `MessageChannel`, and attaches
+  a `PreviewInspector`.
+- `BeownirKernel.PreviewInspector` / `kernel.createInspector()` — opt-in structured
+  DOM/console/error/network/layout inspector (`attach`, `detach`, `ping`,
+  `waitUntil`, `metrics`, `text`, `console`, `errors`, `networkFailures`, `query`,
+  `dom`, `interactive`, `act`, `snapshot`, `destroy`) communicating via `MessageChannel`
+  over both `srcdoc` previews and same-origin service-worker previews (`o/site/coi-sw.js`)
+  without `eval`.
+
+### Opt-in Runtime Profiler
+
+- `kernel.startProfile(options)` / `kernel.getProfile()` / `kernel.stopProfile()` —
+  zero-overhead-when-inactive profiler capturing host, frame-kernel, and worker spans
+  (boot, gunzip, commands, npm installs, esbuild transforms, virtual HTTP, filesystem
+  sync, worker/thread lifecycle) with per-span aggregates (`count`, `totalMs`, `minMs`,
+  `maxMs`, `avgMs`, `p95Ms`).
+
+### Host Bundler & Server Adapters
+
+Zero-dependency ESM adapters ship in `o/embed/` and via `package.json` `exports`:
+
+- `beownir/vite` (`o/embed/vite.mjs`) — `beownir(options)` Vite plugin adding COOP/COEP
+  headers and serving `/__beownir__/beownir-kernel.js` and `/coi-sw.js` locally.
+- `beownir/next` (`o/embed/next.mjs`) — `withBeownir(nextConfig, options)` /
+  `getBeownirHeaders(options)` injecting Next.js `headers()` isolation rules.
+- `beownir/server` (`o/embed/server.mjs`) — `createBeownirMiddleware(options)` for
+  Express/Connect/Node HTTP and `createWebAssetResponse(request, options)` for Web Fetch handlers.
 
 ### Virtual HTTP
 

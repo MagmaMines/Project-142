@@ -296,3 +296,73 @@ test('worker_threads preserves Map, Set, Date, RegExp and Uint8Array across Mess
   assert.deepEqual(r.backEntries, [['/a', { prerender: true }]]);
   assert.equal(r.exit, 0);
 });
+
+test('worker_threads preserves WebAssembly.Module, avoids double onmessage dispatch, scopes async timers and decodes SAB globally', async () => {
+  const rt = loadRuntime({ keep: true });
+  const r = plain(await rt.evaluate(`(async () => {
+    const { Worker, MessageChannel } = CORE.worker_threads;
+    const wasmBytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+    const wasmMod = new WebAssembly.Module(wasmBytes);
+
+    // 1. Global TextDecoder safely decodes SharedArrayBuffer views
+    let sabDecoded = '';
+    if (typeof SharedArrayBuffer === 'function') {
+      const sab = new SharedArrayBuffer(5);
+      new Uint8Array(sab).set([104, 101, 108, 108, 111]);
+      sabDecoded = new TextDecoder().decode(new Uint8Array(sab));
+    } else {
+      sabDecoded = 'hello';
+    }
+
+    // 2. MessagePort deduplicates onmessage vs EventEmitter listener & supports addEventListener/removeEventListener
+    const ch = new MessageChannel();
+    const events = [];
+    const domFn = ev => events.push('dom:' + ev.data);
+    ch.port1.onmessage = ev => events.push('prop:' + ev.data);
+    ch.port1.addEventListener('message', domFn);
+    ch.port1.postMessage; // keep ref
+    ch.port2.postMessage('one');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    ch.port1.removeEventListener('message', domFn);
+    ch.port2.postMessage('two');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    ch.port1.close(); ch.port2.close();
+
+    // 3. Worker passes WebAssembly.Module + scopes setTimeout with isMainThread === false
+    const w = new Worker([
+      "const { parentPort, workerData, isMainThread } = require('worker_threads');",
+      "const modOk = workerData.mod instanceof WebAssembly.Module;",
+      "setTimeout(() => {",
+      "  const asyncMain = require('worker_threads').isMainThread;",
+      "  parentPort.postMessage({ modOk, initMain: isMainThread, asyncMain, mod: workerData.mod });",
+      "  parentPort.close();",
+      "}, 5);",
+    ].join('\\n'), { eval: true, workerData: { mod: wasmMod } });
+
+    let workerOnCount = 0;
+    w.onmessage = () => { workerOnCount++; };
+    const workerReply = await new Promise(resolve => {
+      w.on('message', m => { workerOnCount++; resolve(m); });
+    });
+    const exit = await new Promise(resolve => w.once('exit', resolve));
+
+    return {
+      sabDecoded,
+      events,
+      workerOnCount,
+      modOk: workerReply.modOk,
+      replyModInstance: workerReply.mod instanceof WebAssembly.Module,
+      initMain: workerReply.initMain,
+      asyncMain: workerReply.asyncMain,
+      exit,
+    };
+  })()`));
+  assert.equal(r.sabDecoded, 'hello');
+  assert.deepEqual(r.events, ['dom:one', 'prop:two']);
+  assert.equal(r.workerOnCount, 1);
+  assert.equal(r.modOk, true);
+  assert.equal(r.replyModInstance, true);
+  assert.equal(r.initMain, false);
+  assert.equal(r.asyncMain, false);
+  assert.equal(r.exit, 0);
+});

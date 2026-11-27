@@ -118,6 +118,72 @@ self.addEventListener('message', event => {
  * decides which mode to use; this worker just serves both faithfully. */
 const PREVIEW_PREFIX = '/__beownir_preview__/';
 const PREVIEW_TIMEOUT_MS = 20000;
+const swCookieJars = new Map();
+function swPortJar(port) {
+  let jar = swCookieJars.get(port);
+  if (!jar) { jar = new Map(); swCookieJars.set(port, jar); }
+  return jar;
+}
+function swParseCookie(raw, reqPath) {
+  const str = String(raw || '');
+  const semi = str.indexOf(';');
+  const first = (semi < 0 ? str : str.slice(0, semi)).trim();
+  const eq = first.indexOf('=');
+  if (eq <= 0) return null;
+  const name = first.slice(0, eq).trim();
+  const value = first.slice(eq + 1).trim();
+  let path = '/';
+  if (reqPath && reqPath.startsWith('/')) {
+    const slash = reqPath.lastIndexOf('/');
+    path = slash > 0 ? reqPath.slice(0, slash) : '/';
+  }
+  let maxAge = null, expiresAt = null, httpOnly = false;
+  if (semi >= 0) {
+    for (const part of str.slice(semi + 1).split(';')) {
+      const p = part.trim();
+      if (!p) continue;
+      const idx = p.indexOf('=');
+      const k = (idx < 0 ? p : p.slice(0, idx)).trim().toLowerCase();
+      const v = idx < 0 ? '' : p.slice(idx + 1).trim();
+      if (k === 'path' && v.startsWith('/')) path = v;
+      else if (k === 'max-age' && /^-?\d+$/.test(v)) maxAge = Number(v);
+      else if (k === 'expires') { const t = Date.parse(v); if (!Number.isNaN(t)) expiresAt = t; }
+      else if (k === 'httponly') httpOnly = true;
+    }
+  }
+  const exp = maxAge !== null ? (maxAge <= 0 ? 0 : Date.now() + maxAge * 1000) : expiresAt;
+  return { name, value, path, expiresAt: exp, httpOnly };
+}
+function swSetCookies(port, setCookieHeader, reqPath) {
+  const list = Array.isArray(setCookieHeader) ? setCookieHeader : setCookieHeader ? [String(setCookieHeader)] : [];
+  const jar = swPortJar(port);
+  for (const raw of list) {
+    const parsed = swParseCookie(raw, reqPath);
+    if (!parsed) continue;
+    const key = parsed.name + '\0' + parsed.path;
+    if (parsed.expiresAt !== null && parsed.expiresAt <= Date.now()) jar.delete(key);
+    else jar.set(key, parsed);
+  }
+}
+function swGetCookieHeader(port, reqPath) {
+  const jar = swCookieJars.get(port);
+  if (!jar || !jar.size) return '';
+  const now = Date.now(), p = reqPath.split('?')[0] || '/';
+  const out = [];
+  for (const [key, item] of jar) {
+    if (item.expiresAt !== null && item.expiresAt <= now) { jar.delete(key); continue; }
+    if (item.path === '/' || p === item.path || p.startsWith(item.path.endsWith('/') ? item.path : item.path + '/')) {
+      out.push(item.name + '=' + item.value);
+    }
+  }
+  return out.join('; ');
+}
+function swSubdomainPort(hostname) {
+  const match = /^p(\d{1,5})(?:-[a-z0-9-]+)?\./i.exec(String(hostname || ''));
+  if (!match) return 0;
+  const port = Number(match[1]);
+  return port >= 1 && port <= 65535 ? port : 0;
+}
 /* After a preview document loads, remember which port its client belongs to so
  * root-relative subresource URLs (/src/main.ts, /@vite/client, ...) also route
  * to the virtual server. Claims are re-established on every preview navigation;
@@ -148,6 +214,10 @@ const PREVIEW_WS_SHIM = `(function () {
     var rest = window.location.pathname.slice(prefix.length);
     var slash = rest.indexOf('/');
     previewPort = Number(slash < 0 ? rest : rest.slice(0, slash)) || 0;
+  }
+  if (!previewPort) {
+    var hm = /^p(\d{1,5})(?:-[a-z0-9-]+)?\./i.exec(window.location.hostname);
+    if (hm) previewPort = Number(hm[1]) || 0;
   }
   var NativeWebSocket = window.WebSocket;
   var bc = new BroadcastChannel('beownir-preview-ws');
@@ -267,6 +337,151 @@ const PREVIEW_WS_SHIM = `(function () {
     }
   };
   window.WebSocket = ShimSocket;
+  var INS_MAX = 200, insLogs = [], insErrs = [], insNet = [], insRefs = Object.create(null), insRefSeq = 0, insMutVer = 0, insLastMut = Date.now(), insObs = null;
+  function insPush(arr, item) { if (arr.length >= INS_MAX) arr.shift(); arr.push(item); }
+  function insFmt(v) { try { return typeof v === 'string' ? v : v instanceof Error ? (v.stack || v.message) : JSON.stringify(v); } catch (_) { return String(v); } }
+  ['log', 'info', 'warn', 'error', 'debug'].forEach(function (lvl) {
+    var orig = console[lvl].bind(console);
+    console[lvl] = function () {
+      var args = Array.prototype.slice.call(arguments, 0, 10);
+      insPush(insLogs, { level: lvl, args: args.map(function (v) { return String(insFmt(v)).slice(0, 2000); }), timestamp: Date.now() });
+      return orig.apply(console, arguments);
+    };
+  });
+  if (typeof window.fetch === 'function') {
+    var origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      var u = typeof input === 'string' ? input : (input && input.url) || '';
+      var m = (init && init.method) || (input && input.method) || 'GET';
+      return origFetch(input, init).then(function (res) {
+        if (res && res.status >= 400) insPush(insNet, { method: m, url: u, status: res.status, timestamp: Date.now() });
+        return res;
+      }, function (err) {
+        insPush(insNet, { method: m, url: u, status: 0, error: String(err && err.message || err), timestamp: Date.now() });
+        throw err;
+      });
+    };
+  }
+  window.addEventListener('error', function (ev) {
+    insPush(insErrs, { type: 'error', message: String(ev.message || (ev.error && ev.error.message) || 'Script error'), stack: ev.error && ev.error.stack ? String(ev.error.stack) : undefined, url: ev.filename || '', line: ev.lineno || 0, column: ev.colno || 0, timestamp: Date.now() });
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    insPush(insErrs, { type: 'rejection', message: String(ev.reason && ev.reason.message || ev.reason || 'Unhandled rejection'), stack: ev.reason && ev.reason.stack ? String(ev.reason.stack) : undefined, timestamp: Date.now() });
+  });
+  function insStartMut() {
+    if (insObs || typeof MutationObserver !== 'function') return;
+    var t = document.documentElement || document.body;
+    if (!t) return;
+    insObs = new MutationObserver(function () { insMutVer++; insLastMut = Date.now(); });
+    try { insObs.observe(t, { subtree: true, childList: true, attributes: true, characterData: true }); } catch (_) {}
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', insStartMut, { once: true });
+  else insStartMut();
+  function insRect(el) {
+    var r = el.getBoundingClientRect ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
+    return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height), top: Math.round(r.top), right: Math.round(r.right), bottom: Math.round(r.bottom), left: Math.round(r.left) };
+  }
+  function insVis(el) {
+    if (!el || !el.isConnected) return false;
+    var st = typeof getComputedStyle === 'function' ? getComputedStyle(el) : null;
+    if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  function insLabel(el) { return String(el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder') || el.innerText || el.textContent || el.value || '').trim().slice(0, 160); }
+  function insInteractive(limit) {
+    var list = document.querySelectorAll('a[href],button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[tabindex]');
+    return Array.prototype.slice.call(list, 0, Math.max(1, Math.min(200, Number(limit) || 100))).map(function (el) {
+      var ref = el.getAttribute('data-beownir-ref');
+      if (!ref) { ref = 'e' + (++insRefSeq); try { el.setAttribute('data-beownir-ref', ref); } catch (_) {} }
+      insRefs[ref] = el;
+      return { ref: ref, tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || (el.tagName === 'A' ? 'link' : el.tagName === 'BUTTON' ? 'button' : el.tagName.toLowerCase()), name: insLabel(el), value: 'value' in el && el.type !== 'password' ? String(el.value || '').slice(0, 400) : undefined, disabled: Boolean(el.disabled), checked: 'checked' in el ? Boolean(el.checked) : undefined, visible: insVis(el), rect: insRect(el) };
+    });
+  }
+  function insWait(cond, timeoutMs) {
+    var deadline = Math.max(100, Number(timeoutMs) || 10000);
+    if (!cond || cond === 'domcontentloaded') {
+      if (document.readyState !== 'loading') return Promise.resolve({ readyState: document.readyState });
+      return new Promise(function (resolve, reject) { var tm = setTimeout(function () { reject(new Error('Timed out waiting for domcontentloaded')); }, deadline); document.addEventListener('DOMContentLoaded', function () { clearTimeout(tm); resolve({ readyState: document.readyState }); }, { once: true }); });
+    }
+    if (cond === 'load') {
+      if (document.readyState === 'complete') return Promise.resolve({ readyState: document.readyState });
+      return new Promise(function (resolve, reject) { var tm = setTimeout(function () { reject(new Error('Timed out waiting for load')); }, deadline); window.addEventListener('load', function () { clearTimeout(tm); resolve({ readyState: document.readyState }); }, { once: true }); });
+    }
+    if (cond === 'settled') {
+      insStartMut();
+      return new Promise(function (resolve) { var s = Date.now(); function ck() { if (Date.now() - insLastMut >= 120 || Date.now() - s >= Math.min(deadline, 1500)) resolve({ mutationVersion: insMutVer, readyState: document.readyState }); else setTimeout(ck, 40); } setTimeout(ck, 60); });
+    }
+    if (typeof cond === 'object' && cond.selector) {
+      var sel = String(cond.selector);
+      if (document.querySelector(sel)) return Promise.resolve({ found: true, selector: sel });
+      return new Promise(function (resolve, reject) { var s = Date.now(); function pl() { if (document.querySelector(sel)) { resolve({ found: true, selector: sel }); return; } if (Date.now() - s >= deadline) { reject(new Error('Timed out waiting for selector: ' + sel)); return; } setTimeout(pl, 40); } setTimeout(pl, 20); });
+    }
+    return Promise.resolve({ readyState: document.readyState });
+  }
+  function insMetrics() {
+    var de = document.documentElement, b = document.body;
+    var sw = Math.max(de ? de.scrollWidth : 0, b ? b.scrollWidth : 0), sh = Math.max(de ? de.scrollHeight : 0, b ? b.scrollHeight : 0);
+    var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+    return { url: location.href, title: document.title || '', viewport: { width: vw, height: vh, scrollX: Math.round(window.scrollX || 0), scrollY: Math.round(window.scrollY || 0) }, documentSize: { width: sw, height: sh }, overflow: { horizontal: sw > vw, vertical: sh > vh }, mutationVersion: insMutVer };
+  }
+  function insDom(el, d, md, mc) {
+    if (!el || d > md) return null;
+    var n = { tag: el.tagName ? el.tagName.toLowerCase() : '#node', children: [] };
+    if (el.id) n.id = el.id;
+    if (typeof el.className === 'string' && el.className.trim()) n.class = el.className.trim().slice(0, 120);
+    if (!el.children || !el.children.length) { var txt = String(el.textContent || '').trim(); if (txt) n.text = txt.slice(0, 200); }
+    if (d < md && el.children) { for (var i = 0; i < Math.min(el.children.length, mc); i++) { var c = insDom(el.children[i], d + 1, md, mc); if (c) n.children.push(c); } }
+    return n;
+  }
+  function insRun(op, p) {
+    p = p || {};
+    if (op === 'ping') return Promise.resolve({ ready: true, readyState: document.readyState, url: location.href, title: document.title || '', mutationVersion: insMutVer });
+    if (op === 'waitUntil') return insWait(p.waitUntil || p.condition, p.timeout || p.timeoutMs);
+    if (op === 'metrics') return Promise.resolve(insMetrics());
+    if (op === 'text') { var r = p.selector ? document.querySelector(String(p.selector)) : (document.body || document.documentElement); var raw = r ? String(r.innerText !== undefined ? r.innerText : r.textContent || '') : ''; var ml = Math.max(100, Number(p.maxLength) || 16000); return Promise.resolve({ text: raw.slice(0, ml), length: raw.length, truncated: raw.length > ml }); }
+    if (op === 'console') return Promise.resolve(p.clear ? insLogs.splice(0, insLogs.length) : insLogs.slice());
+    if (op === 'errors') return Promise.resolve(p.clear ? insErrs.splice(0, insErrs.length) : insErrs.slice());
+    if (op === 'networkFailures') return Promise.resolve(p.clear ? insNet.splice(0, insNet.length) : insNet.slice());
+    if (op === 'interactive') return Promise.resolve(insInteractive(p.limit));
+    if (op === 'dom') { var dr = p.selector ? document.querySelector(String(p.selector)) : (document.body || document.documentElement); return Promise.resolve(insDom(dr, 0, Math.max(1, Math.min(8, Number(p.maxDepth) || 4)), Math.max(1, Math.min(60, Number(p.maxChildren) || 30)))); }
+    if (op === 'query') {
+      var sel = String(p.selector || '*'), lim = Math.max(1, Math.min(100, Number(p.limit) || 25));
+      return Promise.resolve(Array.prototype.slice.call(document.querySelectorAll(sel), 0, lim).map(function (el) {
+        return { selector: sel, tag: el.tagName.toLowerCase(), id: el.id || '', className: typeof el.className === 'string' ? el.className : '', text: String(el.innerText !== undefined ? el.innerText : el.textContent || '').trim().slice(0, 500), rect: insRect(el), visible: insVis(el), attributes: {}, computed: {} };
+      }));
+    }
+    if (op === 'act') {
+      var el = p.ref ? insRefs[String(p.ref)] : (p.selector ? document.querySelector(String(p.selector)) : null);
+      if (!el || !el.isConnected) return Promise.reject(new Error('Inspect target not found: ' + (p.ref || p.selector || 'missing')));
+      if (el.disabled) return Promise.reject(new Error('Inspect target is disabled'));
+      if (p.action === 'click') { if (el.focus) el.focus(); el.click(); }
+      else if (p.action === 'fill' || p.action === 'select') { el.value = String(p.value || ''); el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+      else if (p.action === 'press') { var key = String(p.key || 'Enter'); el.dispatchEvent(new KeyboardEvent('keydown', { key: key, bubbles: true, cancelable: true })); el.dispatchEvent(new KeyboardEvent('keyup', { key: key, bubbles: true, cancelable: true })); }
+      else return Promise.reject(new Error('Unsupported inspect action: ' + p.action));
+      return Promise.resolve({ ok: true, action: p.action, ref: p.ref || undefined, mutationVersion: insMutVer });
+    }
+    if (op === 'snapshot') {
+      return Promise.resolve(p.waitUntil ? insWait(p.waitUntil, p.timeout || p.timeoutMs) : null).then(function () {
+        var rt = p.selector ? document.querySelector(String(p.selector)) : (document.body || document.documentElement);
+        var txt = rt ? String(rt.innerText !== undefined ? rt.innerText : rt.textContent || '').slice(0, 16000) : '';
+        var m = insMetrics(); m.text = txt; m.console = insLogs.slice(); m.errors = insErrs.slice(); m.networkFailures = insNet.slice(); m.interactive = insInteractive(p.limit || 80); return m;
+      });
+    }
+    return Promise.reject(new Error('Unsupported inspection operation: ' + op));
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (!d || d.type !== 'beownir-inspect-request' || ev.source !== parent) return;
+    var replyPort = ev.ports && ev.ports[0];
+    Promise.resolve().then(function () { return insRun(d.op, d.params); }).then(function (data) {
+      var res = { type: 'beownir-inspect-response', id: d.id, ok: true, data: data };
+      if (replyPort) replyPort.postMessage(res); else parent.postMessage(res, '*');
+    }, function (err) {
+      var res = { type: 'beownir-inspect-response', id: d.id, ok: false, error: { message: String(err && err.message || err) } };
+      if (replyPort) replyPort.postMessage(res); else parent.postMessage(res, '*');
+    });
+  });
 })();`;
 async function injectPreviewScripts(response, request) {
   var type = response.headers.get('content-type') || '';
@@ -313,6 +528,9 @@ async function previewResponse(request, port, path) {
   const client = await kernelClient();
   if (!client) return textResponse('Open the Beownir IDE tab on this site to serve preview port ' + port + '.', 503);
   const body = ['GET', 'HEAD'].includes(request.method) ? undefined : new Uint8Array(await request.arrayBuffer());
+  const reqHeaders = Object.fromEntries(request.headers);
+  const jarCookies = swGetCookieHeader(port, path);
+  if (jarCookies) reqHeaders.cookie = reqHeaders.cookie ? reqHeaders.cookie + '; ' + jarCookies : jarCookies;
   const channel = new MessageChannel();
   const reply = new Promise((resolve, reject) => {
     const timer = setTimeout(() => { channel.port1.close(); reject(new Error('the IDE tab did not answer in time')); }, PREVIEW_TIMEOUT_MS);
@@ -324,12 +542,23 @@ async function previewResponse(request, port, path) {
   });
   client.postMessage({
     type: 'beownir-sw-http', port, url: path, method: request.method,
-    headers: Object.fromEntries(request.headers), body,
+    headers: reqHeaders, body,
   }, [channel.port2]);
   const result = await reply;
+  const respHeaders = new Headers();
+  if (result.headers && typeof result.headers === 'object') {
+    for (const [k, v] of Object.entries(result.headers)) {
+      if (k.toLowerCase() === 'set-cookie') {
+        swSetCookies(port, v, path);
+        continue;
+      }
+      if (Array.isArray(v)) for (const item of v) respHeaders.append(k, String(item));
+      else if (v !== undefined && v !== null) respHeaders.set(k, String(v));
+    }
+  }
   const noBody = [101, 204, 205, 304].includes(result.status) || request.method === 'HEAD';
   return new Response(noBody ? null : result.body, {
-    status: result.status, statusText: result.statusMessage || '', headers: result.headers || {},
+    status: result.status, statusText: result.statusMessage || '', headers: respHeaders,
   });
 }
 
@@ -347,6 +576,15 @@ self.addEventListener('fetch', event => {
       }
       claimPreviewClient(event.resultingClientId || event.clientId, explicit.port);
       event.respondWith(previewResponse(request, explicit.port, explicit.path)
+        .then(response => injectPreviewScripts(response, request))
+        .catch(error => textResponse('Preview failed: ' + error.message, 502))
+        .then(isolated));
+      return;
+    }
+    const subPort = swSubdomainPort(url.hostname);
+    if (subPort > 0 && url.pathname !== '/coi-sw.js') {
+      const path = url.pathname + url.search;
+      event.respondWith(previewResponse(request, subPort, path)
         .then(response => injectPreviewScripts(response, request))
         .catch(error => textResponse('Preview failed: ' + error.message, 502))
         .then(isolated));

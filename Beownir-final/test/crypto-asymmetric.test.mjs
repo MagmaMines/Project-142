@@ -120,6 +120,15 @@ test('OAEP with SHA-256 interoperates with OpenSSL in both directions', async ()
 `);
   const nodeOpened = crypto.privateDecrypt({ key: privateKey, ...options }, Buffer.from(fromRuntime, 'base64')).toString();
   assert.equal(nodeOpened, 'from runtime');
+
+  const rawNoSep = crypto.publicEncrypt({ key: publicKey, padding: crypto.constants.RSA_NO_PADDING }, Buffer.concat([Buffer.from([0x00, 0x02]), Buffer.alloc(254, 0x41)]));
+  assert.throws(() => crypto.privateDecrypt(privateKey, rawNoSep));
+  const rtRejectNoSep = run(runtime, `    const crypto = require('crypto');
+    const fs = require('fs');
+    const priv = crypto.createPrivateKey(fs.readFileSync('/project/private.pem', 'utf8'));
+    (() => { try { crypto.privateDecrypt(priv, Buffer.from(${JSON.stringify(rawNoSep.toString('base64'))}, 'base64')); return 'accepted'; } catch (e) { return e.code || 'rejected'; } })();
+`);
+  assert.notEqual(rtRejectNoSep, 'accepted');
 });
 
 test('keys exported by the runtime are readable by OpenSSL and vice versa', async () => {

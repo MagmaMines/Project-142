@@ -531,11 +531,18 @@ class WASI {
         return this._writeStrings(this._env, argvPtr, bufPtr);
       },
       clock_res_get(id, outPtr) {
-        this._view().setBigUint64(outPtr, 1000000n, true);
+        if (id < 0 || id > 3) return ERRNO.INVAL;
+        this._view().setBigUint64(outPtr, id === 0 ? 1000000n : 1000n, true);
         return ERRNO.SUCCESS;
       },
       clock_time_get(id, precision, outPtr) {
-        this._view().setBigUint64(outPtr, BigInt(Date.now()) * 1000000n, true);
+        if (id < 0 || id > 3) return ERRNO.INVAL;
+        const ns = id === 0
+          ? BigInt(Date.now()) * 1000000n
+          : (typeof performance !== 'undefined' && performance
+            ? BigInt(Math.max(0, Math.round(performance.now() * 1000))) * 1000n
+            : BigInt(Date.now()) * 1000000n);
+        this._view().setBigUint64(outPtr, ns, true);
         return ERRNO.SUCCESS;
       },
       random_get(ptr, len) {
@@ -550,14 +557,17 @@ class WASI {
         const ready = [];
         const clocks = [];
         const nowMs = Date.now();
+        const nowMonoMs = typeof performance !== 'undefined' && performance ? performance.now() : nowMs;
         for (let i = 0; i < count; i++) {
           const base = inPtr + i * 48;
           const userdata = view.getBigUint64(base, true);
           const type = view.getUint8(base + 8);
           if (type === 0) {
+            const clockId = view.getUint32(base + 16, true);
             const timeoutNs = view.getBigUint64(base + 24, true);
             const flags = view.getUint16(base + 40, true);
-            const delayMs = (flags & 1) ? Math.max(0, Number(timeoutNs) / 1e6 - nowMs) : Math.max(0, Number(timeoutNs) / 1e6);
+            const refMs = clockId === 0 ? nowMs : nowMonoMs;
+            const delayMs = (flags & 1) ? Math.max(0, Number(timeoutNs) / 1e6 - refMs) : Math.max(0, Number(timeoutNs) / 1e6);
             clocks.push({ userdata, type, delayMs });
           } else if (type === 1 || type === 2) {
             const fd = view.getInt32(base + 16, true);
@@ -795,6 +805,10 @@ class WASI {
         if (entry.kind === 'socket') entry.fdFlags = flags & FDFLAGS.NONBLOCK;
         return ERRNO.SUCCESS;
       },
+      fd_fdstat_set_rights(fd) {
+        this._entry(fd);
+        return ERRNO.SUCCESS;
+      },
       fd_filestat_get(fd, statPtr) {
         const entry = this._entry(fd);
         if (entry.kind === 'file') {
@@ -825,6 +839,11 @@ class WASI {
       },
       fd_readdir(fd, bufPtr, bufLen, cookie, usedPtr) {
         const entry = this._entry(fd, 'dir');
+        const cap = Math.max(0, Number(bufLen));
+        if (cap === 0) {
+          this._view().setUint32(usedPtr, 0, true);
+          return ERRNO.SUCCESS;
+        }
         const names = fs.readdirSync(entry.host);
         let used = 0;
         for (let index = Number(cookie); index < names.length; index++) {
@@ -842,8 +861,8 @@ class WASI {
           header.writeUInt32LE(name.length, 16);
           header.writeUInt8(childType, 20);
           const record = Buffer.concat([header, name]);
-          const room = Math.max(0, Number(bufLen) - used);
-          this._bytes(bufPtr + used, Math.min(room, record.length)).set(record.subarray(0, Math.min(room, record.length)));
+          const room = Math.max(0, cap - used);
+          if (room > 0) this._bytes(bufPtr + used, Math.min(room, record.length)).set(record.subarray(0, Math.min(room, record.length)));
           used += Math.min(room, record.length);
           if (room < record.length) break;
         }

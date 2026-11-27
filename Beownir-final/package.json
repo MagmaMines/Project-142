@@ -37,5 +37,28 @@
   },
   "files": [
     "o"
-  ]
+  ],
+  "exports": {
+    ".": {
+      "types": "./o/embed/beownir-kernel.d.ts",
+      "default": "./o/embed/kernel.mjs"
+    },
+    "./kernel": {
+      "types": "./o/embed/beownir-kernel.d.ts",
+      "default": "./o/embed/beownir-kernel.js"
+    },
+    "./vite": {
+      "types": "./o/embed/vite.d.ts",
+      "default": "./o/embed/vite.mjs"
+    },
+    "./next": {
+      "types": "./o/embed/next.d.ts",
+      "default": "./o/embed/next.mjs"
+    },
+    "./server": {
+      "types": "./o/embed/server.d.ts",
+      "default": "./o/embed/server.mjs"
+    },
+    "./package.json": "./package.json"
+  }
 }

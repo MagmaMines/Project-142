@@ -9,9 +9,39 @@
   window.addEventListener('message', event => {
     if (initialized || event.source !== parent || event.data?.type !== 'beownir-runtime' || !event.ports[0] || typeof event.data.source !== 'string') return;
     initialized = true;
-    const host = event.ports[0], processes = new Map(), threads = new Map(), actors = new Map(), files = Object.create(null), versions = Object.create(null), envData = new Map(), listeners = new Map(), httpRoutes = new Map(), syncSessions = new Set();
+    const host = event.ports[0], processes = new Map(), threads = new Map(), actors = new Map(), files = Object.create(null), versions = Object.create(null), envData = new Map(), listeners = new Map(), httpRoutes = new Map(), hostFetchPending = new Map(), syncSessions = new Set();
     let sourceURL, assets, nextPID = 2, nextThreadFallback = 1, sequence = 0, epoch = 0, stopped = false, inputPID = 1;
-    const MAX_PROCESSES = 8, MAX_THREADS = 16, utf8 = new TextEncoder();
+    let networkConfig = (event.data.network && typeof event.data.network === 'object') ? event.data.network
+      : (event.data.limits && typeof event.data.limits.network === 'object' ? event.data.limits.network : null);
+    const profilerState = {
+      enabled: Boolean(event.data.profiler && event.data.profiler.enabled),
+      maxSpans: Number(event.data.profiler && event.data.profiler.maxSpans) > 0 ? Math.min(20000, Math.floor(Number(event.data.profiler.maxSpans))) : 10000,
+      startedAt: Date.now(),
+      spans: [],
+    };
+    const recordKernelSpan = (name, category, startMs, metadata) => {
+      if (!profilerState.enabled || profilerState.spans.length >= profilerState.maxSpans) return;
+      const span = {
+        name,
+        category,
+        startTime: Date.now(),
+        durationMs: Number(Math.max(0, performance.now() - startMs).toFixed(3)),
+        thread: 'frame-kernel',
+        pid: 0,
+        threadId: 0,
+      };
+      if (metadata) span.metadata = metadata;
+      profilerState.spans.push(span);
+    };
+    const appendWorkerSpans = list => {
+      if (!Array.isArray(list) || !profilerState.enabled) return;
+      for (const s of list) {
+        if (profilerState.spans.length >= profilerState.maxSpans) break;
+        if (s && typeof s === 'object') profilerState.spans.push(s);
+      }
+    };
+    const pendingCollect = new Map();
+    const MAX_PROCESSES = 8, MAX_THREADS = 32, utf8 = new TextEncoder();
     // Shared cross-worker control slab when cross-origin isolation provides SharedArrayBuffer:
     // [0]=nextThreadId, [1]=fsEpoch, [2]=activeWorkers, [3]=envVersion
     const ctrlSab = typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(4096) : null;
@@ -139,6 +169,7 @@
       return list;
     }
     function fsUpdate(incoming, incomingVersions, authoritative, sourceActorKey) {
+      const __profStart = profilerState.enabled ? performance.now() : 0;
       if (!incoming || typeof incoming !== 'object' || Object.keys(incoming).length > 20000) throw error('EFBIG', 'Oversized virtual filesystem update.');
       const candidate = { ...files }, delta = Object.create(null), deltaVersions = Object.create(null);
       for (const [path, value] of Object.entries(incoming)) {
@@ -181,6 +212,7 @@
         const visible = Object.fromEntries(Object.entries(delta).filter(([p]) => p === '/project' || p.startsWith('/project/')));
         if (Object.keys(visible).length) sendHost({ type: 'fssync', files: visible, versions: deltaVersions });
       }
+      if (profilerState.enabled) recordKernelSpan('fs.update', 'filesystem', __profStart, { count: Object.keys(delta).length, authoritative });
     }
     function emitOutput(actor, type, value) {
       if (actor.syncSession && (type === 'stdout' || type === 'stderr')) {
@@ -287,14 +319,14 @@
     function startWorker(pid, ppid, spec = {}) {
       if (processes.size >= MAX_PROCESSES) throw error('EAGAIN', 'Virtual process limit reached (' + MAX_PROCESSES + ' including the IDE shell).');
       const worker = new Worker(sourceURL, { name: 'Beownir process ' + pid });
-      const process = { actorKey: 'p:' + pid, isThread: false, pid, ppid, threadId: 0, worker, state: 'booting', command: spec.command || 'beownir shell', args: spec.args || [], cwd: spec.cwd || '/project', env: spec.env || {}, stdio: spec.stdio || ['inherit', 'inherit', 'inherit'], ipc: !!spec.ipc, prepared: spec.prepared || [], syncSession: spec.syncSession || null, startedAt: Date.now(), outputWindow: performance.now(), outputMessages: 0, fsError: null };
+      const process = { actorKey: 'p:' + pid, isThread: false, pid, ppid, threadId: 0, worker, state: 'booting', command: spec.command || 'beownir shell', args: spec.args || [], cwd: spec.cwd || '/project', env: spec.env || {}, stdio: spec.stdio || ['inherit', 'inherit', 'inherit'], ipc: !!spec.ipc, prepared: spec.prepared || [], syncSession: spec.syncSession || null, startedAt: Date.now(), bootPerfStart: profilerState.enabled ? performance.now() : 0, outputWindow: performance.now(), outputMessages: 0, fsError: null };
       processes.set(pid, process);
       actors.set(process.actorKey, process);
       syncActiveCount();
       worker.onmessage = event => handleActorMessage(process, event.data);
       worker.onerror = event => { event.preventDefault(); finish(process, 1, null, error('ERR_WORKER', event.message || 'Virtual worker crashed.')); };
       worker.onmessageerror = () => finish(process, 1, null, error('ERR_IPC', 'Could not decode worker message.'));
-      process.bootTimeout = setTimeout(() => finish(process, 1, null, error('ETIMEDOUT', 'Virtual process startup timed out.')), 12000);
+      process.bootTimeout = setTimeout(() => finish(process, 1, null, error('ETIMEDOUT', 'Virtual process startup timed out.')), 30000);
       if (assets) initializeProcess(process);
       publishTable(); return process;
     }
@@ -304,7 +336,8 @@
       const deps = assets.deps ? assets.deps.slice().buffer : undefined;
       const transfer = deps ? [wasm, deps] : [wasm];
       const syncInput = process.syncSession?.inputBytes ? new Uint8Array(process.syncSession.inputBytes) : null;
-      process.worker.postMessage({ type: 'init', files, versions, embeddedEsbuildWasm: wasm, embeddedEsbuildBrowser: assets.browser, embeddedPako: assets.pako, deps, kernel: { pid: process.pid, ppid: process.ppid, isThread: false, threads: true, threadId: 0, cwd: process.cwd, env: process.env, ipc: process.ipc, stdio: process.stdio, prepared: process.prepared, hasSyncInput: !!process.syncSession, syncInput, ctrlSab, envData: serializeEnvData(), epoch } }, transfer);
+      const profilerCfg = profilerState.enabled ? { enabled: true, maxSpans: profilerState.maxSpans, reset: true } : null;
+      process.worker.postMessage({ type: 'init', files, versions, embeddedEsbuildWasm: wasm, embeddedEsbuildBrowser: assets.browser, embeddedPako: assets.pako, deps, network: networkConfig, profiler: profilerCfg, kernel: { pid: process.pid, ppid: process.ppid, isThread: false, threads: true, threadId: 0, cwd: process.cwd, env: process.env, ipc: process.ipc, stdio: process.stdio, prepared: process.prepared, hasSyncInput: !!process.syncSession, syncInput, ctrlSab, envData: serializeEnvData(), epoch, network: networkConfig, profiler: profilerCfg } }, transfer);
     }
     function spawnSyncProcess(actor, message) {
       const session = {
@@ -329,7 +362,7 @@
         syncSessions.add(session);
         if (!assets || typeof message.command !== 'string' || !Array.isArray(message.args) || message.args.some(a => typeof a !== 'string') || JSON.stringify(message.args).length > 16384) throw error('EINVAL', 'Invalid process arguments.');
         const command = message.command.split('/').pop();
-        if (!['node', 'nodejs', 'npm', 'pnpm', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'spawnSync ' + message.command + ' ENOENT');
+        if (!['node', 'nodejs', 'npm', 'pnpm', 'yarn', 'bun', 'bunx', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'spawnSync ' + message.command + ' ENOENT');
         if (!validPath(message.cwd) || !files[message.cwd]?.d) throw error('ENOENT', 'spawnSync ' + message.command + ' ENOENT');
         if (JSON.stringify(message.env || {}).length > 65536 || !Array.isArray(message.prepared || []) || JSON.stringify(message.prepared || []).length > 16 * 1024 * 1024) throw error('EFBIG', 'Process environment or prepared module graph exceeds limit.');
         if (message.deps instanceof ArrayBuffer) assets.deps = new Uint8Array(message.deps).slice();
@@ -380,7 +413,7 @@
         port: spec.port, mailboxes: spec.mailboxes || null, workerData: spec.workerData, transferredPorts: Array.isArray(spec.transferredPorts) ? spec.transferredPorts : [],
         filename: spec.filename, isEval: !!spec.isEval, name: spec.name || '', resourceLimits: spec.resourceLimits || null,
         execArgv: Array.isArray(spec.execArgv) ? spec.execArgv : [], argv: Array.isArray(spec.argv) ? spec.argv : [],
-        prepared: Array.isArray(spec.prepared) ? spec.prepared : [], startedAt: Date.now(), outputWindow: performance.now(), outputMessages: 0, fsError: null,
+        prepared: Array.isArray(spec.prepared) ? spec.prepared : [], startedAt: Date.now(), bootPerfStart: profilerState.enabled ? performance.now() : 0, outputWindow: performance.now(), outputMessages: 0, fsError: null,
       };
       threads.set(threadId, entry);
       actors.set(actorKey, entry);
@@ -388,7 +421,7 @@
       worker.onmessage = event => handleActorMessage(entry, event.data);
       worker.onerror = event => { event.preventDefault(); finishThread(entry, 1, error('ERR_WORKER', event.message || 'Worker thread crashed.')); };
       worker.onmessageerror = () => finishThread(entry, 1, error('ERR_IPC', 'Could not decode worker thread message.'));
-      entry.bootTimeout = setTimeout(() => finishThread(entry, 1, error('ETIMEDOUT', 'Worker thread startup timed out.')), 12000);
+      entry.bootTimeout = setTimeout(() => finishThread(entry, 1, error('ETIMEDOUT', 'Worker thread startup timed out.')), 30000);
       const wasm = assets.wasm.slice().buffer;
       const deps = assets.deps ? assets.deps.slice().buffer : undefined;
       const transfer = [wasm];
@@ -399,6 +432,7 @@
           transfer.push(item);
         }
       }
+      const profilerCfg = profilerState.enabled ? { enabled: true, maxSpans: profilerState.maxSpans, reset: true } : null;
       worker.postMessage({
         type: 'init',
         files,
@@ -407,6 +441,8 @@
         embeddedEsbuildBrowser: assets.browser,
         embeddedPako: assets.pako,
         deps,
+        network: networkConfig,
+        profiler: profilerCfg,
         kernel: {
           pid: entry.ownerKey === 'p:1' ? 1 : owner.pid,
           ppid: 0,
@@ -435,6 +471,8 @@
           execArgv: entry.execArgv,
           argv: entry.argv,
           epoch,
+          network: networkConfig,
+          profiler: profilerCfg,
         },
       }, transfer);
       // Drop references to transferred handles from router memory once handed to child.
@@ -465,7 +503,7 @@
         case 'spawn': {
           if (!assets || typeof data.command !== 'string' || !Array.isArray(data.args) || data.args.some(a => typeof a !== 'string') || JSON.stringify(data.args).length > 16384) throw error('EINVAL', 'Invalid process arguments.');
           const command = data.command.split('/').pop();
-          if (!['node', 'nodejs', 'npm', 'pnpm', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'No browser executable named ' + command + '. Native OS binaries cannot be spawned.');
+          if (!['node', 'nodejs', 'npm', 'pnpm', 'yarn', 'bun', 'bunx', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'No browser executable named ' + command + '. Native OS binaries cannot be spawned.');
           if (!validPath(data.cwd) || !files[data.cwd]?.d) throw error('ENOENT', 'Child working directory does not exist.');
           if (JSON.stringify(data.env || {}).length > 65536 || !Array.isArray(data.prepared) || JSON.stringify(data.prepared).length > 16 * 1024 * 1024) throw error('EFBIG', 'Process environment or prepared module graph exceeds limit.');
           if (data.deps instanceof ArrayBuffer) assets.deps = new Uint8Array(data.deps).slice();
@@ -516,6 +554,17 @@
         }
         case 'unbind-http': if (listeners.get(Number(data.port)) === actor.actorKey) { listeners.delete(Number(data.port)); sendHost({ type: 'close', port: Number(data.port) }); publishTable(); } return true;
         case 'http': return routeHTTP({ ...data, type: 'http' });
+        case 'host-fetch': {
+          if (!networkConfig?.useHostProxy) throw error('ENOTCAPABLE', 'Host fetch proxy relay is not enabled.');
+          if (typeof data.url !== 'string' || !/^https:\/\//i.test(data.url) || data.url.length > 8192) throw error('EINVAL', 'Invalid proxied fetch URL.');
+          if ((data.body?.byteLength || data.body?.length || 0) > 2 * 1024 * 1024) throw error('EFBIG', 'Proxied request body exceeds 2 MiB.');
+          const fetchId = 'host-fetch-' + ++sequence;
+          return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => { hostFetchPending.delete(fetchId); reject(error('ETIMEDOUT', 'Host fetch proxy timed out.')); }, 30000);
+            hostFetchPending.set(fetchId, { resolve, reject, timer });
+            sendHost({ type: 'host-fetch', id: fetchId, url: data.url, method: data.method || 'GET', headers: data.headers || {}, body: data.body || null });
+          });
+        }
         default: throw error('ENOSYS', 'Unknown virtual OS syscall: ' + message.op);
       }
     }
@@ -551,6 +600,19 @@
         threadEvent(actor, { event: 'online' });
         return;
       }
+      if (message.type === 'profiler-spans') {
+        appendWorkerSpans(message.spans);
+        return;
+      }
+      if (message.type === 'profiler-data') {
+        appendWorkerSpans(message.spans);
+        const pending = pendingCollect.get(message.collectId);
+        if (pending) {
+          pending.remaining.delete(actor.actorKey);
+          if (pending.remaining.size === 0) pending.finish();
+        }
+        return;
+      }
       if (message.type === 'thread-exit' && actor.isThread) {
         finishThread(actor, message.code, message.error || null);
         return;
@@ -565,6 +627,9 @@
       if (message.type === 'ready') {
         if (actor.ready) return; actor.ready = true;
         clearTimeout(actor.bootTimeout); actor.state = 'running';
+        if (profilerState.enabled && actor.bootPerfStart) {
+          recordKernelSpan(actor.isThread ? 'thread.boot' : 'worker.boot', 'workers', actor.bootPerfStart, { pid: actor.pid, threadId: actor.threadId || 0 });
+        }
         if (actor.isThread) return;
         publishTable();
         if (actor.pid === 1) sendHost({ type: 'ready' });
@@ -601,7 +666,8 @@
       for (const process of processes.values()) { clearTimeout(process.bootTimeout); clearTimeout(process.killTimeout); process.worker.terminate(); }
       for (const entry of threads.values()) { clearTimeout(entry.bootTimeout); entry.worker.terminate(); }
       for (const route of httpRoutes.values()) clearTimeout(route.timer);
-      processes.clear(); threads.clear(); actors.clear(); httpRoutes.clear(); listeners.clear(); if (sourceURL) URL.revokeObjectURL(sourceURL);
+      for (const pending of hostFetchPending.values()) { clearTimeout(pending.timer); pending.reject(error('ECONNRESET', 'Virtual OS stopped.')); }
+      processes.clear(); threads.clear(); actors.clear(); httpRoutes.clear(); hostFetchPending.clear(); listeners.clear(); if (sourceURL) URL.revokeObjectURL(sourceURL);
       host.postMessage({ type: 'kernel-stopped' }); host.close();
     }
     try {
@@ -611,6 +677,12 @@
         try {
           if (message.type === 'terminate') return shutdown();
           if (message.type === 'init') {
+            if (message.network && typeof message.network === 'object') networkConfig = message.network;
+            if (message.profiler && typeof message.profiler === 'object') {
+              profilerState.enabled = Boolean(message.profiler.enabled);
+              if (Number(message.profiler.maxSpans) > 0) profilerState.maxSpans = Math.min(20000, Math.floor(Number(message.profiler.maxSpans)));
+              if (profilerState.enabled) { profilerState.startedAt = Date.now(); profilerState.spans.length = 0; }
+            }
             const depsCopy = message.deps instanceof ArrayBuffer ? new Uint8Array(message.deps).slice()
               : ArrayBuffer.isView(message.deps) ? new Uint8Array(message.deps.buffer, message.deps.byteOffset, message.deps.byteLength).slice()
               : null;
@@ -618,6 +690,48 @@
             fsUpdate({ '/tmp': { d: true }, ...message.files }, message.versions, true, 'p:1'); initializeProcess(processes.get(1)); return;
           }
           if (message.type === 'setfiles') { fsUpdate(message.files, message.versions, true, 'host'); return; }
+          if (message.type === 'set-network') {
+            networkConfig = message.network && typeof message.network === 'object' ? message.network : null;
+            for (const actor of actors.values()) actor.worker.postMessage({ type: 'set-network', network: networkConfig });
+            return;
+          }
+          if (message.type === 'profiler') {
+            const action = message.action;
+            if (action === 'start') {
+              profilerState.enabled = true;
+              if (Number(message.maxSpans) > 0) profilerState.maxSpans = Math.min(20000, Math.floor(Number(message.maxSpans)));
+              profilerState.startedAt = Date.now();
+              profilerState.spans.length = 0;
+              for (const actor of actors.values()) actor.worker.postMessage({ type: 'profiler', action: 'start', maxSpans: profilerState.maxSpans });
+              if (message.id) sendHost({ type: 'profiler-report', id: message.id, report: { startedAt: profilerState.startedAt, spans: [] } });
+              return;
+            }
+            if (action === 'stop' || action === 'snapshot') {
+              const collectId = 'col-' + (++sequence);
+              const remaining = new Set(actors.keys());
+              const finishCollect = () => {
+                if (!pendingCollect.has(collectId)) return;
+                clearTimeout(entry.timer);
+                pendingCollect.delete(collectId);
+                const collected = profilerState.spans.slice();
+                if (action === 'stop') { profilerState.enabled = false; profilerState.spans.length = 0; }
+                sendHost({ type: 'profiler-report', id: message.id, report: { startedAt: profilerState.startedAt, endedAt: Date.now(), spans: collected } });
+              };
+              const entry = { remaining, finish: finishCollect, timer: setTimeout(finishCollect, 400) };
+              if (!remaining.size) { finishCollect(); return; }
+              pendingCollect.set(collectId, entry);
+              for (const actor of actors.values()) actor.worker.postMessage({ type: 'profiler', action, collectId });
+              return;
+            }
+          }
+          if (message.type === 'host-fetch-reply') {
+            const pending = hostFetchPending.get(message.id);
+            if (!pending) return;
+            clearTimeout(pending.timer); hostFetchPending.delete(message.id);
+            if (message.error) pending.reject(error(message.code || 'ENETUNREACH', message.error));
+            else pending.resolve({ status: message.status, statusMessage: message.statusText || '', headers: message.headers || {}, body: message.body instanceof Uint8Array ? message.body : new Uint8Array(message.body || []) });
+            return;
+          }
           if (message.type === 'http') {
             try { const response = await routeHTTP(message); sendHost({ ...response, type: 'httpres', id: message.id }); }
             catch (failure) { sendHost({ type: 'httpres', id: message.id, status: 502, headers: { 'content-type': 'text/plain' }, body: new TextEncoder().encode(failure.message) }); } return;

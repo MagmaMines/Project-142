@@ -29,6 +29,143 @@
   const CONTAINER_ID = 'beownir-kernel-host';
   const SANDBOX_POLICY = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src blob:; connect-src https://registry.npmjs.org; img-src data: blob:; style-src 'unsafe-inline'; base-uri 'none'; object-src 'none'; form-action 'none'";
 
+  function normaliseNetworkConfig(network) {
+    if (!network || typeof network !== 'object') return null;
+    const allowedFetchDomains = Array.isArray(network.allowedFetchDomains)
+      ? network.allowedFetchDomains
+          .map(d => String(d || '').trim().toLowerCase())
+          .filter(d => d && d !== '*' && !d.includes('/') && !d.includes(' ') && /^[a-z0-9*.-]+(?::\d{1,5})?$/.test(d))
+      : [];
+    const corsProxy = typeof network.corsProxy === 'string' && network.corsProxy.trim() ? network.corsProxy.trim() : null;
+    return {
+      allowedFetchDomains,
+      corsProxy,
+      useHostProxy: Boolean(network.useHostProxy),
+    };
+  }
+
+  function buildSandboxPolicy(network) {
+    const connect = ['https://registry.npmjs.org'];
+    if (network && Array.isArray(network.allowedFetchDomains)) {
+      for (const domain of network.allowedFetchDomains) {
+        if (domain.startsWith('*.')) connect.push('https://' + domain);
+        else connect.push('https://' + domain);
+      }
+    }
+    if (network && network.corsProxy) {
+      if (network.corsProxy.startsWith('/')) connect.push("'self'");
+      else {
+        try {
+          const u = new URL(network.corsProxy);
+          if (u.protocol === 'https:' || (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1'))) {
+            connect.push(u.origin);
+          }
+        } catch { /* ignore invalid corsProxy URL */ }
+      }
+    }
+    const dedup = [...new Set(connect)];
+    return "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src blob:; connect-src " + dedup.join(' ') + "; img-src data: blob:; style-src 'unsafe-inline'; base-uri 'none'; object-src 'none'; form-action 'none'";
+  }
+
+  class VirtualCookieJar {
+    constructor() {
+      this._ports = new Map();
+    }
+    _portMap(port) {
+      const p = Number(port) || 80;
+      let jar = this._ports.get(p);
+      if (!jar) { jar = new Map(); this._ports.set(p, jar); }
+      return jar;
+    }
+    _parse(raw, requestPath = '/') {
+      const str = String(raw || '');
+      const semi = str.indexOf(';');
+      const first = (semi < 0 ? str : str.slice(0, semi)).trim();
+      const eq = first.indexOf('=');
+      if (eq <= 0) return null;
+      const name = first.slice(0, eq).trim();
+      const value = first.slice(eq + 1).trim();
+      let path = '/';
+      if (requestPath && requestPath.startsWith('/')) {
+        const clean = requestPath.split('?')[0];
+        const slash = clean.lastIndexOf('/');
+        path = slash > 0 ? clean.slice(0, slash) : '/';
+      }
+      let domain = '', maxAge = null, expiresAt = null, httpOnly = false, secure = false, sameSite = 'Lax';
+      if (semi >= 0) {
+        for (const part of str.slice(semi + 1).split(';')) {
+          const t = part.trim();
+          if (!t) continue;
+          const idx = t.indexOf('=');
+          const k = (idx < 0 ? t : t.slice(0, idx)).trim().toLowerCase();
+          const v = idx < 0 ? '' : t.slice(idx + 1).trim();
+          if (k === 'path' && v.startsWith('/')) path = v;
+          else if (k === 'domain' && v) domain = v.replace(/^\./, '').toLowerCase();
+          else if (k === 'max-age' && /^-?\d+$/.test(v)) maxAge = Number(v);
+          else if (k === 'expires') { const ts = Date.parse(v); if (!Number.isNaN(ts)) expiresAt = ts; }
+          else if (k === 'httponly') httpOnly = true;
+          else if (k === 'secure') secure = true;
+          else if (k === 'samesite' && v) sameSite = v;
+        }
+      }
+      const expires = maxAge !== null ? (maxAge <= 0 ? 0 : Date.now() + maxAge * 1000) : expiresAt;
+      return { name, value, path, domain, expiresAt: expires, httpOnly, secure, sameSite };
+    }
+    set(port, setCookieHeader, requestPath = '/') {
+      const list = Array.isArray(setCookieHeader) ? setCookieHeader : setCookieHeader ? [String(setCookieHeader)] : [];
+      const jar = this._portMap(port);
+      for (const raw of list) {
+        const entry = this._parse(raw, requestPath);
+        if (!entry) continue;
+        const key = entry.name + '\0' + entry.domain + '\0' + entry.path;
+        if (entry.expiresAt !== null && entry.expiresAt <= Date.now()) jar.delete(key);
+        else jar.set(key, entry);
+      }
+    }
+    setDocumentCookie(port, raw, requestPath = '/') {
+      const entry = this._parse(raw, requestPath);
+      if (!entry || entry.httpOnly) return;
+      const jar = this._portMap(port);
+      const key = entry.name + '\0' + entry.domain + '\0' + entry.path;
+      if (entry.expiresAt !== null && entry.expiresAt <= Date.now()) jar.delete(key);
+      else jar.set(key, entry);
+    }
+    getCookieHeader(port, requestPath = '/', { includeHttpOnly = true } = {}) {
+      const jar = this._ports.get(Number(port) || 80);
+      if (!jar || !jar.size) return '';
+      const now = Date.now();
+      const reqPath = String(requestPath || '/').split('?')[0] || '/';
+      const pairs = [];
+      for (const [key, item] of jar) {
+        if (item.expiresAt !== null && item.expiresAt <= now) { jar.delete(key); continue; }
+        if (!includeHttpOnly && item.httpOnly) continue;
+        const pathMatch = item.path === '/' || reqPath === item.path || reqPath.startsWith(item.path.endsWith('/') ? item.path : item.path + '/');
+        if (pathMatch) pairs.push(item.name + '=' + item.value);
+      }
+      return pairs.join('; ');
+    }
+    getCookies(port) {
+      const jar = this._ports.get(Number(port) || 80);
+      if (!jar) return [];
+      const now = Date.now();
+      const out = [];
+      for (const [key, item] of jar) {
+        if (item.expiresAt !== null && item.expiresAt <= now) { jar.delete(key); continue; }
+        out.push({ ...item });
+      }
+      return out;
+    }
+    exportForBridge(port) {
+      return this.getCookies(port)
+        .filter(item => !item.httpOnly)
+        .map(item => item.name + '=' + item.value + '; Path=' + (item.path || '/') + (item.expiresAt ? '; Expires=' + new Date(item.expiresAt).toUTCString() : ''));
+    }
+    clear(port) {
+      if (port === undefined) this._ports.clear();
+      else this._ports.delete(Number(port) || 80);
+    }
+  }
+
   const isPlainObject = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
   const toErrorMessage = error => String((error && error.message) || error || 'Unknown error').slice(0, 4000);
 
@@ -97,10 +234,13 @@
   class BeownirKernel {
     /**
      * Options:
-     *   files        { '/project/app.js': 'console.log(1)' }  (optional)
-     *   container    Element or selector to host the hidden frame (default: <body>)
-     *   limits       { bytes, perFile, entries } overrides for the workspace budget
-     *   autostart    boot immediately (default true)
+     *   files           { '/project/app.js': 'console.log(1)' }  (optional)
+     *   container       Element or selector to host the hidden frame (default: <body>)
+     *   limits          { bytes, perFile, entries } overrides for the workspace budget
+     *   network         { allowedFetchDomains, corsProxy, useHostProxy }
+     *   previewOrigin   base or wildcard/template origin (e.g. 'https://*.preview.example.com')
+     *   previewSessionId optional identifier for {id} / * preview subdomain labels
+     *   autostart       boot immediately (default true)
      */
     constructor(options = {}) {
       this._options = options;
@@ -109,15 +249,44 @@
       this._ports = new Set();
       this._commands = new Map();
       this._pendingHttp = new Map();
+      this._cookieJar = new VirtualCookieJar();
+      this._network = normaliseNetworkConfig(options.network);
+      this._previewOrigin = typeof options.previewOrigin === 'string' && options.previewOrigin.trim() ? options.previewOrigin.trim() : null;
+      this._previewSessionId = typeof options.previewSessionId === 'string' && options.previewSessionId.trim()
+        ? options.previewSessionId.trim().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 24) || 'session'
+        : Math.random().toString(36).slice(2, 10);
       this._commandSeq = 0;
       this._state = 'idle';
       this._buffer = { stdout: '' };
       this._destroyed = false;
       this._frame = null;
       this._channel = null;
+      this._pendingProfiler = new Map();
+      this._profiler = {
+        enabled: Boolean(options.profiler && (options.profiler === true || options.profiler.enabled)),
+        startedAt: options.profiler ? Date.now() : 0,
+        maxSpans: options.profiler && Number(options.profiler.maxSpans) > 0 ? Math.min(20000, Math.floor(Number(options.profiler.maxSpans))) : 5000,
+        hostSpans: [],
+      };
       this._ready = this._deferred();
       this._booted = this._deferred();
       if (options.autostart !== false) this.start();
+    }
+
+    _recordHostSpan(name, category, startMs, detail) {
+      if (!this._profiler.enabled) return;
+      if (this._profiler.hostSpans.length >= this._profiler.maxSpans) this._profiler.hostSpans.shift();
+      const endMs = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+      this._profiler.hostSpans.push({
+        name,
+        category: category || 'host',
+        source: 'host',
+        pid: 0,
+        threadId: 0,
+        startMs,
+        durationMs: Math.max(0, endMs - startMs),
+        detail: detail || null,
+      });
     }
 
     _deferred() {
@@ -133,6 +302,7 @@
     start() {
       if (this._destroyed) return Promise.reject(new Error('This kernel instance was destroyed.'));
       if (this._frame) return this._booted.promise;
+      this._bootPerfStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
       this._setState('booting');
       const container = this._resolveContainer();
       const frame = document.createElement('iframe');
@@ -145,7 +315,8 @@
       frame.setAttribute('referrerpolicy', 'no-referrer');
       frame.setAttribute('aria-hidden', 'true');
       frame.style.cssText = 'position:absolute;width:0;height:0;border:0;visibility:hidden';
-      const policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"" + SANDBOX_POLICY + "\">";
+      const policyText = this._network ? buildSandboxPolicy(this._network) : SANDBOX_POLICY;
+      const policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"" + policyText + "\">";
       frame.srcdoc = '<!doctype html><meta charset="utf-8">' + policy + '<script>' + BUILD.kernel.replace(/<\/script/gi, '<\\/script') + '<\/script>';
       this._bootTimer = setTimeout(() => {
         this._fail(new Error('The kernel frame did not report back within 20 s. Sandboxed iframes or blob workers may be blocked on this page.'));
@@ -157,7 +328,7 @@
         this._channel.onmessage = event => this._receive(event.data);
         this._channel.start();
         frame.contentWindow.postMessage(
-          { type: 'beownir-runtime', source: BUILD.runtime, limits: this._options.limits || {} },
+          { type: 'beownir-runtime', source: BUILD.runtime, limits: this._options.limits || {}, network: this._network },
           '*',
           [pair.port2],
         );
@@ -195,6 +366,11 @@
       this._commands.clear();
       for (const pending of this._pendingHttp.values()) pending.reject(new Error('The kernel was destroyed.'));
       this._pendingHttp.clear();
+      for (const pending of this._pendingProfiler.values()) {
+        clearTimeout(pending.timer);
+        pending.resolve({ spans: [] });
+      }
+      this._pendingProfiler.clear();
       this._ports.clear();
       this._ready.reject(new Error('The kernel was destroyed.'));
       this._booted.reject(new Error('The kernel was destroyed.'));
@@ -268,8 +444,10 @@
       for (const previous of Object.keys(this._files)) {
         if (previous !== '/project' && previous !== '/tmp' && !(previous in patch)) patch[previous] = null;
       }
+      const pStart = this._profiler.enabled ? (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) : 0;
       await this._post({ type: 'setfiles', files: patch, versions: {} });
       this._files = next;
+      if (this._profiler.enabled) this._recordHostSpan('kernel.setFiles', 'filesystem', pStart, { count: Object.keys(patch).length });
       this._emit('files', { files: { ...patch } });
       return { files: { ...next } };
     }
@@ -279,8 +457,10 @@
       if (typeof content !== 'string') throw new TypeError('writeFile requires a string. Use writeFileBytes for binary content.');
       const target = assertWritablePath(normalisePath(path));
       const map = withParents({ [target]: { c: content } });
+      const pStart = this._profiler.enabled ? (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) : 0;
       await this._post({ type: 'setfiles', files: map, versions: {} });
       Object.assign(this._files, map);
+      if (this._profiler.enabled) this._recordHostSpan('kernel.writeFile', 'filesystem', pStart, { path: target, bytes: content.length });
       this._emit('files', { files: { [target]: map[target] } });
       return { path: target };
     }
@@ -342,7 +522,8 @@
         this._commands.delete(id);
         pending.reject(new Error('Command timed out after ' + timeoutMs + ' ms: ' + command));
       }, timeoutMs) : null;
-      this._commands.set(id, { ...pending, stdout: '', stderr: '', timer, onData });
+      const perfStart = this._profiler.enabled && typeof performance !== 'undefined' && performance.now ? performance.now() : 0;
+      this._commands.set(id, { ...pending, stdout: '', stderr: '', timer, onData, command, perfStart });
       /* The shell worker takes `line` and queues commands internally. */
       this._channel.postMessage({ type: 'cmd', id, line: command });
       return pending.promise;
@@ -369,22 +550,72 @@
      */
     async http(input, init = {}) {
       await this._ready.promise;
+      const pStart = this._profiler.enabled && typeof performance !== 'undefined' && performance.now ? performance.now() : 0;
       const url = new URL(String(input), 'http://localhost');
       const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+      const reqPath = url.pathname + url.search;
       const method = String(init.method || 'GET').toUpperCase();
       const headers = init.headers ? Object.fromEntries(new Headers(init.headers)) : {};
+      if (init.credentials !== 'omit') {
+        const jarCookies = this._cookieJar.getCookieHeader(port, reqPath, { includeHttpOnly: true });
+        if (jarCookies) headers.cookie = headers.cookie ? headers.cookie + '; ' + jarCookies : jarCookies;
+      }
       const body = init.body ? await new Response(init.body).arrayBuffer() : null;
       const id = 'http-' + (++this._commandSeq);
       const pending = this._deferred();
       this._pendingHttp.set(id, pending);
-      this._channel.postMessage({ type: 'http', id, port, url: url.pathname + url.search, method, headers, body: body ? new Uint8Array(body) : null });
+      this._channel.postMessage({ type: 'http', id, port, url: reqPath, method, headers, body: body ? new Uint8Array(body) : null });
       const response = await pending.promise;
+      const respHeaders = response.headers || {};
+      for (const [k, v] of Object.entries(respHeaders)) {
+        if (k.toLowerCase() === 'set-cookie') this._cookieJar.set(port, v, reqPath);
+      }
+      if (this._profiler.enabled) this._recordHostSpan('kernel.http', 'http', pStart, { port, method, path: reqPath, status: response.status });
       return {
         status: response.status,
-        headers: response.headers || {},
+        headers: respHeaders,
         bytes: response.body || new Uint8Array(),
         body: new TextDecoder().decode(response.body || new Uint8Array()),
       };
+    }
+
+    /** Returns preview cookies for a port (`includeHttpOnly` defaults to false for document.cookie parity). */
+    getPreviewCookies(port, path = '/', { includeHttpOnly = false } = {}) {
+      return this._cookieJar.getCookieHeader(port, path, { includeHttpOnly });
+    }
+
+    /** Sets a cookie into the isolated per-port cookie jar (`document.cookie` or `Set-Cookie` style). */
+    setPreviewCookie(port, cookie, path = '/') {
+      this._cookieJar.setDocumentCookie(port, cookie, path);
+    }
+
+    /** Clears cookies for one preview port, or all preview ports if omitted. */
+    clearPreviewCookies(port) {
+      this._cookieJar.clear(port);
+    }
+
+    /**
+     * Resolves an isolated preview URL for `port` and `path`. Supports exact
+     * origins (`https://preview.example.com`) and wildcard/template patterns
+     * (`https://*.preview.example.com`, `https://p{port}-{id}.preview.example.com`).
+     */
+    resolvePreviewUrl(port, path = '/') {
+      const p = Number(port) || 3000;
+      const cleanPath = String(path || '/').startsWith('/') ? String(path || '/') : '/' + String(path || '/');
+      if (!this._previewOrigin) return '/__beownir_preview__/' + p + cleanPath;
+      const label = 'p' + p + '-' + this._previewSessionId;
+      const resolved = this._previewOrigin
+        .replace(/\{port\}/g, String(p))
+        .replace(/\{id\}/g, this._previewSessionId)
+        .replace(/\*/g, label);
+      return new URL(cleanPath, resolved).href;
+    }
+
+    /** Updates runtime network policy (`allowedFetchDomains`, `corsProxy`, `useHostProxy`). */
+    setNetworkConfig(network) {
+      this._network = normaliseNetworkConfig(network);
+      if (this._channel) this._channel.postMessage({ type: 'set-network', network: this._network });
+      return this._network;
     }
 
     /** Convenience: parsed JSON from the virtual server. */
@@ -411,10 +642,222 @@
       throw new Error('Nothing answered on virtual port ' + port + ' within ' + timeoutMs + ' ms' + (lastError ? ': ' + lastError.message : ''));
     }
 
+    /* ---------------------------------------------------- preview & inspector */
+
+    createInspector() {
+      return new PreviewInspector();
+    }
+
+    async _buildPreviewSrcdoc(port, reqPath, token) {
+      const response = await this.http('http://localhost:' + port + reqPath);
+      if (response.status >= 400) throw new Error('Preview server returned HTTP ' + response.status + ' for ' + reqPath);
+      const rawHtml = response.body;
+      const configJson = JSON.stringify({
+        port: Number(port),
+        path: reqPath,
+        token,
+        cookies: this._cookieJar.exportForBridge(port),
+      }).replace(/</g, '\\u003c');
+      const csp = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: data:; style-src 'unsafe-inline'; img-src data: blob:; font-src data: blob:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'\">";
+      const bridgeScript = '<script>window.__BEOWNIR_PREVIEW_CONFIG__=' + configJson + ';\n' + String(BUILD.previewBridge || '').replace(/<\/script/gi, '<\\/script') + '<\/script>';
+
+      if (typeof DOMParser === 'function') {
+        const baseHref = new URL(reqPath, 'http://localhost:' + port).href;
+        const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+        doc.querySelectorAll('base,meta[http-equiv],iframe,frame,object,embed').forEach(node => node.remove());
+        for (const script of Array.from(doc.querySelectorAll('script[src]'))) {
+          const rawSrc = script.getAttribute('src');
+          let resolvedUrl;
+          try { resolvedUrl = new URL(rawSrc, baseHref); } catch { resolvedUrl = null; }
+          if (!resolvedUrl || resolvedUrl.origin !== 'http://localhost:' + port) { script.remove(); continue; }
+          const localPath = resolvedUrl.pathname + resolvedUrl.search;
+          if ((script.getAttribute('type') || '').toLowerCase().trim() === 'module') {
+            script.removeAttribute('src'); script.removeAttribute('crossorigin'); script.removeAttribute('defer'); script.removeAttribute('async');
+            script.textContent = 'globalThis.__beownirDynamicImport(' + JSON.stringify(localPath).replace(/</g, '\\u003c') + ').catch(function(e){console.error(e);});';
+          } else {
+            const res = await this.http('http://localhost:' + port + localPath);
+            if (res.status < 400) {
+              script.removeAttribute('src'); script.removeAttribute('crossorigin'); script.removeAttribute('defer'); script.removeAttribute('async');
+              script.textContent = res.body.replace(/<\/script/gi, '<\\/script');
+            } else {
+              script.remove();
+            }
+          }
+        }
+        for (const link of Array.from(doc.querySelectorAll('link'))) {
+          if ((link.rel || '').toLowerCase() === 'stylesheet') {
+            const rawHref = link.getAttribute('href');
+            let resolvedUrl;
+            try { resolvedUrl = new URL(rawHref, baseHref); } catch { resolvedUrl = null; }
+            if (!resolvedUrl || resolvedUrl.origin !== 'http://localhost:' + port) { link.remove(); continue; }
+            const res = await this.http('http://localhost:' + port + resolvedUrl.pathname + resolvedUrl.search);
+            if (res.status < 400) {
+              const style = doc.createElement('style');
+              style.textContent = res.body.replace(/<\/style/gi, '<\\/style');
+              link.replaceWith(style);
+            } else {
+              link.remove();
+            }
+          } else {
+            link.remove();
+          }
+        }
+        if (!doc.head) doc.documentElement.insertBefore(doc.createElement('head'), doc.body || null);
+        doc.head.insertAdjacentHTML('afterbegin', csp + bridgeScript);
+        return '<!doctype html>\n' + doc.documentElement.outerHTML;
+      }
+      const headInject = csp + bridgeScript;
+      if (/<head[^>]*>/i.test(rawHtml)) return rawHtml.replace(/<head[^>]*>/i, m => m + headInject);
+      return '<!doctype html><html><head>' + headInject + '</head><body>' + rawHtml + '</body></html>';
+    }
+
+    async mountPreview(iframe, { port = 3000, path = '/', inspector } = {}) {
+      await this._ready.promise;
+      if (!iframe || typeof iframe.setAttribute !== 'function') throw new TypeError('mountPreview requires a target iframe element.');
+      const targetPort = Number(port) || 3000;
+      let currentPath = String(path || '/').startsWith('/') ? String(path || '/') : '/' + String(path || '/');
+      const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      const activeInspector = inspector === false ? null : (inspector || new PreviewInspector());
+      let bridgePort = null;
+      let disposed = false;
+
+      const onWsEvent = msg => {
+        if (bridgePort && msg && msg.port === targetPort) {
+          try { bridgePort.postMessage(msg); } catch {}
+        }
+      };
+      this.on('wsevent', onWsEvent);
+
+      const attachFrame = () => {
+        if (disposed || !iframe.contentWindow) return;
+        const mc = new MessageChannel();
+        if (bridgePort) { try { bridgePort.close(); } catch {} }
+        bridgePort = mc.port1;
+        bridgePort.onmessage = async ev => {
+          const msg = ev.data;
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.type === 'ws') {
+            this._channel?.postMessage({ ...msg, port: targetPort });
+            return;
+          }
+          if (msg.type === 'cookie-set') {
+            this.setPreviewCookie(targetPort, msg.cookie || '', msg.path || '/');
+            return;
+          }
+          if (msg.type === 'console') {
+            this._emit('preview-console', { port: targetPort, level: msg.level, args: msg.args });
+            return;
+          }
+          if (msg.type === 'navigate') {
+            try { await load(msg.path || '/'); } catch {}
+            return;
+          }
+          if (msg.type === 'request') {
+            try {
+              const res = await this.http('http://localhost:' + targetPort + (msg.path || '/'), {
+                method: msg.method || 'GET',
+                headers: msg.headers || {},
+                body: msg.body || undefined,
+              });
+              const setCookies = [];
+              for (const [k, v] of Object.entries(res.headers || {})) {
+                if (k.toLowerCase() === 'set-cookie') {
+                  if (Array.isArray(v)) setCookies.push(...v);
+                  else if (v) setCookies.push(String(v));
+                }
+              }
+              const transferBytes = res.bytes instanceof Uint8Array ? res.bytes.slice() : new Uint8Array(res.bytes || []);
+              bridgePort?.postMessage({ id: msg.id, status: res.status, headers: res.headers, body: transferBytes, setCookies }, [transferBytes.buffer]);
+            } catch (error) {
+              bridgePort?.postMessage({ id: msg.id, error: toErrorMessage(error) });
+            }
+          }
+        };
+        bridgePort.start();
+        iframe.contentWindow.postMessage({ type: 'beownir-preview', token, port: targetPort }, '*', [mc.port2]);
+      };
+
+      const load = async (nextPath = currentPath) => {
+        if (disposed) throw new Error('Mounted preview was destroyed.');
+        currentPath = String(nextPath || '/').startsWith('/') ? String(nextPath || '/') : '/' + String(nextPath || '/');
+        const srcdoc = await this._buildPreviewSrcdoc(targetPort, currentPath, token);
+        iframe.setAttribute('sandbox', 'allow-scripts');
+        const loaded = new Promise(resolve => {
+          const onLoad = () => { attachFrame(); resolve(); };
+          iframe.addEventListener('load', onLoad, { once: true });
+        });
+        iframe.srcdoc = srcdoc;
+        await loaded;
+      };
+
+      if (activeInspector) activeInspector.attach(targetPort, iframe, { token });
+      await load(currentPath);
+
+      return {
+        port: targetPort,
+        get path() { return currentPath; },
+        inspector: activeInspector,
+        reload: nextPath => load(nextPath),
+        destroy: () => {
+          if (disposed) return;
+          disposed = true;
+          this.off('wsevent', onWsEvent);
+          if (activeInspector) activeInspector.detach(targetPort);
+          if (bridgePort) { try { bridgePort.close(); } catch {} bridgePort = null; }
+        },
+      };
+    }
+
+    /* -------------------------------------------------------- runtime profiler */
+
+    async startProfile(options = {}) {
+      this._profiler.enabled = true;
+      this._profiler.startedAt = Date.now();
+      this._profiler.hostSpans.length = 0;
+      if (Number(options.maxSpans) > 0) this._profiler.maxSpans = Math.min(20000, Math.floor(Number(options.maxSpans)));
+      if (this._channel && this._state === 'ready') {
+        const id = 'prof-' + (++this._commandSeq);
+        const pending = this._deferred();
+        const timer = setTimeout(() => { this._pendingProfiler.delete(id); pending.resolve({ spans: [] }); }, 500);
+        this._pendingProfiler.set(id, { resolve: pending.resolve, timer });
+        this._channel.postMessage({ type: 'profiler', action: 'start', id, maxSpans: this._profiler.maxSpans });
+        await pending.promise;
+      }
+      return { enabled: true, startedAt: this._profiler.startedAt };
+    }
+
+    async _collectProfile(action) {
+      let workerReport = { startedAt: this._profiler.startedAt, endedAt: Date.now(), spans: [] };
+      if (this._channel && this._state === 'ready') {
+        const id = 'prof-' + (++this._commandSeq);
+        const pending = this._deferred();
+        const timer = setTimeout(() => { this._pendingProfiler.delete(id); pending.resolve(workerReport); }, 1500);
+        this._pendingProfiler.set(id, { resolve: pending.resolve, timer });
+        this._channel.postMessage({ type: 'profiler', action, id });
+        workerReport = await pending.promise || workerReport;
+      }
+      const hostSpans = this._profiler.hostSpans.slice();
+      const spans = hostSpans.concat(Array.isArray(workerReport.spans) ? workerReport.spans : []);
+      if (action === 'stop') {
+        this._profiler.enabled = false;
+        this._profiler.hostSpans.length = 0;
+      }
+      return buildProfilerReport(spans, this._profiler.startedAt || workerReport.startedAt || Date.now(), workerReport.endedAt || Date.now());
+    }
+
+    async getProfile() {
+      return this._collectProfile('snapshot');
+    }
+
+    async stopProfile() {
+      return this._collectProfile('stop');
+    }
+
     /* -------------------------------------------------------------- internal */
 
     /** Decompresses the embedded esbuild wasm (gzipped base64, as the IDE ships it). */
     async _gunzipAssets() {
+      const pStart = this._profiler.enabled && typeof performance !== 'undefined' && performance.now ? performance.now() : 0;
       const compressed = decode64(BUILD.esbuildWasm);
       let wasm = null;
       if (typeof DecompressionStream === 'function') {
@@ -427,6 +870,7 @@
          * boots. */
         wasm = await gunzipInSandbox(compressed);
       }
+      if (this._profiler.enabled) this._recordHostSpan('kernel.gunzip', 'boot', pStart, { bytes: wasm.length });
       /* Transfer a copy so a view on a larger buffer can never leak extra bytes. */
       return { wasm: wasm.slice(), browser: decode64Text(BUILD.esbuildBrowser) };
     }
@@ -452,6 +896,8 @@
               files: withParents(this._files),
               versions: {},
               limits: this._options.limits || {},
+              network: this._network,
+              profiler: this._profiler.enabled ? { enabled: true, maxSpans: this._profiler.maxSpans } : null,
               embeddedEsbuildWasm: wasm,
               embeddedEsbuildBrowser: browser,
               embeddedPako: BUILD.pako,
@@ -460,8 +906,51 @@
           }).catch(error => this._fail(error));
           break;
         }
+        case 'profiler-report': {
+          const pending = this._pendingProfiler.get(message.id);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this._pendingProfiler.delete(message.id);
+            pending.resolve(message.report || { spans: [] });
+          }
+          break;
+        }
+        case 'host-fetch': {
+          const handleHostFetch = async () => {
+            if (!this._network || !this._network.useHostProxy) {
+              throw Object.assign(new Error('Host fetch proxy relay is disabled.'), { code: 'ENOTCAPABLE' });
+            }
+            const target = new URL(String(message.url || ''));
+            if (target.protocol !== 'https:' || target.username || target.password) {
+              throw Object.assign(new Error('Blocked host-fetch target URL.'), { code: 'ENOTCAPABLE' });
+            }
+            const host = target.hostname.toLowerCase();
+            if (Array.isArray(this._network.allowedFetchDomains) && this._network.allowedFetchDomains.length) {
+              const allowed = this._network.allowedFetchDomains.some(rule => rule.startsWith('*.') ? host.endsWith(rule.slice(1)) && host.length > rule.length - 1 : host === rule);
+              if (!allowed) throw Object.assign(new Error('Domain blocked by host network policy: ' + host), { code: 'ENOTCAPABLE' });
+            }
+            const fetchUrl = this._network.corsProxy
+              ? (this._network.corsProxy.includes('{url}') ? this._network.corsProxy.replace(/\{url\}/g, encodeURIComponent(target.href)) : this._network.corsProxy + (this._network.corsProxy.includes('?') ? '&' : '?') + 'url=' + encodeURIComponent(target.href))
+              : target.href;
+            const resp = await (typeof this._options.hostFetch === 'function'
+              ? this._options.hostFetch(fetchUrl, { method: message.method || 'GET', headers: message.headers || {}, body: message.body })
+              : global.fetch(fetchUrl, { method: message.method || 'GET', headers: message.headers || {}, body: ['GET', 'HEAD'].includes(String(message.method || 'GET').toUpperCase()) ? undefined : message.body, credentials: 'omit' }));
+            const headersObj = {};
+            resp.headers.forEach((v, k) => {
+              if (k.toLowerCase() === 'set-cookie') return;
+              headersObj[k] = v;
+            });
+            const bytes = new Uint8Array(await resp.arrayBuffer());
+            this._channel?.postMessage({ type: 'host-fetch-reply', id: message.id, status: resp.status, statusText: resp.statusText, headers: headersObj, body: bytes }, [bytes.buffer]);
+          };
+          handleHostFetch().catch(error => {
+            this._channel?.postMessage({ type: 'host-fetch-reply', id: message.id, error: toErrorMessage(error), code: error.code || 'ENETUNREACH' });
+          });
+          break;
+        }
         case 'ready': {
           clearTimeout(this._bootTimer);
+          if (this._profiler.enabled && this._bootPerfStart) this._recordHostSpan('kernel.boot', 'boot', this._bootPerfStart);
           this._setState('ready');
           this._booted.resolve(this);
           this._ready.resolve(this);
@@ -503,6 +992,7 @@
           if (!pending) break;
           clearTimeout(pending.timer);
           this._commands.delete(message.id);
+          if (this._profiler.enabled && pending.perfStart) this._recordHostSpan('kernel.run', 'shell', pending.perfStart, { command: String(pending.command || '').slice(0, 120), code: Number(message.code) || 0 });
           this._emit('exit', { id: message.id, code: Number(message.code) || 0, stdout: pending.stdout, stderr: pending.stderr });
           pending.resolve({ code: Number(message.code) || 0, stdout: pending.stdout, stderr: pending.stderr, cwd: message.cwd });
           break;
@@ -597,10 +1087,227 @@
     return out;
   }
 
+  class PreviewNotAttachedError extends Error {
+    constructor(port) {
+      super('No preview iframe is attached for port ' + port);
+      this.name = 'PreviewNotAttachedError';
+      this.code = 'PREVIEW_NOT_ATTACHED';
+      this.port = port;
+    }
+  }
+
+  class PreviewInspectionTimeoutError extends Error {
+    constructor(port, op, timeoutMs) {
+      super('Preview inspection "' + op + '" timed out after ' + timeoutMs + ' ms on port ' + port);
+      this.name = 'PreviewInspectionTimeoutError';
+      this.code = 'PREVIEW_TIMEOUT';
+      this.port = port;
+      this.op = op;
+    }
+  }
+
+  class PreviewAgentUnavailableError extends Error {
+    constructor(port, reason) {
+      super('Preview inspection agent is unavailable on port ' + port + (reason ? ': ' + reason : ''));
+      this.name = 'PreviewAgentUnavailableError';
+      this.code = 'PREVIEW_AGENT_UNAVAILABLE';
+      this.port = port;
+    }
+  }
+
+  class PreviewInspector {
+    constructor(options = {}) {
+      this._defaultTimeoutMs = Math.max(100, Number(options.timeoutMs) || 8000);
+      this._targets = new Map();
+      this._seq = 0;
+      this._destroyed = false;
+    }
+
+    attach(port, iframe, options = {}) {
+      if (this._destroyed) throw new Error('PreviewInspector was destroyed.');
+      const p = Number(port);
+      if (!Number.isInteger(p) || p <= 0) throw new TypeError('attach(port, iframe) requires a valid positive port.');
+      if (!iframe || typeof iframe !== 'object') throw new TypeError('attach(port, iframe) requires an iframe reference.');
+      this._targets.set(p, { port: p, iframe, token: options.token || null });
+      return this;
+    }
+
+    detach(port) {
+      this._targets.delete(Number(port));
+      return this;
+    }
+
+    isAttached(port) {
+      return this._targets.has(Number(port));
+    }
+
+    _sendOnce(target, op, params, timeoutMs) {
+      const win = target.iframe && target.iframe.contentWindow;
+      if (!win || typeof win.postMessage !== 'function') {
+        return Promise.reject(new PreviewAgentUnavailableError(target.port, 'iframe contentWindow is missing'));
+      }
+      const id = 'ins-' + (++this._seq);
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let mc = null;
+        const onWindowMessage = event => {
+          const d = event && event.data;
+          if (!d || d.type !== 'beownir-inspect-response' || d.id !== id) return;
+          cleanup();
+          if (d.ok) resolve(d.data);
+          else reject(new Error((d.error && d.error.message) || 'Preview inspection error'));
+        };
+        const cleanup = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (mc && mc.port1) { try { mc.port1.close(); } catch {} }
+          if (typeof global.removeEventListener === 'function') global.removeEventListener('message', onWindowMessage);
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new PreviewInspectionTimeoutError(target.port, op, timeoutMs));
+        }, timeoutMs);
+        if (typeof global.addEventListener === 'function') global.addEventListener('message', onWindowMessage);
+        const payload = { type: 'beownir-inspect-request', id, op, params: params || {}, token: target.token || undefined };
+        try {
+          if (typeof MessageChannel === 'function') {
+            mc = new MessageChannel();
+            mc.port1.onmessage = ev => {
+              const d = ev && ev.data;
+              if (!d || d.type !== 'beownir-inspect-response' || d.id !== id) return;
+              cleanup();
+              if (d.ok) resolve(d.data);
+              else reject(new Error((d.error && d.error.message) || 'Preview inspection error'));
+            };
+            mc.port1.start();
+            win.postMessage(payload, '*', [mc.port2]);
+          } else {
+            win.postMessage(payload, '*');
+          }
+        } catch (err) {
+          cleanup();
+          reject(new PreviewAgentUnavailableError(target.port, toErrorMessage(err)));
+        }
+      });
+    }
+
+    async _send(port, op, params = {}, options = {}) {
+      if (this._destroyed) throw new Error('PreviewInspector was destroyed.');
+      const p = Number(port);
+      const target = this._targets.get(p);
+      if (!target) throw new PreviewNotAttachedError(p);
+      const timeoutMs = Math.max(50, Number(options.timeoutMs) || this._defaultTimeoutMs);
+      const deadline = Date.now() + timeoutMs;
+      let lastError = null;
+      for (;;) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        const perTry = options.retry === false ? remaining : Math.min(remaining, Math.max(250, Math.min(timeoutMs, 1500)));
+        try {
+          return await this._sendOnce(target, op, params, perTry);
+        } catch (err) {
+          lastError = err;
+          if (options.retry === false || Date.now() >= deadline - 40) break;
+          if (err && err.code === 'PREVIEW_AGENT_UNAVAILABLE' || (err && err.code === 'PREVIEW_TIMEOUT' && op === 'ping')) {
+            await new Promise(resolve => setTimeout(resolve, 60));
+            continue;
+          }
+          break;
+        }
+      }
+      throw lastError || new PreviewInspectionTimeoutError(p, op, timeoutMs);
+    }
+
+    ping(port, opts = {}) { return this._send(port, 'ping', {}, opts); }
+    metrics(port, opts = {}) { return this._send(port, 'metrics', {}, opts); }
+    text(port, opts = {}) { return this._send(port, 'text', opts, opts); }
+    console(port, opts = {}) { return this._send(port, 'console', opts, opts); }
+    errors(port, opts = {}) { return this._send(port, 'errors', opts, opts); }
+    networkFailures(port, opts = {}) { return this._send(port, 'networkFailures', opts, opts); }
+    query(port, selector, opts = {}) { return this._send(port, 'query', { ...opts, selector }, opts); }
+    dom(port, opts = {}) { return this._send(port, 'dom', opts, opts); }
+    interactive(port, opts = {}) { return this._send(port, 'interactive', opts, opts); }
+    act(port, actionSpec, opts = {}) { return this._send(port, 'act', actionSpec || {}, opts); }
+    waitUntil(port, waitUntilSpec, opts = {}) {
+      const waitOpts = typeof waitUntilSpec === 'string' || (waitUntilSpec && waitUntilSpec.selector)
+        ? { waitUntil: waitUntilSpec, ...opts }
+        : { ...(waitUntilSpec || {}), ...opts };
+      return this._send(port, 'waitUntil', waitOpts, opts);
+    }
+    snapshot(port, opts = {}) { return this._send(port, 'snapshot', opts, opts); }
+
+    destroy() {
+      this._destroyed = true;
+      this._targets.clear();
+    }
+  }
+
+  function buildProfilerReport(rawSpans, startedAt, endedAt) {
+    const spans = (Array.isArray(rawSpans) ? rawSpans : []).slice().sort((a, b) => (a.startMs || 0) - (b.startMs || 0));
+    const byName = new Map();
+    const byCategory = {};
+    const slowSpans = [];
+    for (const s of spans) {
+      const cat = s.category || 'other';
+      const dur = Number(s.durationMs) || 0;
+      if (!byCategory[cat]) byCategory[cat] = { count: 0, totalMs: 0 };
+      byCategory[cat].count++;
+      byCategory[cat].totalMs += dur;
+      if (dur >= 100) slowSpans.push(s);
+      let list = byName.get(s.name);
+      if (!list) { list = []; byName.set(s.name, list); }
+      list.push(dur);
+    }
+    const aggregates = {};
+    for (const [name, list] of byName) {
+      list.sort((a, b) => a - b);
+      let sum = 0;
+      for (const v of list) sum += v;
+      const p95Idx = Math.min(list.length - 1, Math.floor(list.length * 0.95));
+      aggregates[name] = {
+        count: list.length,
+        totalMs: Number(sum.toFixed(3)),
+        minMs: Number(list[0].toFixed(3)),
+        maxMs: Number(list[list.length - 1].toFixed(3)),
+        avgMs: Number((sum / list.length).toFixed(3)),
+        p95Ms: Number(list[p95Idx].toFixed(3)),
+      };
+    }
+    const warnings = [];
+    if (typeof crossOriginIsolated !== 'undefined' && !crossOriginIsolated) {
+      warnings.push('crossOriginIsolated is false; SharedArrayBuffer and synchronous multi-thread atomics run in fallback mode.');
+    }
+    return {
+      startedAt,
+      endedAt,
+      durationMs: Math.max(0, endedAt - startedAt),
+      spans,
+      aggregates,
+      summary: {
+        totalSpans: spans.length,
+        byCategory,
+        slowSpanCount: slowSpans.length,
+        slowSpans: slowSpans.slice(0, 25),
+        warnings,
+      },
+      environment: {
+        version: BUILD.version,
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'node',
+        crossOriginIsolated: typeof crossOriginIsolated !== 'undefined' ? Boolean(crossOriginIsolated) : false,
+      },
+    };
+  }
+
   const api = {
     version: BUILD.version,
     create: options => new BeownirKernel(options),
     BeownirKernel,
+    VirtualCookieJar,
+    PreviewInspector,
+    PreviewNotAttachedError,
+    PreviewInspectionTimeoutError,
+    PreviewAgentUnavailableError,
     normalisePath,
     /** Feature probe for a host that wants to warn before booting. */
     capabilities: () => ({

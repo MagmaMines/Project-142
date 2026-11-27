@@ -6,15 +6,93 @@
   const base = new URL(config.path, virtualOrigin);
   let port, sequence = 0;
   const waiting = new Map();
+  // Per-preview virtual cookie jar (works inside opaque srcdoc frames where native document.cookie throws).
+  const cookieStore = new Map();
+  function parseCookiePair(raw) {
+    const str = String(raw || '');
+    const semi = str.indexOf(';');
+    const first = (semi < 0 ? str : str.slice(0, semi)).trim();
+    const eq = first.indexOf('=');
+    if (eq <= 0) return null;
+    const name = first.slice(0, eq).trim();
+    const value = first.slice(eq + 1).trim();
+    const attrs = semi < 0 ? '' : str.slice(semi + 1);
+    let path = '/';
+    let maxAge = null;
+    let expiresAt = null;
+    let httpOnly = false;
+    for (const part of attrs.split(';')) {
+      const p = part.trim();
+      if (!p) continue;
+      const idx = p.indexOf('=');
+      const k = (idx < 0 ? p : p.slice(0, idx)).trim().toLowerCase();
+      const v = idx < 0 ? '' : p.slice(idx + 1).trim();
+      if (k === 'path' && v.startsWith('/')) path = v;
+      else if (k === 'max-age' && /^-?\d+$/.test(v)) maxAge = Number(v);
+      else if (k === 'expires') { const t = Date.parse(v); if (!Number.isNaN(t)) expiresAt = t; }
+      else if (k === 'httponly') httpOnly = true;
+    }
+    const exp = maxAge !== null ? (maxAge <= 0 ? 0 : Date.now() + maxAge * 1000) : expiresAt;
+    return { name, value, path, expiresAt: exp, httpOnly };
+  }
+  function applyVirtualCookie(raw, fromDocument = false) {
+    const parsed = parseCookiePair(raw);
+    if (!parsed) return;
+    if (fromDocument && parsed.httpOnly) return;
+    const key = parsed.name + '\0' + parsed.path;
+    if (parsed.expiresAt !== null && parsed.expiresAt <= Date.now()) { cookieStore.delete(key); return; }
+    cookieStore.set(key, parsed);
+  }
+  function readVirtualDocumentCookies() {
+    const now = Date.now(), reqPath = base.pathname || '/';
+    const out = [];
+    for (const [key, item] of cookieStore) {
+      if (item.expiresAt !== null && item.expiresAt <= now) { cookieStore.delete(key); continue; }
+      if (item.httpOnly) continue;
+      if (item.path === '/' || reqPath === item.path || reqPath.startsWith(item.path.endsWith('/') ? item.path : item.path + '/')) {
+        out.push(item.name + '=' + item.value);
+      }
+    }
+    return out.join('; ');
+  }
+  if (Array.isArray(config.cookies)) {
+    for (const c of config.cookies) applyVirtualCookie(c, false);
+  } else if (typeof config.cookies === 'string' && config.cookies) {
+    for (const c of config.cookies.split(';')) applyVirtualCookie(c.trim(), true);
+  }
+  try {
+    Object.defineProperty(document, 'cookie', {
+      configurable: true,
+      enumerable: true,
+      get() { return readVirtualDocumentCookies(); },
+      set(val) {
+        const text = String(val ?? '');
+        applyVirtualCookie(text, true);
+        send({ type: 'cookie-set', cookie: text, path: location.pathname || config.path || '/' }).catch(() => {});
+      },
+    });
+  } catch { /* host document may disallow cookie override */ }
   const connected = new Promise(resolve => {
     window.addEventListener('message', function connect(event) {
       if (event.source !== parent || event.data?.type !== 'beownir-preview' || event.data.token !== config.token || !event.ports[0]) return;
       port = event.ports[0]; window.removeEventListener('message', connect);
       port.onmessage = event => {
         if (event.data?.type === 'wsevent') { dispatchWsEvent(event.data); return; }
+        if (event.data?.type === 'cookie-sync' && Array.isArray(event.data.cookies)) {
+          cookieStore.clear();
+          for (const c of event.data.cookies) applyVirtualCookie(c, false);
+          return;
+        }
+        if (event.data?.type === 'beownir-inspect-request') {
+          handleInspectRequest(event.data, res => { try { port.postMessage(res); } catch {} });
+          return;
+        }
         const message = event.data, request = waiting.get(message?.id);
         if (!request) return;
         waiting.delete(message.id); clearTimeout(request.timer);
+        if (Array.isArray(message.setCookies)) {
+          for (const c of message.setCookies) applyVirtualCookie(c, false);
+        }
         if (message.error) request.reject(new Error(message.error)); else request.resolve(message);
       };
       port.start(); resolve(port);
@@ -29,6 +107,11 @@
     if (url.origin !== virtualOrigin) throw new TypeError('External preview requests are disabled. Use a backend or a browser-compatible API integration outside single-file mode.');
     const request = new Request(url.href, { ...(input instanceof Request ? { method: input.method, headers: input.headers, body: ['GET', 'HEAD'].includes(input.method) ? undefined : await input.clone().arrayBuffer() } : {}), ...init });
     if (request.signal.aborted) throw new DOMException('Request aborted', 'AbortError');
+    const reqHeaders = Object.fromEntries(request.headers);
+    if (!reqHeaders.cookie && (request.credentials === 'include' || request.credentials === 'same-origin' || !init.credentials)) {
+      const jarCookie = readVirtualDocumentCookies();
+      if (jarCookie) reqHeaders.cookie = jarCookie;
+    }
     const body = ['GET', 'HEAD'].includes(request.method) ? null : await request.arrayBuffer();
     if (body && body.byteLength > 1024 * 1024) throw new Error('Virtual request body exceeds 1 MiB.');
     const id = ++sequence;
@@ -36,16 +119,266 @@
       const timer = setTimeout(() => { waiting.delete(id); reject(new Error('Virtual request timed out.')); }, 15000);
       waiting.set(id, { resolve, reject, timer });
       request.signal.addEventListener('abort', () => { const item = waiting.get(id); if (item) { clearTimeout(item.timer); waiting.delete(id); reject(new DOMException('Request aborted', 'AbortError')); } }, { once: true });
-      send({ type: 'request', id, path: url.pathname + url.search, method: request.method, headers: Object.fromEntries(request.headers), body }).catch(error => { clearTimeout(timer); waiting.delete(id); reject(error); });
+      send({ type: 'request', id, path: url.pathname + url.search, method: request.method, headers: reqHeaders, body }).catch(error => { clearTimeout(timer); waiting.delete(id); reject(error); });
     });
+    if (response.status >= 400) pushInspectItem(inspectNetworkFailures, { method: request.method, url: url.pathname + url.search, status: response.status, timestamp: Date.now() });
     const noBody = [101, 204, 205, 304].includes(response.status) || request.method === 'HEAD';
     return new Response(noBody ? null : response.body, { status: response.status, headers: response.headers });
   };
+  const INSPECT_MAX = 200;
+  const inspectLogs = [], inspectErrors = [], inspectNetworkFailures = [];
+  const inspectRefs = new Map();
+  const inspectElementToRef = typeof WeakMap === 'function' ? new WeakMap() : null;
+  let inspectRefSeq = 0, mutationVersion = 0, lastMutationAt = Date.now(), mutationObserver = null;
+  function pushInspectItem(list, item) {
+    if (list.length >= INSPECT_MAX) list.shift();
+    list.push(item);
+  }
+  function startMutationTracking() {
+    if (mutationObserver || typeof MutationObserver !== 'function') return;
+    const target = document.documentElement || document.body;
+    if (!target) return;
+    mutationObserver = new MutationObserver(() => { mutationVersion++; lastMutationAt = Date.now(); });
+    try { mutationObserver.observe(target, { subtree: true, childList: true, attributes: true, characterData: true }); } catch {}
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startMutationTracking, { once: true });
+  else startMutationTracking();
   function safeFormat(value) { try { return typeof value === 'string' ? value : value instanceof Error ? value.stack || value.message : JSON.stringify(value); } catch { return String(value); } }
   let logCount = 0;
   for (const name of ['log', 'info', 'warn', 'error', 'debug']) {
     const original = console[name].bind(console);
-    console[name] = (...args) => { original(...args); if (++logCount < 2000) send({ type: 'console', level: name, args: args.slice(0, 10).map(v => String(safeFormat(v)).slice(0, 2000)) }).catch(() => {}); };
+    console[name] = (...args) => {
+      original(...args);
+      const formatted = args.slice(0, 10).map(v => String(safeFormat(v)).slice(0, 2000));
+      pushInspectItem(inspectLogs, { level: name, args: formatted, timestamp: Date.now() });
+      if (++logCount < 2000) send({ type: 'console', level: name, args: formatted }).catch(() => {});
+    };
+  }
+  function roundRect(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0 };
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height), top: Math.round(r.top), right: Math.round(r.right), bottom: Math.round(r.bottom), left: Math.round(r.left) };
+  }
+  function isVisibleElement(el) {
+    if (!el || !el.isConnected) return false;
+    const style = typeof getComputedStyle === 'function' ? getComputedStyle(el) : null;
+    if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  function elementLabel(el) {
+    return (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder') || el.innerText || el.textContent || el.value || '').trim().slice(0, 160);
+  }
+  function refForElement(el) {
+    if (inspectElementToRef && inspectElementToRef.has(el)) return inspectElementToRef.get(el);
+    const ref = 'e' + (++inspectRefSeq);
+    inspectRefs.set(ref, el);
+    if (inspectElementToRef) inspectElementToRef.set(el, ref);
+    return ref;
+  }
+  function inspectMetrics() {
+    const de = document.documentElement, body = document.body;
+    const sw = Math.max(de ? de.scrollWidth : 0, body ? body.scrollWidth : 0);
+    const sh = Math.max(de ? de.scrollHeight : 0, body ? body.scrollHeight : 0);
+    const vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+    return {
+      url: base.href,
+      title: document.title || '',
+      viewport: { width: vw, height: vh, scrollX: Math.round(window.scrollX || 0), scrollY: Math.round(window.scrollY || 0) },
+      documentSize: { width: sw, height: sh },
+      overflow: { horizontal: sw > vw, vertical: sh > vh },
+      mutationVersion,
+    };
+  }
+  function collectInteractive(limit = 100) {
+    const sel = 'a[href],button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[tabindex]';
+    const nodes = Array.from(document.querySelectorAll(sel)).slice(0, Math.max(1, Math.min(200, Number(limit) || 100)));
+    return nodes.map(el => ({
+      ref: refForElement(el),
+      tag: el.tagName.toLowerCase(),
+      role: el.getAttribute('role') || (el.tagName === 'A' ? 'link' : el.tagName === 'BUTTON' ? 'button' : el.tagName === 'SELECT' ? 'combobox' : (el.tagName === 'INPUT' ? (el.type || 'textbox') : el.tagName.toLowerCase())),
+      name: elementLabel(el),
+      value: 'value' in el && el.type !== 'password' ? String(el.value ?? '').slice(0, 400) : undefined,
+      disabled: Boolean(el.disabled),
+      checked: 'checked' in el ? Boolean(el.checked) : undefined,
+      visible: isVisibleElement(el),
+      rect: roundRect(el),
+    }));
+  }
+  function buildDomNode(el, depth, maxDepth, maxChildren) {
+    if (!el || depth > maxDepth) return null;
+    const node = {
+      tag: el.tagName ? el.tagName.toLowerCase() : '#node',
+      children: [],
+    };
+    if (el.id) node.id = el.id;
+    if (typeof el.className === 'string' && el.className.trim()) node.class = el.className.trim().slice(0, 120);
+    const role = el.getAttribute && el.getAttribute('role');
+    if (role) node.role = role;
+    if (!el.children || el.children.length === 0) {
+      const txt = (el.textContent || '').trim();
+      if (txt) node.text = txt.slice(0, 200);
+    }
+    if (depth < maxDepth && el.children) {
+      const len = Math.min(el.children.length, maxChildren);
+      for (let i = 0; i < len; i++) {
+        const child = buildDomNode(el.children[i], depth + 1, maxDepth, maxChildren);
+        if (child) node.children.push(child);
+      }
+    }
+    return node;
+  }
+  function waitForInspectCondition(condition, timeoutMs = 10000) {
+    const deadline = Math.max(100, Number(timeoutMs) || 10000);
+    if (!condition || condition === 'domcontentloaded') {
+      if (document.readyState !== 'loading') return Promise.resolve({ readyState: document.readyState });
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Timed out waiting for domcontentloaded')), deadline);
+        document.addEventListener('DOMContentLoaded', () => { clearTimeout(timer); resolve({ readyState: document.readyState }); }, { once: true });
+      });
+    }
+    if (condition === 'load') {
+      if (document.readyState === 'complete') return Promise.resolve({ readyState: document.readyState });
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Timed out waiting for load')), deadline);
+        window.addEventListener('load', () => { clearTimeout(timer); resolve({ readyState: document.readyState }); }, { once: true });
+      });
+    }
+    if (condition === 'settled') {
+      startMutationTracking();
+      return new Promise(resolve => {
+        const start = Date.now();
+        const check = () => {
+          if (Date.now() - lastMutationAt >= 120 || Date.now() - start >= Math.min(deadline, 1500)) {
+            resolve({ mutationVersion, readyState: document.readyState });
+          } else setTimeout(check, 40);
+        };
+        setTimeout(check, 60);
+      });
+    }
+    if (typeof condition === 'object' && condition.selector) {
+      const sel = String(condition.selector);
+      if (document.querySelector(sel)) return Promise.resolve({ found: true, selector: sel });
+      return new Promise((resolve, reject) => {
+        const start = Date.now();
+        const poll = () => {
+          if (document.querySelector(sel)) { resolve({ found: true, selector: sel }); return; }
+          if (Date.now() - start >= deadline) { reject(new Error('Timed out waiting for selector: ' + sel)); return; }
+          setTimeout(poll, 40);
+        };
+        setTimeout(poll, 20);
+      });
+    }
+    return Promise.resolve({ readyState: document.readyState });
+  }
+  function setNativeValue(el, value) {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && typeof desc.set === 'function') desc.set.call(el, value);
+    else el.value = value;
+  }
+  async function runInspectOp(op, params = {}) {
+    switch (op) {
+      case 'ping':
+        return { ready: true, readyState: document.readyState, url: base.href, title: document.title || '', mutationVersion };
+      case 'waitUntil':
+        return waitForInspectCondition(params.waitUntil || params.condition, params.timeout || params.timeoutMs);
+      case 'metrics':
+        return inspectMetrics();
+      case 'text': {
+        const root = params.selector ? document.querySelector(String(params.selector)) : (document.body || document.documentElement);
+        if (!root) return { text: '', length: 0, truncated: false };
+        const raw = String(root.innerText !== undefined ? root.innerText : root.textContent || '');
+        const maxLen = Math.max(100, Number(params.maxLength) || 16000);
+        return { text: raw.slice(0, maxLen), length: raw.length, truncated: raw.length > maxLen };
+      }
+      case 'console':
+        return params.clear ? inspectLogs.splice(0, inspectLogs.length) : inspectLogs.slice();
+      case 'errors':
+        return params.clear ? inspectErrors.splice(0, inspectErrors.length) : inspectErrors.slice();
+      case 'networkFailures':
+        return params.clear ? inspectNetworkFailures.splice(0, inspectNetworkFailures.length) : inspectNetworkFailures.slice();
+      case 'query': {
+        const sel = String(params.selector || '*');
+        const limit = Math.max(1, Math.min(100, Number(params.limit) || 25));
+        const styleKeys = Array.isArray(params.computedStyles) ? params.computedStyles.map(String) : [];
+        return Array.from(document.querySelectorAll(sel)).slice(0, limit).map(el => {
+          const attrs = {};
+          for (const attr of Array.from(el.attributes || [])) attrs[attr.name] = String(attr.value).slice(0, 400);
+          const computed = {};
+          if (styleKeys.length && typeof getComputedStyle === 'function') {
+            const cs = getComputedStyle(el);
+            for (const k of styleKeys) computed[k] = cs.getPropertyValue(k) || cs[k] || '';
+          }
+          return {
+            selector: sel,
+            tag: el.tagName.toLowerCase(),
+            id: el.id || '',
+            className: typeof el.className === 'string' ? el.className : '',
+            text: String(el.innerText !== undefined ? el.innerText : el.textContent || '').trim().slice(0, 500),
+            rect: roundRect(el),
+            visible: isVisibleElement(el),
+            attributes: attrs,
+            computed,
+          };
+        });
+      }
+      case 'dom': {
+        const root = params.selector ? document.querySelector(String(params.selector)) : (document.body || document.documentElement);
+        if (!root) return null;
+        return buildDomNode(root, 0, Math.max(1, Math.min(8, Number(params.maxDepth) || 4)), Math.max(1, Math.min(60, Number(params.maxChildren) || 30)));
+      }
+      case 'interactive':
+        return collectInteractive(params.limit);
+      case 'act': {
+        const action = String(params.action || '');
+        const target = params.ref ? inspectRefs.get(String(params.ref)) : (params.selector ? document.querySelector(String(params.selector)) : null);
+        if (!target || !target.isConnected) throw new Error('Inspect target not found: ' + (params.ref || params.selector || 'missing'));
+        if (target.disabled) throw new Error('Inspect target is disabled: ' + (params.ref || params.selector));
+        if (action === 'click') {
+          if (typeof target.focus === 'function') target.focus();
+          target.click();
+        } else if (action === 'fill') {
+          if (typeof target.focus === 'function') target.focus();
+          setNativeValue(target, String(params.value ?? ''));
+          target.dispatchEvent(new Event('input', { bubbles: true }));
+          target.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (action === 'select') {
+          setNativeValue(target, String(params.value ?? ''));
+          target.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (action === 'press') {
+          const key = String(params.key || 'Enter');
+          if (typeof target.focus === 'function') target.focus();
+          target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+          target.dispatchEvent(new KeyboardEvent('keypress', { key, bubbles: true, cancelable: true }));
+          target.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, cancelable: true }));
+        } else {
+          throw new Error('Unsupported inspect action: ' + action);
+        }
+        return { ok: true, action, ref: params.ref || undefined, mutationVersion };
+      }
+      case 'snapshot': {
+        if (params.waitUntil) await waitForInspectCondition(params.waitUntil, params.timeout || params.timeoutMs);
+        const root = params.selector ? document.querySelector(String(params.selector)) : (document.body || document.documentElement);
+        const text = root ? String(root.innerText !== undefined ? root.innerText : root.textContent || '').slice(0, 16000) : '';
+        return {
+          ...inspectMetrics(),
+          text,
+          console: inspectLogs.slice(),
+          errors: inspectErrors.slice(),
+          networkFailures: inspectNetworkFailures.slice(),
+          interactive: collectInteractive(params.limit || 80),
+        };
+      }
+      default:
+        throw new Error('Unsupported inspection operation: ' + op);
+    }
+  }
+  function handleInspectRequest(message, sendReply) {
+    Promise.resolve()
+      .then(() => runInspectOp(message.op, message.params || {}))
+      .then(data => sendReply({ type: 'beownir-inspect-response', id: message.id, port: config.port, ok: true, data }))
+      .catch(error => sendReply({ type: 'beownir-inspect-response', id: message.id, port: config.port, ok: false, error: { message: String(error?.message || error) } }));
   }
   /* Live reload: the IDE captures the scroll offset and typed form values
    * before a refresh and restores them once the new document is ready, so a
@@ -55,6 +388,18 @@
   window.addEventListener('message', event => {
     const data = event.data;
     if (!data || typeof data !== 'object') return;
+    if (data.type === 'beownir-inspect-request') {
+      if (event.source !== parent) return;
+      if (config.token && data.token && data.token !== config.token) return;
+      const replyPort = event.ports && event.ports[0];
+      handleInspectRequest(data, res => {
+        try {
+          if (replyPort) replyPort.postMessage(res);
+          else parent.postMessage(res, '*');
+        } catch { /* detached frame */ }
+      });
+      return;
+    }
     if (data.type === 'beownir-preview-capture') {
       const state = { scroll: [Math.round(window.scrollX || 0), Math.round(window.scrollY || 0)], fields: [], focus: null };
       controlNodes().forEach((node, index) => {
@@ -94,8 +439,17 @@
       if (document.readyState !== 'complete') window.addEventListener('load', apply, { once: true });
     }
   });
-  window.addEventListener('error', event => console.error(event.error?.stack || event.message));
-  window.addEventListener('unhandledrejection', event => console.error(event.reason?.stack || event.reason));
+  window.addEventListener('error', event => {
+    const msg = event.error?.stack || event.message || 'Script error';
+    pushInspectItem(inspectErrors, { type: 'error', message: String(event.message || msg), stack: event.error?.stack ? String(event.error.stack) : undefined, url: event.filename || '', line: event.lineno || 0, column: event.colno || 0, timestamp: Date.now() });
+    console.error(msg);
+  });
+  window.addEventListener('unhandledrejection', event => {
+    const msg = event.reason?.stack || event.reason || 'Unhandled rejection';
+    pushInspectItem(inspectErrors, { type: 'rejection', message: String(event.reason?.message || event.reason || msg), stack: event.reason?.stack ? String(event.reason.stack) : undefined, timestamp: Date.now() });
+    console.error(msg);
+  });
+  try { parent.postMessage({ type: 'beownir-inspect-ready', port: config.port, path: base.pathname + base.search }, '*'); } catch {}
   document.addEventListener('click', event => {
     const link = event.target.closest?.('a[href]'); if (!link) return;
     if (link.getAttribute('href')?.startsWith('#')) return;

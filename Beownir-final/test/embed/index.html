@@ -190,6 +190,73 @@
     return 'binary [0,128,255,254,65], removeFile dir, setFiles clean';
   });
 
+  add('yarn and bun execute scripts and TypeScript while git remains excluded', async () => {
+    await kernel.writeFile('package.json', JSON.stringify({
+      name: 'cli-e2e',
+      version: '1.0.0',
+      scripts: { greet: 'node -e "console.log(\'YARN_E2E_OK\')"' },
+    }, null, 2));
+    await kernel.writeFile('typed.ts', 'const msg: string = "BUN_TS_E2E_OK";\nconsole.log(msg);\n');
+    const yRes = await kernel.run('yarn greet');
+    if (yRes.code !== 0 || !yRes.stdout.includes('YARN_E2E_OK')) throw new Error('yarn failed: ' + JSON.stringify(yRes));
+    const bRes = await kernel.run('bun run typed.ts');
+    if (bRes.code !== 0 || !bRes.stdout.includes('BUN_TS_E2E_OK')) throw new Error('bun failed: ' + JSON.stringify(bRes));
+    const gRes = await kernel.run('git --version');
+    if (gRes.code === 0) throw new Error('git unexpectedly succeeded');
+    return 'yarn + bun TS OK, git excluded';
+  });
+
+  add('opt-in profiler captures host + kernel + worker spans and mountPreview + PreviewInspector drive live preview DOM', async () => {
+    await kernel.startProfile({ maxSpans: 1000 });
+    await kernel.writeFile('inspector-app.js', [
+      "const http = require('http');",
+      "const html = '<!doctype html><html><head><title>Preview App</title></head><body>' +",
+      "  '<h1 id=\"heading\">Preview Ready</h1>' +",
+      "  '<input id=\"name\" placeholder=\"Name\" />' +",
+      "  '<button id=\"inc\">Increment</button>' +",
+      "  '<div id=\"out\">0:</div>' +",
+      "  '<script>' +",
+      "  'var c=0;document.getElementById(\"inc\").addEventListener(\"click\",function(){c++;document.getElementById(\"out\").textContent=c+\":\"+document.getElementById(\"name\").value;console.log(\"clicked\",c);});' +",
+      "  '</scr' + 'ipt></body></html>';",
+      "http.createServer((req, res) => {",
+      "  res.writeHead(200, { 'content-type': 'text/html' });",
+      "  res.end(html);",
+      "}).listen(5174);",
+      '',
+    ].join('\n'));
+    kernel.run('node inspector-app.js').catch(() => {});
+    await kernel.waitForServer(5174, { path: '/', timeoutMs: 25000 });
+
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'width:640px;height:480px;border:0;position:fixed;left:-2000px;top:0';
+    document.body.appendChild(iframe);
+    const mounted = await kernel.mountPreview(iframe, { port: 5174, path: '/' });
+    try {
+      const ins = mounted.inspector;
+      await ins.waitUntil(5174, { selector: '#inc', timeout: 10000 });
+      const items = await ins.interactive(5174);
+      const inputItem = items.find(i => i.tag === 'input');
+      const btnItem = items.find(i => i.tag === 'button');
+      if (!inputItem || !btnItem) throw new Error('interactive elements missing: ' + JSON.stringify(items));
+      await ins.act(5174, { action: 'fill', ref: inputItem.ref, value: 'Beownir' });
+      await ins.act(5174, { action: 'click', ref: btnItem.ref });
+      const snap = await ins.snapshot(5174);
+      if (!snap.text.includes('1:Beownir')) throw new Error('snapshot text mismatch: ' + JSON.stringify(snap.text));
+      if (!snap.console.some(c => c.args.join(' ').includes('clicked'))) throw new Error('console log missing: ' + JSON.stringify(snap.console));
+      if (snap.errors.length) throw new Error('unexpected preview errors: ' + JSON.stringify(snap.errors));
+    } finally {
+      mounted.destroy();
+      iframe.remove();
+    }
+
+    const report = await kernel.stopProfile();
+    const names = new Set(report.spans.map(s => s.name));
+    if (!names.has('kernel.run') || !names.has('kernel.http') || !names.has('shell.command') || !names.has('http.serve')) {
+      throw new Error('missing expected profile spans: ' + JSON.stringify([...names]));
+    }
+    return 'inspector DOM+act+snapshot & ' + report.summary.totalSpans + ' profile spans';
+  });
+
   add('boots without DecompressionStream (pako iframe fallback)', async () => {
     const native = window.DecompressionStream;
     delete window.DecompressionStream; // Firefox < 113 / Safari < 16.4 path

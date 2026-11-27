@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import net from 'node:net';
@@ -192,6 +193,122 @@ test('websocket upgrades without a trusted origin are rejected', { timeout: 6000
     assert.notEqual(await attempt(runtime + '/tcp/'), 'open', 'the registry relay requires a same-origin browser page');
     assert.notEqual(await attempt(runtime + '/owner/' + id + '?cap=' + cap), 'open', 'the preview broker requires a runtime origin');
     assert.notEqual(await attempt('ws://127.0.0.1:' + (base + 2) + '/socket'), 'open', 'the preview origin requires a session cookie');
+  } finally {
+    host.child.kill('SIGTERM');
+    await host.exited;
+  }
+});
+
+test('host supports wildcard previewOrigin and opt-in SSRF-guarded CORS proxy', { timeout: 60000 }, async () => {
+  const base = await findBase();
+  const host = startHost([appFile], {
+    PORT: String(base),
+    BEOWNIR_PREVIEW_ORIGIN: 'http://*.preview.localhost:' + (base + 2),
+    BEOWNIR_CORS_PROXY: '1',
+    BEOWNIR_ALLOWED_FETCH_DOMAINS: 'api.github.com,*.example.org',
+  });
+  try {
+    await host.ready;
+    const ide = 'http://127.0.0.1:' + base;
+    const runtime = 'http://127.0.0.1:' + (base + 1);
+    const pageHtml = await (await get(ide + '/')).text();
+    assert.ok(pageHtml.includes('"previewPattern":"http://*.preview.localhost:' + (base + 2) + '"'));
+    assert.ok(pageHtml.includes('"corsProxy":"' + ide + '/__beownir_cors_proxy__"'));
+    assert.ok(pageHtml.includes('"allowedFetchDomains":["api.github.com","*.example.org"]'));
+
+    const rtFrame = await get(runtime + '/');
+    const rtCsp = rtFrame.headers.get('content-security-policy') || '';
+    assert.match(rtCsp, /https:\/\/api\.github\.com/);
+    assert.match(rtCsp, /https:\/\/\*\.example\.org/);
+
+    // CORS preflight for trusted IDE origin succeeds; untrusted origin is 403
+    const preflightOk = await fetch(ide + '/__beownir_cors_proxy__', {
+      method: 'OPTIONS',
+      headers: { origin: ide },
+    });
+    assert.equal(preflightOk.status, 204);
+    assert.equal(preflightOk.headers.get('access-control-allow-origin'), ide);
+
+    const badOrigin = await get(ide + '/__beownir_cors_proxy__?url=' + encodeURIComponent('https://api.github.com/zen'), {
+      headers: { origin: 'https://evil.example' },
+    });
+    assert.equal(badOrigin.status, 403);
+
+    // SSRF & allowlist enforcement on proxy endpoint
+    for (const blockedUrl of [
+      'http://127.0.0.1:' + base + '/',
+      'https://169.254.169.254/latest/meta-data/',
+      'https://10.0.0.1/',
+      'https://user:pass@api.github.com/',
+      'https://unlisted.example.net/',
+    ]) {
+      const resp = await get(ide + '/__beownir_cors_proxy__?url=' + encodeURIComponent(blockedUrl), {
+        headers: { origin: ide },
+      });
+      assert.equal(resp.status, 403, 'expected 403 for blocked proxy target: ' + blockedUrl);
+    }
+
+    const ownerJs = await (await get(runtime + '/runtime-owner.mjs')).text();
+    assert.match(ownerJs, /previewUrlOrigin/);
+
+    if (typeof WebSocket === 'function') {
+      const id = 'a'.repeat(32), cap = 'b'.repeat(64);
+      const ownerWs = new WebSocket('ws://127.0.0.1:' + (base + 1) + '/owner/' + id + '?cap=' + cap, { headers: { origin: runtime } });
+      await new Promise((resolve, reject) => {
+        ownerWs.addEventListener('open', resolve, { once: true });
+        ownerWs.addEventListener('error', () => reject(new Error('owner WS failed')), { once: true });
+      });
+      await new Promise(resolve => {
+        ownerWs.addEventListener('message', ev => { if (JSON.parse(ev.data).type === 'owner-ready') resolve(); });
+      });
+      ownerWs.send(JSON.stringify({ type: 'set-port', id: 'p1', port: 3000, wsPort: 3000 }));
+      await new Promise(resolve => {
+        ownerWs.addEventListener('message', ev => { if (JSON.parse(ev.data).type === 'port-set') resolve(); });
+      });
+
+      const openedPorts = [];
+      let tcpReadCount = 0;
+      ownerWs.addEventListener('message', ev => {
+        const msg = JSON.parse(ev.data);
+        if (msg.method === 'tcpOpen') {
+          openedPorts.push(msg.args[0]);
+          ownerWs.send(JSON.stringify({ id: msg.id, value: 9 }));
+        } else if (msg.method === 'tcpWrite') {
+          ownerWs.send(JSON.stringify({ id: msg.id, value: Buffer.from(msg.args[1], 'base64').length }));
+        } else if (msg.method === 'tcpRead') {
+          tcpReadCount++;
+          const payload = tcpReadCount === 1
+            ? Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok').toString('base64')
+            : '';
+          ownerWs.send(JSON.stringify({ id: msg.id, binary: payload }));
+        } else if (msg.method === 'tcpClose') {
+          ownerWs.send(JSON.stringify({ id: msg.id, value: true }));
+        }
+      });
+
+      const subRes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: base + 2,
+          path: '/hello',
+          method: 'GET',
+          headers: {
+            host: 'p5173-abcd1234.preview.localhost:' + (base + 2),
+            cookie: '__beownir_preview=' + id,
+          },
+        }, res => {
+          const chunks = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      assert.equal(subRes.status, 200);
+      assert.equal(subRes.body, 'ok');
+      assert.deepEqual(openedPorts, [5173], 'wildcard subdomain Host label routes HTTP to guest port 5173');
+      ownerWs.close();
+    }
   } finally {
     host.child.kill('SIGTERM');
     await host.exited;

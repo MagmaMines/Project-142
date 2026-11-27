@@ -165,3 +165,84 @@ test('writeFileBytes, setFiles, removeFile and destroy maintain kernel/mirror in
   k2.destroy();
   assert.equal(domTimers.size, 0, 'destroy() clears the boot timeout');
 });
+
+test('BeownirKernel supports VirtualCookieJar, wildcard previewOrigin resolution, and dynamic network CSP policy', async () => {
+  const vm = await import('node:vm');
+  const source = fs.readFileSync(outputPath, 'utf8');
+  const posted = [];
+  const frames = [];
+  const context = {
+    console,
+    document: {
+      createElement(tag) {
+        const el = {
+          tagName: tag.toUpperCase(),
+          attrs: {},
+          style: {},
+          setAttribute(k, v) { this.attrs[k] = String(v); },
+          addEventListener() {},
+          remove() {},
+        };
+        frames.push(el);
+        return el;
+      },
+      body: { appendChild() {} },
+    },
+    setTimeout,
+    clearTimeout,
+    Uint8Array, ArrayBuffer, TextEncoder, TextDecoder, Promise, Error, TypeError, Object, Set, Map, URL, Headers, Response,
+    btoa: globalThis.btoa, atob: globalThis.atob,
+  };
+  context.window = context;
+  context.globalThis = context;
+  const api = vm.runInNewContext(source + '\n;BeownirKernel;', context);
+
+  const kernel = api.create({
+    autostart: true,
+    previewOrigin: 'https://*.preview.example.com',
+    previewSessionId: 'demo42',
+    network: { allowedFetchDomains: ['api.github.com', '*.npmjs.org'], corsProxy: 'https://proxy.example.com/?url=' },
+  });
+  const runtimeFrame = frames.find(f => f.tagName === 'IFRAME');
+  assert.ok(runtimeFrame);
+  assert.match(runtimeFrame.srcdoc, /connect-src https:\/\/registry\.npmjs\.org https:\/\/api\.github\.com https:\/\/\*\.npmjs\.org https:\/\/proxy\.example\.com/);
+  assert.equal(kernel.resolvePreviewUrl(5173, '/app'), 'https://p5173-demo42.preview.example.com/app');
+
+  const tplKernel = api.create({ autostart: false, previewOrigin: 'https://p{port}-{id}.edge.dev', previewSessionId: 's1' });
+  assert.equal(tplKernel.resolvePreviewUrl(3000, 'api/hi'), 'https://p3000-s1.edge.dev/api/hi');
+
+  kernel._channel = { postMessage(msg) { posted.push(msg); }, close() {} };
+  kernel._state = 'ready';
+  kernel._ready.resolve(kernel);
+
+  // Per-port VirtualCookieJar across http() calls
+  const p1 = kernel.http('http://localhost:3000/set');
+  await new Promise(r => setTimeout(r, 0));
+  const msg1 = posted.pop();
+  kernel._receive({ type: 'httpres', id: msg1.id, status: 200, headers: { 'set-cookie': ['session=xyz; Path=/; HttpOnly', 'theme=dark; Path=/'] }, body: new Uint8Array() });
+  await p1;
+
+  assert.equal(kernel.getPreviewCookies(3000), 'theme=dark');
+  assert.equal(kernel.getPreviewCookies(3000, '/', { includeHttpOnly: true }), 'session=xyz; theme=dark');
+  assert.equal(kernel.getPreviewCookies(4000, '/', { includeHttpOnly: true }), '');
+
+  const p2 = kernel.http('http://localhost:3000/check');
+  await new Promise(r => setTimeout(r, 0));
+  const msg2 = posted.pop();
+  assert.match(msg2.headers.cookie, /session=xyz/);
+  assert.match(msg2.headers.cookie, /theme=dark/);
+  kernel._receive({ type: 'httpres', id: msg2.id, status: 200, headers: {}, body: new Uint8Array() });
+  await p2;
+
+  kernel.setPreviewCookie(3000, 'injected=bad; HttpOnly');
+  assert.ok(!kernel.getPreviewCookies(3000, '/', { includeHttpOnly: true }).includes('injected='));
+  kernel.clearPreviewCookies(3000);
+  assert.equal(kernel.getPreviewCookies(3000, '/', { includeHttpOnly: true }), '');
+
+  kernel.setNetworkConfig({ allowedFetchDomains: ['registry.yarnpkg.com'], corsProxy: null, useHostProxy: true });
+  const netMsg = posted.pop();
+  assert.equal(netMsg.type, 'set-network');
+  assert.deepEqual(JSON.parse(JSON.stringify(netMsg.network)), { allowedFetchDomains: ['registry.yarnpkg.com'], corsProxy: null, useHostProxy: true });
+  kernel.destroy();
+  tplKernel.destroy();
+});

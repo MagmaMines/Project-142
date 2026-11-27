@@ -450,7 +450,7 @@ test('WASI symlinks, dangling links, fd_renumber(self) on sockets, path_open TRU
 
   assert.equal(r.dirRc, 0);
   assert.equal(r.entries['real.txt'], 4);
-  assert.equal(r.entries['sub'], 3);
+  assert.equal(r.entries.sub, 3);
   assert.equal(r.entries['good-link'], 7);
   assert.equal(r.entries['dangling-link'], 7);
   assert.equal(r.nofollowRc, 0);
@@ -464,4 +464,60 @@ test('WASI symlinks, dangling links, fd_renumber(self) on sockets, path_open TRU
   assert.equal(r.sendRc, 0);
   assert.equal(r.recvRc, 0);
   assert.equal(r.recvText, 'hi');
+});
+
+test('WASI supports monotonic clocks, fd_fdstat_set_rights, and zero-length fd_readdir', async () => {
+  const r = JSON.parse(await rt.evaluate(`(async () => {
+    const req = CORE.module.createRequire('/project/index.js');
+    const fs = req('fs');
+    const { WASI } = req('wasi');
+    fs.mkdirSync('/project/wasi-clock', { recursive: true });
+    fs.writeFileSync('/project/wasi-clock/a.txt', 'x');
+    const wasi = new WASI({ version: 'preview1', preopens: { '/work': '/project/wasi-clock' } });
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    wasi.initialize({ exports: { memory } });
+    const imp = wasi.wasiImport;
+    const view = new DataView(memory.buffer);
+    const bytes = new Uint8Array(memory.buffer);
+
+    const resRc = imp.clock_res_get(1, 100);
+    const monoRes = view.getBigUint64(100, true);
+    const t1Rc = imp.clock_time_get(1, 0n, 112);
+    const t1 = view.getBigUint64(112, true);
+    await new Promise(r => setTimeout(r, 8));
+    const t2Rc = imp.clock_time_get(1, 0n, 120);
+    const t2 = view.getBigUint64(120, true);
+
+    const rightsOk = imp.fd_fdstat_set_rights(3, 0n, 0n);
+    const rightsBad = imp.fd_fdstat_set_rights(999, 0n, 0n);
+
+    // Zero-length fd_readdir succeeds cleanly with bufused=0
+    view.setUint32(130, 123, true);
+    const zeroDirRc = imp.fd_readdir(3, 200, 0, 0n, 130);
+    const zeroDirUsed = view.getUint32(130, true);
+
+    // Monotonic timer subscription (clock_id=1) in poll_oneoff
+    bytes.fill(0, 256, 400);
+    view.setBigUint64(256, 777n, true);
+    view.setUint8(264, 0); // EVENTTYPE_CLOCK
+    view.setUint32(272, 1, true); // CLOCKID_MONOTONIC
+    view.setBigUint64(280, 6000000n, true); // 6ms relative
+    const pollRc = imp.poll_oneoff(256, 320, 1, 380);
+    const nevents = view.getUint32(380, true);
+    const evUser = view.getBigUint64(320, true);
+    wasi.close();
+    return JSON.stringify({ resRc, monoRes: Number(monoRes), t1Rc, t2Rc, dt: Number(t2 - t1), rightsOk, rightsBad, zeroDirRc, zeroDirUsed, pollRc, nevents, evUser: Number(evUser) });
+  })()`));
+  assert.equal(r.resRc, 0);
+  assert.ok(r.monoRes > 0);
+  assert.equal(r.t1Rc, 0);
+  assert.equal(r.t2Rc, 0);
+  assert.ok(r.dt > 0, 'monotonic clock advances');
+  assert.equal(r.rightsOk, 0);
+  assert.equal(r.rightsBad, 8);
+  assert.equal(r.zeroDirRc, 0);
+  assert.equal(r.zeroDirUsed, 0);
+  assert.equal(r.pollRc, 0);
+  assert.equal(r.nevents, 1);
+  assert.equal(r.evUser, 777);
 });

@@ -38,6 +38,15 @@ function startServer(embedBundle, siteHtml, coi) {
       if (req.url === '/beownir-kernel.js') {
         res.writeHead(200, { ...headers, 'content-type': 'text/javascript; charset=utf-8' });
         res.end(embedBundle);
+      } else if (req.url.startsWith('/__beownir_cors_proxy__')) {
+        const target = new URL(req.url, 'http://127.0.0.1').searchParams.get('url');
+        res.writeHead(200, {
+          ...headers,
+          'content-type': 'application/json',
+          'access-control-allow-origin': '*',
+          'cross-origin-resource-policy': 'cross-origin',
+        });
+        res.end(JSON.stringify({ proxied: true, target }));
       } else if (req.url === '/site.html') {
         res.writeHead(200, { ...headers, 'content-type': 'text/html; charset=utf-8' });
         res.end(siteHtml);
@@ -107,6 +116,12 @@ function startServer(embedBundle, siteHtml, coi) {
           "  const wasiFd = new DataView(wasiMem.buffer).getUint32(fdPtr, true);",
           "  assert.strictEqual(wasi.wasiImport.fd_filestat_get(wasiFd, statPtr), 0);",
           "  assert.strictEqual(Number(new DataView(wasiMem.buffer).getBigUint64(statPtr + 32, true)), 11);",
+          "  assert.strictEqual(wasi.wasiImport.clock_res_get(1, 780), 0);",
+          "  assert.ok(new DataView(wasiMem.buffer).getBigUint64(780, true) > 0n);",
+          "  assert.strictEqual(wasi.wasiImport.clock_time_get(1, 0n, 792), 0);",
+          "  assert.ok(new DataView(wasiMem.buffer).getBigUint64(792, true) > 0n);",
+          "  assert.strictEqual(wasi.wasiImport.fd_readdir(3, 800, 0, 0n, 820), 0);",
+          "  assert.strictEqual(new DataView(wasiMem.buffer).getUint32(820, true), 0);",
           "  const pollView = new DataView(wasiMem.buffer);",
           "  new Uint8Array(wasiMem.buffer).fill(0, 600, 768);",
           "  pollView.setBigUint64(600, 77n, true); pollView.setUint8(608, 1); pollView.setInt32(616, wasiFd, true);",
@@ -192,6 +207,14 @@ function startServer(embedBundle, siteHtml, coi) {
           "  const wMiss = new Worker(new URL('file:///project/does_not_exist.js'));",
           "  const missErr = await new Promise(r => wMiss.once('error', r));",
           "  assert.strictEqual(missErr.code, 'MODULE_NOT_FOUND');",
+          "  const mod = await WebAssembly.compile(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));",
+          "  const wMod = new Worker(\"const { parentPort, workerData } = require('worker_threads'); parentPort.postMessage(workerData.mod instanceof WebAssembly.Module);\", { eval: true, workerData: { mod } });",
+          "  assert.strictEqual(await new Promise(r => wMod.once('message', r)), true);",
+          "  await new Promise(r => wMod.once('exit', r));",
+          "  fs.writeFileSync('/project/mod.wasm', Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]));",
+          "  const fRes = await fetch('file:///project/mod.wasm');",
+          "  assert.strictEqual(fRes.status, 200);",
+          "  assert.strictEqual(fRes.headers.get('content-type'), 'application/wasm');",
           "  const wTerm = new Worker('setInterval(() => {}, 100)', { eval: true });",
           "  await new Promise(r => wTerm.once('online', r));",
           "  assert.strictEqual(await wTerm.terminate(), 1);",
@@ -206,6 +229,39 @@ function startServer(embedBundle, siteHtml, coi) {
       throw new Error('COI embed worker_threads suite failed: ' + JSON.stringify(r1));
     }
     console.log('PASS  COI embed worker_threads suite', r1.stdout.trim());
+
+    const netRes = await p1.evaluate(async () => {
+      const k = BeownirKernel.create({
+        previewOrigin: 'https://*.preview.example.com',
+        previewSessionId: 'e2eb',
+        network: {
+          allowedFetchDomains: ['api.github.com'],
+          corsProxy: '/__beownir_cors_proxy__?url={url}',
+          useHostProxy: true,
+        },
+        files: {
+          '/project/cookie_srv.js': "require('http').createServer((req, res) => { if (req.url === '/login') { res.writeHead(200, { 'Set-Cookie': ['sid=secret123; Path=/; HttpOnly', 'ui=dark; Path=/'] }); res.end('ok'); } else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ cookie: req.headers.cookie || '' })); } }).listen(4500);",
+          '/project/net_check.mjs': "import assert from 'node:assert'; let err=''; try { await fetch('https://unlisted.invalid/x'); } catch (e) { err = e.message; } assert.ok(/Network restricted/i.test(err), err); const p = await fetch('https://api.github.com/zen'); const j = await p.json(); assert.strictEqual(j.proxied, true); console.log('NET_PROXY_OK');",
+        },
+      });
+      await k.whenReady();
+      const resolvedUrl = k.resolvePreviewUrl(4500, '/home');
+      const netRun = await k.run('node /project/net_check.mjs');
+      k.run('node /project/cookie_srv.js');
+      await k.waitForServer(4500, { path: '/check' });
+      await k.http('http://localhost:4500/login');
+      const checkJson = await k.httpJson('http://localhost:4500/check');
+      const docCookies = k.getPreviewCookies(4500);
+      const otherCookies = k.getPreviewCookies(4501, '/', { includeHttpOnly: true });
+      k.destroy();
+      return { resolvedUrl, netRun, serverCookie: checkJson.cookie, docCookies, otherCookies };
+    });
+    if (netRes.resolvedUrl !== 'https://p4500-e2eb.preview.example.com/home' ||
+        netRes.netRun.code !== 0 || !netRes.netRun.stdout.includes('NET_PROXY_OK') ||
+        !netRes.serverCookie.includes('sid=secret123') || netRes.docCookies !== 'ui=dark' || netRes.otherCookies !== '') {
+      throw new Error('COI embed cookie/network/previewOrigin check failed: ' + JSON.stringify(netRes));
+    }
+    console.log('PASS  COI embed VirtualCookieJar + wildcard previewOrigin + network proxy');
 
     // 2. Cross-Origin Isolated Main IDE Site (o/site/index.html)
     const p2 = await ctxCoi.newPage();
@@ -227,6 +283,29 @@ function startServer(embedBundle, siteHtml, coi) {
       throw new Error('COI main site worker_threads check failed: ' + siteText.slice(-300));
     }
     console.log('PASS  COI main site worker_threads + Atomics');
+
+    await p2.evaluate(async () => {
+      await window.Beownir.newProject('script');
+      await window.Beownir.write('cookie_app.js', [
+        "const http = require('http');",
+        "http.createServer((req, res) => {",
+        "  res.writeHead(200, { 'Content-Type': 'text/html', 'Set-Cookie': ['app=preview1; Path=/', 'httpsec=hidden; Path=/; HttpOnly'] });",
+        "  res.end('<!doctype html><html><body><pre id=\"out\"></pre><script>document.cookie=\"client=yes; Path=/\"; document.getElementById(\"out\").textContent=document.cookie;</script></body></html>');",
+        "}).listen(4600);",
+      ].join('\n'));
+      window.Beownir.run('node /project/cookie_app.js');
+    });
+    await p2.waitForFunction(() => window.Beownir.status().ports.includes(4600), null, { timeout: 30000 });
+    await p2.waitForTimeout(1500);
+    const previewFrame = p2.frames().find(f => f !== p2.mainFrame() && f.url().startsWith('about:srcdoc'));
+    if (!previewFrame) throw new Error('srcdoc preview frame not found on main site');
+    await previewFrame.waitForSelector('#out', { timeout: 15000 });
+    const outCookieText = await previewFrame.locator('#out').textContent();
+    const hostCookie = await p2.evaluate(() => document.cookie);
+    if (!outCookieText.includes('app=preview1') || !outCookieText.includes('client=yes') || outCookieText.includes('httpsec') || hostCookie !== '') {
+      throw new Error('srcdoc VirtualCookieJar isolation failed: ' + JSON.stringify({ outCookieText, hostCookie }));
+    }
+    console.log('PASS  COI main site srcdoc VirtualCookieJar cookie isolation');
 
     // 3. Plain HTTP Degraded Non-COI mode
     const ctxPlain = await browser.newContext({ bypassCSP: false });
