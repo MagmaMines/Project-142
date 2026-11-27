@@ -258,8 +258,275 @@
       return response.text();
     });
   }
-  // Static imports: `import ... from "spec"`, `export ... from "spec"`, `import "spec"`.
-  const STATIC_SPECIFIER = /(\bfrom\s*|\bimport\s*)(["'])([^"'\n]+)\2/g;
+  function decodeStringLiteral(raw) {
+    const inner = raw.slice(1, -1);
+    if (inner.indexOf('\\') < 0) return inner;
+    let out = '';
+    for (let i = 0; i < inner.length; i++) {
+      const ch = inner[i];
+      if (ch !== '\\') { out += ch; continue; }
+      const next = inner[++i];
+      if (next === undefined) break;
+      if (next === '\n') continue;
+      if (next === '\r') { if (inner[i + 1] === '\n') i++; continue; }
+      if (next === 'n') out += '\n';
+      else if (next === 'r') out += '\r';
+      else if (next === 't') out += '\t';
+      else if (next === 'b') out += '\b';
+      else if (next === 'f') out += '\f';
+      else if (next === 'v') out += '\v';
+      else if (next === '0' && !/[0-9]/.test(inner[i + 1] || '')) out += '\0';
+      else if (next === 'x' && /^[0-9a-fA-F]{2}/.test(inner.slice(i + 1, i + 3))) {
+        out += String.fromCharCode(parseInt(inner.slice(i + 1, i + 3), 16));
+        i += 2;
+      } else if (next === 'u') {
+        if (inner[i + 1] === '{') {
+          const close = inner.indexOf('}', i + 2);
+          if (close > i + 2 && /^[0-9a-fA-F]+$/.test(inner.slice(i + 2, close))) {
+            out += String.fromCodePoint(parseInt(inner.slice(i + 2, close), 16));
+            i = close;
+            continue;
+          }
+        } else if (/^[0-9a-fA-F]{4}/.test(inner.slice(i + 1, i + 5))) {
+          out += String.fromCharCode(parseInt(inner.slice(i + 1, i + 5), 16));
+          i += 4;
+          continue;
+        }
+        out += next;
+      } else out += next;
+    }
+    return out;
+  }
+  const REGEX_BEFORE_KEYWORDS = new Set(['return', 'throw', 'case', 'delete', 'void', 'typeof', 'await', 'yield', 'in', 'instanceof', 'new', 'else', 'do', 'of', 'export', 'default', 'import']);
+  const isIdentStart = c => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36 || c >= 128;
+  const isIdentPart = c => isIdentStart(c) || (c >= 48 && c <= 57);
+  const isSpace = c => c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12 || c === 160 || c === 0xfeff;
+  function skipString(code, start) {
+    const quote = code.charCodeAt(start);
+    let i = start + 1;
+    while (i < code.length) {
+      const c = code.charCodeAt(i);
+      if (c === 92) {
+        if (code.charCodeAt(i + 1) === 13 && code.charCodeAt(i + 2) === 10) i += 3;
+        else i += 2;
+        continue;
+      }
+      if (c === quote) return i + 1;
+      if (c === 10 || c === 13) return i;
+      i++;
+    }
+    return code.length;
+  }
+  function skipTemplateChunk(code, start) {
+    let i = start;
+    while (i < code.length) {
+      const c = code.charCodeAt(i);
+      if (c === 92) { i += 2; continue; }
+      if (c === 96) return { kind: 'end', end: i + 1 };
+      if (c === 36 && code.charCodeAt(i + 1) === 123) return { kind: 'expr', end: i + 2 };
+      i++;
+    }
+    return { kind: 'end', end: code.length };
+  }
+  function scanRegexEnd(code, start) {
+    let i = start + 1, inClass = false;
+    while (i < code.length) {
+      const c = code.charCodeAt(i);
+      if (c === 92) {
+        const next = code.charCodeAt(i + 1);
+        if (Number.isNaN(next) || next === 10 || next === 13 || next === 0x2028 || next === 0x2029) return -1;
+        i += 2; continue;
+      }
+      if (c === 10 || c === 13 || c === 0x2028 || c === 0x2029) return -1;
+      if (c === 91) { inClass = true; i++; continue; }
+      if (c === 93) { inClass = false; i++; continue; }
+      if (c === 47 && !inClass) {
+        i++;
+        while (i < code.length && ((code.charCodeAt(i) >= 65 && code.charCodeAt(i) <= 90) || (code.charCodeAt(i) >= 97 && code.charCodeAt(i) <= 122))) i++;
+        return i;
+      }
+      i++;
+    }
+    return -1;
+  }
+  function skipTrivia(code, pos) {
+    let i = pos;
+    while (i < code.length) {
+      const c = code.charCodeAt(i);
+      if (isSpace(c)) { i++; continue; }
+      if (c === 47 && code.charCodeAt(i + 1) === 47) {
+        i += 2;
+        while (i < code.length && code.charCodeAt(i) !== 10 && code.charCodeAt(i) !== 13) i++;
+        continue;
+      }
+      if (c === 47 && code.charCodeAt(i + 1) === 42) {
+        const close = code.indexOf('*/', i + 2);
+        i = close < 0 ? code.length : close + 2;
+        continue;
+      }
+      break;
+    }
+    return i;
+  }
+  function isImportMethodDef(code, openParenIndex) {
+    let i = openParenIndex + 1, parenDepth = 1;
+    const tStack = [];
+    while (i < code.length && parenDepth > 0) {
+      const c = code.charCodeAt(i);
+      if (isSpace(c)) { i++; continue; }
+      if (c === 47 && code.charCodeAt(i + 1) === 47) {
+        i += 2;
+        while (i < code.length && code.charCodeAt(i) !== 10 && code.charCodeAt(i) !== 13) i++;
+        continue;
+      }
+      if (c === 47 && code.charCodeAt(i + 1) === 42) {
+        const close = code.indexOf('*/', i + 2);
+        i = close < 0 ? code.length : close + 2;
+        continue;
+      }
+      if (c === 34 || c === 39) { i = skipString(code, i); continue; }
+      if (c === 96) {
+        const chunk = skipTemplateChunk(code, i + 1);
+        i = chunk.end;
+        if (chunk.kind === 'expr') tStack.push(0);
+        continue;
+      }
+      if (tStack.length) {
+        if (c === 123) { tStack[tStack.length - 1]++; i++; continue; }
+        if (c === 125) {
+          if (--tStack[tStack.length - 1] < 0) {
+            tStack.pop();
+            const chunk = skipTemplateChunk(code, i + 1);
+            i = chunk.end;
+            if (chunk.kind === 'expr') tStack.push(0);
+            continue;
+          }
+          i++; continue;
+        }
+      }
+      if (c === 40) parenDepth++;
+      else if (c === 41) parenDepth--;
+      i++;
+    }
+    if (parenDepth !== 0) return false;
+    const after = skipTrivia(code, i);
+    return code.charCodeAt(after) === 123; // `{` follows `(params)` -> method definition, not `import(...)`
+  }
+  function scanModuleImports(code) {
+    const ops = [];
+    const templateBraces = [];
+    let i = 0, regexAllowed = true, prevDot = false, pending = null;
+    while (i < code.length) {
+      const c = code.charCodeAt(i);
+      if (isSpace(c)) { i++; continue; }
+      if (c === 47) {
+        const next = code.charCodeAt(i + 1);
+        if (next === 47) {
+          i += 2;
+          while (i < code.length && code.charCodeAt(i) !== 10 && code.charCodeAt(i) !== 13) i++;
+          continue;
+        }
+        if (next === 42) {
+          const close = code.indexOf('*/', i + 2);
+          i = close < 0 ? code.length : close + 2;
+          continue;
+        }
+        if (regexAllowed) {
+          const reEnd = scanRegexEnd(code, i);
+          if (reEnd > i) {
+            pending = null; prevDot = false; regexAllowed = false;
+            i = reEnd; continue;
+          }
+        }
+        pending = null; prevDot = false; regexAllowed = true;
+        i += next === 61 ? 2 : 1; continue;
+      }
+      if (c === 34 || c === 39) {
+        const end = skipString(code, i);
+        if (pending && (pending.kind === 'from' || pending.kind === 'import')) {
+          ops.push({ kind: 'static', start: i, end, spec: decodeStringLiteral(code.slice(i, end)) });
+        }
+        pending = null; prevDot = false; regexAllowed = false;
+        i = end; continue;
+      }
+      if (c === 96) {
+        pending = null; prevDot = false; regexAllowed = false;
+        const chunk = skipTemplateChunk(code, i + 1);
+        i = chunk.end;
+        if (chunk.kind === 'expr') { templateBraces.push(0); regexAllowed = true; }
+        continue;
+      }
+      if (templateBraces.length) {
+        if (c === 123) {
+          templateBraces[templateBraces.length - 1]++;
+          pending = null; prevDot = false; regexAllowed = true;
+          i++; continue;
+        }
+        if (c === 125) {
+          if (--templateBraces[templateBraces.length - 1] < 0) {
+            templateBraces.pop();
+            pending = null; prevDot = false;
+            const chunk = skipTemplateChunk(code, i + 1);
+            i = chunk.end;
+            if (chunk.kind === 'expr') { templateBraces.push(0); regexAllowed = true; }
+            else regexAllowed = false;
+            continue;
+          }
+          pending = null; prevDot = false; regexAllowed = true;
+          i++; continue;
+        }
+      }
+      if (isIdentStart(c)) {
+        const start = i;
+        i++;
+        while (i < code.length && isIdentPart(code.charCodeAt(i))) i++;
+        const word = code.slice(start, i);
+        pending = !prevDot && (word === 'import' || word === 'from') ? { kind: word, start, end: i } : null;
+        prevDot = false;
+        regexAllowed = REGEX_BEFORE_KEYWORDS.has(word);
+        continue;
+      }
+      if ((c >= 48 && c <= 57) || (c === 46 && code.charCodeAt(i + 1) >= 48 && code.charCodeAt(i + 1) <= 57)) {
+        pending = null; prevDot = false; regexAllowed = false;
+        if (c === 48 && (code.charCodeAt(i + 1) === 120 || code.charCodeAt(i + 1) === 88 || code.charCodeAt(i + 1) === 98 || code.charCodeAt(i + 1) === 66 || code.charCodeAt(i + 1) === 111 || code.charCodeAt(i + 1) === 79)) {
+          i += 2;
+          while (i < code.length && /[0-9a-fA-F_]/.test(code[i])) i++;
+        } else {
+          while (i < code.length && /[0-9_]/.test(code[i])) i++;
+          if (code.charCodeAt(i) === 46) { i++; while (i < code.length && /[0-9_]/.test(code[i])) i++; }
+          if (code.charCodeAt(i) === 101 || code.charCodeAt(i) === 69) {
+            i++;
+            if (code.charCodeAt(i) === 43 || code.charCodeAt(i) === 45) i++;
+            while (i < code.length && /[0-9_]/.test(code[i])) i++;
+          }
+        }
+        if (code.charCodeAt(i) === 110) i++;
+        continue;
+      }
+      if (c === 40) {
+        if (pending && pending.kind === 'import' && !isImportMethodDef(code, i)) {
+          ops.push({ kind: 'dynamic', start: pending.start, end: pending.end });
+        }
+        pending = null; prevDot = false; regexAllowed = true;
+        i++; continue;
+      }
+      if (c === 46) {
+        pending = null;
+        if (code.charCodeAt(i + 1) === 46 && code.charCodeAt(i + 2) === 46) { prevDot = false; regexAllowed = true; i += 3; continue; }
+        prevDot = true; regexAllowed = false; i++; continue;
+      }
+      if (c === 63 && code.charCodeAt(i + 1) === 46 && !(code.charCodeAt(i + 2) >= 48 && code.charCodeAt(i + 2) <= 57)) {
+        pending = null; prevDot = true; regexAllowed = false; i += 2; continue;
+      }
+      if ((c === 43 && code.charCodeAt(i + 1) === 43) || (c === 45 && code.charCodeAt(i + 1) === 45)) {
+        pending = null; prevDot = false; regexAllowed = false; i += 2; continue;
+      }
+      pending = null; prevDot = false;
+      regexAllowed = !(c === 41 || c === 93);
+      i++;
+    }
+    return ops;
+  }
   async function resolveSpecifier(spec, importer, depth, seen) {
     if (/^(data:|blob:)/i.test(spec)) return spec;
     const resolved = new URL(spec, importer);
@@ -275,26 +542,20 @@
     if (depth > DEPTH_LIMIT) throw new Error('Module graph nesting limit reached at ' + importer);
     const next = new Set(seen || []);
     next.add(moduleKey(new URL(importer)));
-    const jobs = [];
-    STATIC_SPECIFIER.lastIndex = 0;
-    let match;
-    while ((match = STATIC_SPECIFIER.exec(code)) !== null) jobs.push(match[3]);
-    const results = await Promise.all(jobs.map(spec => resolveSpecifier(spec, importer, depth, next)));
-    // Rebuild the source precisely: keyword + quote + rewritten specifier + quote.
+    const ops = scanModuleImports(code);
+    const staticOps = ops.filter(op => op.kind === 'static');
+    const results = await Promise.all(staticOps.map(op => resolveSpecifier(op.spec, importer, depth, next)));
+    let staticIdx = 0;
     const pieces = [];
     let lastIndex = 0;
-    let jobIndex = 0;
-    STATIC_SPECIFIER.lastIndex = 0;
-    while ((match = STATIC_SPECIFIER.exec(code)) !== null) {
-      pieces.push(code.slice(lastIndex, match.index), match[1], match[2], results[jobIndex], match[2]);
-      lastIndex = match.index + match[0].length;
-      jobIndex += 1;
+    for (const op of ops) {
+      pieces.push(code.slice(lastIndex, op.start));
+      if (op.kind === 'static') pieces.push(JSON.stringify(results[staticIdx++]));
+      else pieces.push('globalThis.__beownirDynamicImport');
+      lastIndex = op.end;
     }
     pieces.push(code.slice(lastIndex));
-    let out = pieces.join('');
-    // Any remaining dynamic imports (Vite's HMR re-import uses one) resolve at call time.
-    out = out.replace(/\bimport\s*\(/g, 'globalThis.__beownirDynamicImport(');
-    return out;
+    return pieces.join('');
   }
   function loadModule(url, depth, seen) {
     const key = moduleKey(url);
@@ -313,12 +574,13 @@
     }
     return entry;
   }
+  const loadModuleUrl = typeof config.importDataUrl === 'function' ? config.importDataUrl : url => import(url);
   window.__beownirDynamicImport = async spec => {
     const text = String(spec);
-    if (/^data:/i.test(text)) return import(text);
+    if (/^data:/i.test(text)) return loadModuleUrl(text);
     const url = new URL(text, virtualOrigin + '/');
     if (/^https?:$/i.test(url.protocol) && url.origin !== virtualOrigin) throw new TypeError('External module imports are disabled in the preview: ' + text);
     const dataUrl = await loadModule(url, 0, new Set([moduleKey(url)]));
-    return import(dataUrl);
+    return loadModuleUrl(dataUrl);
   };
 })();
