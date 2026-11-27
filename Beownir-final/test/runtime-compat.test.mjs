@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import { loadRuntime } from './helpers/runtime.mjs';
+import { loadRuntime, initToolchain } from './helpers/runtime.mjs';
 
 /* The runtime is a worker source. This harness evaluates it once in a VM with a
  * worker-shaped global object, then checks the Node compatibility surface that
@@ -417,4 +417,311 @@ test('events, timers, async_hooks, buffer and process fill their Node surfaces',
   assert.equal(process.domain, null);
   assert.throws(() => process.assert(false, 'boom'), error => error.code === 'ERR_ASSERTION');
   assert.equal(typeof process.browser, 'undefined', 'Node does not define process.browser (typescript checks it)');
+});
+
+test('cross-realm ArrayBuffers and TypedArrays work with Buffer.from and util.types', async () => {
+  const { sandbox, evaluate } = loadRuntime();
+  sandbox.__hostTestAb = await new Response('astro-html').arrayBuffer();
+  sandbox.__hostTestU8 = new TextEncoder().encode('host-bytes');
+  try {
+    const result = evaluate(`(() => {
+      const { types } = require('util');
+      return {
+        abIsArrayBuffer: types.isArrayBuffer(__hostTestAb),
+        abIsAnyArrayBuffer: types.isAnyArrayBuffer(__hostTestAb),
+        abText: Buffer.from(__hostTestAb).toString('utf8'),
+        u8IsUint8Array: types.isUint8Array(__hostTestU8),
+        u8Text: Buffer.from(__hostTestU8).toString('utf8'),
+      };
+    })()`);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(result)), {
+      abIsArrayBuffer: true,
+      abIsAnyArrayBuffer: true,
+      abText: 'astro-html',
+      u8IsUint8Array: true,
+      u8Text: 'host-bytes',
+    });
+  } finally {
+    delete sandbox.__hostTestAb;
+    delete sandbox.__hostTestU8;
+  }
+});
+
+test('node:zlib Brotli codec matches Node across sync, callback, promises, streaming and error paths', async () => {
+  const { evaluate } = loadRuntime();
+  const payloadText = 'beownir-brotli-codec-roundtrip-'.repeat(120);
+  const nodeCompressed = zlib.brotliCompressSync(Buffer.from(payloadText));
+
+  const res = JSON.parse(await evaluate(`(async () => {
+    const z = require('zlib');
+    const { pipeline } = require('stream/promises');
+    const { Readable, Writable } = require('stream');
+    const src = ${JSON.stringify(payloadText)};
+
+    // Sync round-trip & Node interop (both directions)
+    const compSync = z.brotliCompressSync(src, { params: { [z.constants.BROTLI_PARAM_QUALITY]: 4 } });
+    const decompFromNode = z.brotliDecompressSync(Buffer.from(${JSON.stringify(nodeCompressed.toString('base64'))}, 'base64')).toString('utf8');
+
+    // Callback & promises APIs
+    const compCb = await new Promise((resolve, reject) => z.brotliCompress(src, (e, out) => e ? reject(e) : resolve(out)));
+    const decompProm = (await z.promises.brotliDecompress(compCb)).toString('utf8');
+
+    // Streaming CompressStream & DecompressStream via pipeline
+    const compChunks = [];
+    await pipeline(
+      Readable.from([src.slice(0, 500), src.slice(500, 1500), src.slice(1500)]),
+      z.createBrotliCompress({ params: { [z.constants.BROTLI_PARAM_QUALITY]: 2 } }),
+      new Writable({ write(c, _e, cb) { compChunks.push(Buffer.from(c)); cb(); } })
+    );
+    const streamCompressed = Buffer.concat(compChunks);
+    const decompChunks = [];
+    await pipeline(
+      Readable.from([streamCompressed.subarray(0, 7), streamCompressed.subarray(7)]),
+      z.createBrotliDecompress(),
+      new Writable({ write(c, _e, cb) { decompChunks.push(Buffer.from(c)); cb(); } })
+    );
+    const streamOut = Buffer.concat(decompChunks).toString('utf8');
+
+    // Invalid input throws structured error and runtime recovers cleanly afterwards
+    let badCode = null;
+    try { z.brotliDecompressSync(Buffer.from('corrupt-brotli-data')); }
+    catch (e) { badCode = e && e.code; }
+    let truncCode = null;
+    try {
+      await pipeline(
+        Readable.from([streamCompressed.subarray(0, Math.floor(streamCompressed.length / 2))]),
+        z.createBrotliDecompress(),
+        new Writable({ write(_c, _e, cb) { cb(); } })
+      );
+    } catch (e) { truncCode = e && e.code; }
+    const recovered = z.brotliDecompressSync(compSync).toString('utf8') === src;
+
+    return JSON.stringify({
+      compSyncB64: compSync.toString('base64'),
+      decompFromNodeMatch: decompFromNode === src,
+      decompPromMatch: decompProm === src,
+      streamOutMatch: streamOut === src,
+      badCode,
+      truncCode,
+      recovered,
+      qualityConst: z.constants.BROTLI_PARAM_QUALITY,
+    });
+  })()`));
+
+  assert.equal(zlib.brotliDecompressSync(Buffer.from(res.compSyncB64, 'base64')).toString('utf8'), payloadText);
+  assert.equal(res.decompFromNodeMatch, true);
+  assert.equal(res.decompPromMatch, true);
+  assert.equal(res.streamOutMatch, true);
+  assert.equal(res.badCode, 'Z_DATA_ERROR');
+  assert.equal(res.truncCode, 'Z_BUF_ERROR');
+  assert.equal(res.recovered, true);
+  assert.equal(res.qualityConst, zlib.constants.BROTLI_PARAM_QUALITY);
+});
+
+test('fs.promises.watch, npm run -- args, npx flags, and shared esbuild API work cleanly', async () => {
+  const { evaluate, executeLine, posts } = await initToolchain(loadRuntime({ keep: true }));
+  const fs = evaluate('CORE.fs');
+  fs.mkdirSync('/project/watch-dir', { recursive: true });
+  fs.writeFileSync('/project/package.json', JSON.stringify({
+    name: 'cli-flags-test',
+    version: '1.0.0',
+    scripts: { echo: 'node -e "console.log(process.argv.slice(1).join(\',\'))"' },
+  }));
+  fs.mkdirSync('/project/node_modules/hello-cli', { recursive: true });
+  fs.writeFileSync('/project/node_modules/hello-cli/package.json', JSON.stringify({ name: 'hello-cli', version: '1.0.0', bin: { 'hello-cli': 'cli.js' } }));
+  fs.writeFileSync('/project/node_modules/hello-cli/cli.js', 'console.log("CLI:" + process.argv.slice(2).join(" "));\n');
+
+  const ac = new AbortController();
+  const watchPromise = evaluate(`(async (signal) => {
+    const events = [];
+    for await (const ev of CORE.fs.promises.watch('/project/watch-dir', { signal })) {
+      events.push(ev);
+      if (events.length >= 1) break;
+    }
+    return JSON.stringify(events);
+  })`)(ac.signal);
+  await new Promise(r => setTimeout(r, 15));
+  fs.writeFileSync('/project/watch-dir/a.txt', 'v1');
+  const watched = JSON.parse(await watchPromise);
+  assert.equal(watched.length, 1);
+  assert.equal(watched[0].filename, 'a.txt');
+  ac.abort();
+
+  const esbResult = JSON.parse(await evaluate(`(async () => {
+    const esb = require('esbuild');
+    const out1 = await esb.transform('const x: number = 1;', { loader: 'ts' });
+    // Also exercise VirtualNodeWorker sharing globalThis.__beownirEsbuildApi without re-initializing WASM:
+    const { Worker } = require('worker_threads');
+    const workerCode = "const { parentPort } = require('worker_threads'); require('esbuild').transform('const y: number = 2;', { loader: 'ts' }).then(r => parentPort.postMessage(r.code), e => { throw e; });";
+    const workerOut = await new Promise((resolve, reject) => {
+      const w = new Worker(workerCode, { eval: true });
+      w.once('message', resolve);
+      w.once('error', reject);
+    });
+    return JSON.stringify({ out1: out1.code.trim(), workerOut: workerOut.trim(), hasGlobal: Boolean(globalThis.__beownirEsbuildApi) });
+  })()`));
+  assert.equal(esbResult.out1, 'const x = 1;');
+  assert.equal(esbResult.workerOut, 'const y = 2;');
+  assert.equal(esbResult.hasGlobal, true);
+
+  // npm run -- forwarding and npx -y flag stripping
+  const outFrom1 = posts.length;
+  const code1 = await executeLine('npm run echo -- --alpha beta');
+  assert.equal(code1, 0);
+  const stdout1 = posts.slice(outFrom1).filter(m => m.type === 'stdout').map(m => m.data).join('');
+  assert.match(stdout1, /--alpha,beta/);
+
+  const outFrom2 = posts.length;
+  const code2 = await executeLine('npx -y hello-cli one two');
+  assert.equal(code2, 0);
+  const stdout2 = posts.slice(outFrom2).filter(m => m.type === 'stdout').map(m => m.data).join('');
+  assert.match(stdout2, /CLI:one two/);
+});
+
+test('Writable cork/_writev, vm context isolation, and recursive node:test runner behave cleanly', async () => {
+  const { evaluate } = loadRuntime();
+  const result = JSON.parse(await evaluate(`(async () => {
+    const { Writable } = require('stream');
+    const vm = require('vm');
+    const nodeTest = require('node:test');
+    const assert = require('node:assert/strict');
+
+    // 1. Writable corking + _writev batching + async flush before finish
+    const batches = [];
+    let finalRan = false;
+    const events = [];
+    const w = new Writable({
+      writev(chunks, cb) {
+        batches.push(chunks.map(c => c.chunk.toString('utf8')));
+        setTimeout(cb, 5);
+      },
+      write(chunk, _enc, cb) {
+        batches.push([chunk.toString('utf8')]);
+        cb();
+      },
+      final(cb) {
+        finalRan = true;
+        events.push('final');
+        cb();
+      },
+    });
+    w.on('finish', () => events.push('finish'));
+    w.cork();
+    w.cork();
+    w.write('a');
+    w.write('b');
+    w.uncork();
+    const stillCorked = batches.length === 0 && w.writableCorked === 1;
+    w.cork();
+    w.write('c');
+    await new Promise(resolve => w.end(resolve));
+
+    // 2. vm context writes stay inside context instead of leaking to globalThis
+    const ctx = vm.createContext({ a: 10 });
+    const sum = vm.runInContext('b = a + 32; a = 99; b', ctx);
+    const leaked = typeof globalThis.b;
+    const newCtx = { base: 7 };
+    const doubled = vm.runInNewContext('out = base * 2', newCtx);
+    const leakedNew = typeof globalThis.out;
+
+    // 3. node:test nested suites, t.test subtests, (t, done), skip/todo, run() reset
+    nodeTest._root.length = 0;
+    const trace = [];
+    nodeTest.describe('outer', () => {
+      nodeTest.it('sync pass', t => {
+        trace.push(t.fullName);
+      });
+      nodeTest.it('done callback', (t, done) => {
+        setTimeout(() => { trace.push(t.name); done(); }, 2);
+      });
+      nodeTest.skip('skipped', () => { trace.push('BAD'); });
+      nodeTest.todo('planned', () => {});
+      nodeTest.describe('inner', () => {
+        nodeTest.it('subtest parent', async t => {
+          await t.test('child step', sub => {
+            assert.equal(sub.fullName, 'subtest parent > child step');
+            trace.push('sub');
+          });
+        });
+      });
+    });
+    const run1 = await nodeTest.run();
+    const run2 = await nodeTest.run();
+
+    // Test .only filtering
+    nodeTest._root.length = 0;
+    const onlyTrace = [];
+    nodeTest.it('ignored', () => { onlyTrace.push('no'); });
+    nodeTest.describe.only('focused suite', () => {
+      nodeTest.it('included', () => { onlyTrace.push('yes'); });
+    });
+    const onlyRun = await nodeTest.run();
+    nodeTest._root.length = 0;
+
+    return JSON.stringify({
+      batches,
+      stillCorked,
+      finalRan,
+      events,
+      vm: { sum, a: ctx.a, b: ctx.b, leaked, doubled, out: newCtx.out, leakedNew },
+      run1: { passed: run1.passed, failed: run1.failed.length, skipped: run1.skipped },
+      run2: { passed: run2.passed, failed: run2.failed.length, skipped: run2.skipped },
+      trace,
+      onlyRun: { passed: onlyRun.passed, failed: onlyRun.failed.length, skipped: onlyRun.skipped },
+      onlyTrace,
+    });
+  })()`));
+
+  assert.deepEqual(result.batches, [['a', 'b', 'c']]);
+  assert.equal(result.stillCorked, true);
+  assert.equal(result.finalRan, true);
+  assert.deepEqual(result.events, ['final', 'finish']);
+  assert.deepEqual(result.vm, { sum: 42, a: 99, b: 42, leaked: 'undefined', doubled: 14, out: 14, leakedNew: 'undefined' });
+  assert.deepEqual(result.run1, { passed: 4, failed: 0, skipped: 2 });
+  assert.deepEqual(result.run2, { passed: 4, failed: 0, skipped: 2 });
+  assert.deepEqual(result.trace, ['sync pass', 'done callback', 'sub', 'sync pass', 'done callback', 'sub']);
+  assert.deepEqual(result.onlyRun, { passed: 1, failed: 0, skipped: 0 });
+  assert.deepEqual(result.onlyTrace, ['yes']);
+});
+
+test('installEsbuildGoFs exposes lstat, readlink, symlink, and link over the virtual FS', async () => {
+  const runtime = loadRuntime();
+  const res = JSON.parse(await runtime.evaluate(`(async () => {
+    const fs = CORE.fs;
+    installEsbuildGoFs();
+    fs.mkdirSync('/project/go-fs', { recursive: true });
+    fs.writeFileSync('/project/go-fs/origin.txt', 'go-symlink-data');
+    return JSON.stringify(await new Promise((resolve, reject) => {
+      globalThis.fs.symlink('/project/go-fs/origin.txt', '/project/go-fs/link.txt', err => {
+        if (err) return reject(err);
+        globalThis.fs.readlink('/project/go-fs/link.txt', (e2, target) => {
+          if (e2) return reject(e2);
+          globalThis.fs.lstat('/project/go-fs/link.txt', (e3, lst) => {
+            if (e3) return reject(e3);
+            globalThis.fs.stat('/project/go-fs/link.txt', (e4, st) => {
+              if (e4) return reject(e4);
+              globalThis.fs.link('/project/go-fs/origin.txt', '/project/go-fs/hard.txt', e5 => {
+                if (e5) return reject(e5);
+                resolve({
+                  target,
+                  lstatSym: lst.isSymbolicLink(),
+                  lstatFile: lst.isFile(),
+                  statSym: st.isSymbolicLink(),
+                  statFile: st.isFile(),
+                  hardContent: fs.readFileSync('/project/go-fs/hard.txt', 'utf8'),
+                });
+              });
+            });
+          });
+        });
+      });
+    }));
+  })()`));
+
+  assert.equal(res.target, '/project/go-fs/origin.txt');
+  assert.equal(res.lstatSym, true);
+  assert.equal(res.lstatFile, false);
+  assert.equal(res.statSym, false);
+  assert.equal(res.statFile, true);
+  assert.equal(res.hardContent, 'go-symlink-data');
 });

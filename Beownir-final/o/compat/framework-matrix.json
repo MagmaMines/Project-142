@@ -1,7 +1,7 @@
 {
-  "generatedAt": "2026-11-14T05:45:59.416Z",
-  "node": "v22.23.4",
-  "runtime": "v20.11.0-beownir",
+  "generatedAt": "2026-11-24T16:11:14.947Z",
+  "node": "v22.22.3",
+  "runtime": "v22.22.3-beownir",
   "results": [
     {
       "name": "express",
@@ -13,43 +13,43 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1296
+      "ms": 951
     },
     {
       "name": "koa",
       "passed": true,
       "detail": "koa 3.3.0 served 200 /koa",
-      "packages": 30,
+      "packages": 36,
       "versions": [
         "koa@3.3.0"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 491
+      "ms": 441
     },
     {
       "name": "fastify",
       "passed": true,
       "detail": "fastify 5.12.8 served 200 true",
-      "packages": 47,
+      "packages": 48,
       "versions": [
         "fastify@5.12.8"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1385
+      "ms": 1154
     },
     {
       "name": "hono",
       "passed": true,
-      "detail": "hono 4.13.18 answered 200 /hello",
+      "detail": "hono 4.13.21 answered 200 /hello",
       "packages": 1,
       "versions": [
-        "hono@4.13.18"
+        "hono@4.13.21"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 257
+      "ms": 110
     },
     {
       "name": "react",
@@ -57,25 +57,25 @@
       "detail": "react 19.3.1 rendered <main><h1>beownir</h1></main>",
       "packages": 3,
       "versions": [
-        "react-dom@19.3.1",
-        "react@19.3.1"
+        "react@19.3.1",
+        "react-dom@19.3.1"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 364
+      "ms": 1366
     },
     {
       "name": "vue",
       "passed": true,
-      "detail": "vue 3.5.45 rendered <p>beownir</p>",
+      "detail": "vue 3.5.46 rendered <p>beownir</p>",
       "packages": 23,
       "versions": [
-        "@vue/server-renderer@3.5.45",
-        "vue@3.5.45"
+        "vue@3.5.46",
+        "@vue/server-renderer@3.5.46"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1449
+      "ms": 764
     },
     {
       "name": "preact",
@@ -83,25 +83,25 @@
       "detail": "preact 11.2.0 rendered <section>beownir</section>",
       "packages": 2,
       "versions": [
-        "preact-render-to-string@6.8.3",
-        "preact@11.2.0"
+        "preact@11.2.0",
+        "preact-render-to-string@6.8.3"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 260
+      "ms": 121
     },
     {
       "name": "svelte",
       "passed": true,
-      "detail": "svelte 5.57.3 compiled 311 bytes",
+      "detail": "svelte 5.59.1 compiled 353 bytes",
       "note": "ESM-only compiler reached through the \"svelte/compiler\" subpath export",
       "packages": 19,
       "versions": [
-        "svelte@5.57.3"
+        "svelte@5.59.1"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 948
+      "ms": 628
     },
     {
       "name": "vite",
@@ -114,7 +114,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1057
+      "ms": 737
     },
     {
       "name": "hapi",
@@ -126,7 +126,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1686
+      "ms": 637
     },
     {
       "name": "zod",
@@ -138,7 +138,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 737
+      "ms": 208
     },
     {
       "name": "graphql",
@@ -150,7 +150,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 755
+      "ms": 309
     },
     {
       "name": "socket.io",
@@ -162,7 +162,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 797
+      "ms": 521
     },
     {
       "name": "typescript",
@@ -175,20 +175,20 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1627
+      "ms": 1755
     },
     {
       "name": "babel",
       "passed": true,
-      "detail": "babel 8.1.2 transformed JSX",
-      "packages": 47,
+      "detail": "babel 8.1.3 transformed JSX",
+      "packages": 48,
       "versions": [
-        "@babel/preset-react@8.0.1",
-        "@babel/core@8.1.2"
+        "@babel/core@8.1.3",
+        "@babel/preset-react@8.0.1"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1691
+      "ms": 1344
     },
     {
       "name": "postcss",
@@ -200,7 +200,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 95
+      "ms": 96
     },
     {
       "name": "sass",
@@ -212,19 +212,19 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1360
+      "ms": 961
     },
     {
       "name": "yargs",
       "passed": true,
       "detail": "yargs 18.2.0 parsed port=3000 name=beownir",
-      "packages": 12,
+      "packages": 15,
       "versions": [
         "yargs@18.2.0"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 454
+      "ms": 360
     },
     {
       "name": "chalk",
@@ -237,7 +237,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 279
+      "ms": 136
     },
     {
       "name": "dotenv",
@@ -249,7 +249,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 43
+      "ms": 40
     },
     {
       "name": "esbuild",
@@ -262,7 +262,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 686
+      "ms": 397
     },
     {
       "name": "vite-dev-transform",
@@ -275,7 +275,89 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 2255
+      "ms": 1257
+    },
+    {
+      "name": "vite-http-dev-server",
+      "passed": true,
+      "detail": "vite HTTP 200 index, 200 transformed module on virtual port 5173",
+      "note": "Vite dev server binds to the project virtual loopback; an HTTP client fetches the served HTML and transformed module over the runtime kernel",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 769
+    },
+    {
+      "name": "vite-production-build",
+      "passed": true,
+      "detail": "vite 6.4.6 production build emitted index.html, index-816tlDbo.js and index-B9-KD18r.css",
+      "note": "Vite 6 production build with the WASM Rollup/esbuild providers; verifies emitted HTML, JS bundle and CSS asset from a real virtual project",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 766
+    },
+    {
+      "name": "vite-cli-production-build",
+      "passed": true,
+      "detail": "vite/6.4.6\nvite 6.4.6 built 2 output bundle item(s) from /project\n\u001b[33m\u001b[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.\u001b[39m\u001b[0m; verified index.html and index-pfxZuzYB.js",
+      "note": "Runs the Vite 6 command through its installed Node API and WASM bundler; validates TypeScript output and bundle content; unsupported CLI options are rejected rather than silently ignored",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 718
+    },
+    {
+      "name": "vite-react-production-build",
+      "passed": true,
+      "detail": "vite 6.4.6 + React 19.3.1 production bundle emitted index-BqpCRNZS.js with JSX and createRoot",
+      "note": "Integrated Vite 6 + React 19 production build from a virtual project; validates JSX transform, package resolution, Rollup output and emitted entry bundle (not browser hydration or arbitrary plugins)",
+      "packages": 14,
+      "versions": [
+        "vite@6.4.6",
+        "react@19.3.1",
+        "react-dom@19.3.1"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 5330
+    },
+    {
+      "name": "vite-react-dev-server",
+      "passed": true,
+      "detail": "vite 6.4.6 + React 19.3.1 dev HTTP 200 HTML, 200 JSX module with React imports",
+      "note": "Integrated Vite 6 + React 19 dev server: serves project HTML and transforms JSX with package imports through the virtual HTTP loopback (not browser hydration or HMR WebSocket)",
+      "packages": 14,
+      "versions": [
+        "vite@6.4.6",
+        "react@19.3.1",
+        "react-dom@19.3.1"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 607
+    },
+    {
+      "name": "vite-hmr-websocket",
+      "passed": true,
+      "detail": "vite 6.4.6 HMR WebSocket sent connected then update after src.js edit",
+      "note": "End-to-end Vite HMR over the runtime virtual WebSocket: handshake, connected frame, file edit and update frame. Does not assert browser DOM rendering.",
+      "packages": 11,
+      "versions": [
+        "vite@6.4.6"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 562
     },
     {
       "name": "vite-hmr-invalidation",
@@ -288,7 +370,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1342
+      "ms": 931
     },
     {
       "name": "tailwind-4",
@@ -303,7 +385,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1625
+      "ms": 3680
     },
     {
       "name": "mocha",
@@ -316,20 +398,20 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1137
+      "ms": 718
     },
     {
       "name": "stylelint",
       "passed": true,
-      "detail": "stylelint 18.0.0 warnings=1",
+      "detail": "stylelint 18.1.0 warnings=1",
       "note": "Stylelint probes the cache with statSync({ throwIfNoEntry: false }) and must not throw on a cold run",
       "packages": 30,
       "versions": [
-        "stylelint@18.0.0"
+        "stylelint@18.1.0"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1194
+      "ms": 772
     },
     {
       "name": "chokidar",
@@ -342,7 +424,7 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 2041
+      "ms": 1667
     },
     {
       "name": "prettier",
@@ -355,34 +437,147 @@
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 401
+      "ms": 305
     },
     {
       "name": "eslint",
       "passed": true,
       "detail": "eslint 10.15.0 messages=1",
       "note": "Flat-config linter run through its Node API with an inline rule",
-      "packages": 76,
+      "packages": 78,
       "versions": [
         "eslint@10.15.0"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1978
+      "ms": 1350
     },
     {
       "name": "tailwind-3",
       "passed": true,
-      "detail": "tailwind 4.3.5 compiled css=10209 bytes",
-      "note": "Tailwind v3 is pure JavaScript. Tailwind v4 needs the native lightningcss binary and is not supported here",
-      "packages": 68,
+      "detail": "tailwind 3.4.19 compiled css=10210 bytes",
+      "note": "Tailwind v3 is pure JavaScript and needs no native fallbacks; Tailwind v4 runs through its real PostCSS plugin with the oxide scanner and lightningcss served by JavaScript compat shims (the tailwind-4 row)",
+      "packages": 71,
       "versions": [
         "tailwindcss@3.4.19",
         "postcss@8.5.33"
       ],
       "installFailures": 0,
       "resolveFailures": 0,
-      "ms": 1848
+      "ms": 1644
+    },
+    {
+      "name": "next",
+      "passed": true,
+      "detail": "next 15.5.29 loads; @next/swc-linux-x64-gnu resolves to the wasm twin; transformSync compiled the JSX page to 249 bytes in 79 ms",
+      "note": "Next 15 boots with SWC served by the WASM twin (59 ms first transform, 0-13 ms after, measured). The dev server also boots and webpack compiled 147 modules to its done hook in the VM harness, but a full page render costs ~17 min per page there (~1 GiB RSS) - beyond row budget, so the render is not claimed",
+      "packages": 22,
+      "versions": [
+        "react@19.3.1",
+        "react-dom@19.3.1",
+        "@next/swc-wasm-nodejs@15.5.29",
+        "next@15.5.29"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 9464
+    },
+    {
+      "name": "nestjs",
+      "passed": true,
+      "detail": "nestjs 12.6.0 served 200 NEST_SMOKE_OK (express adapter)",
+      "note": "NestJS 12 bootstrap with the exact metadata TypeScript decorators emit, defined by hand in plain JavaScript",
+      "packages": 98,
+      "versions": [
+        "rxjs@7.8.2",
+        "express@5.3.0",
+        "reflect-metadata@0.2.2",
+        "@nestjs/platform-express@12.6.0",
+        "@nestjs/common@12.6.0",
+        "@nestjs/core@12.6.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 2494
+    },
+    {
+      "name": "nuxt",
+      "passed": true,
+      "detail": "nuxt 4.4.8 dev-rendered the app.vue page",
+      "note": "Nuxt 4.4.8 (last Rollup-based line; >=4.5.0 needs vite 8 / rolldown whose @rolldown/binding-wasm32-wasi spawns a real worker_threads WASI thread pool at require time - impossible in a single-threaded browser worker). Installs cleanly with Vite 7, runs loadNuxt + build(nuxt) in-VM, connects Vite-node over Unix socket IPC to Nitro in its virtual worker_threads Worker, and SSR-renders app/app.vue over loopback HTTP. Nuxt >=4.5.0 recorded as blocked, not claimed",
+      "packages": 566,
+      "versions": [
+        "nuxt@4.4.8"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 41013
+    },
+    {
+      "name": "astro",
+      "passed": true,
+      "detail": "astro 5.18.2 built dist/index.html (86 bytes)",
+      "note": "Astro 5.18.2 static build of a one-page site (Vite + esbuild WASM + Astro compiler). Astro 6 requires Node >=22.23.4, newer than the 22.22.3 differential baseline, so it is not claimed either",
+      "packages": 275,
+      "versions": [
+        "astro@5.18.2"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 12652
+    },
+    {
+      "name": "sveltekit",
+      "passed": true,
+      "detail": "\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G\u001b[2K\u001b[1G                                                                    4:10:34 PM\nRun \u001b[1m\u001b[36mnpm run preview\u001b[22m\u001b[39m to preview your production build locally.\n\u001b[1m\u001b[36m                                                                    4:10:34 PM\n> Using @sveltejs/adapter-node\u001b[22m\u001b[39m\n  \u001b[32m✔ done\u001b[39m                                                           4:10:39 PM\nvite 7.3.8 built 17 output bundle item(s) from /project; adapter-node output present (4810 byte entry, 900 byte handler, gz=13, br=13)",
+      "note": "SvelteKit 2.70.4 sync + vite 7 build with the kit plugin and adapter-node (precompress enabled: both .gz and .br precompressed assets are produced via createGzip and embedded WASM createBrotliCompress). SvelteKit 3 peers vite 8 / rolldown, whose @rolldown/binding-wasm32-wasi spawns a real worker_threads WASI thread pool at require time - a single-threaded browser worker cannot nest real threads, so that line is recorded as blocked here rather than claimed",
+      "packages": 62,
+      "versions": [
+        "vite@7.3.8",
+        "@sveltejs/vite-plugin-svelte@6.2.4",
+        "@sveltejs/adapter-node@5.5.8",
+        "svelte@5.59.1",
+        "@sveltejs/kit@2.70.4"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 15840
+    },
+    {
+      "name": "remix",
+      "passed": true,
+      "detail": "\u001b[7m\u001b[34m info \u001b[39m\u001b[27m building...\u001b[90m (NODE_ENV=production)\u001b[39m\n\u001b[7m\u001b[34m info \u001b[39m\u001b[27m built\u001b[90m (7.6s)\u001b[39m\n\n[4:11:04 PM]  WARN  \u001b[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.\u001b[39m\n\n\u001b[7m\u001b[33m warn \u001b[39m\u001b[27m Fetcher persistence behavior is changing in React Router v7\n\u001b[33m┃\u001b[39m \u001b[90mYou can use the `v3_fetcherPersist` future flag to opt-in early.\u001b[39m\n\u001b[33m┃\u001b[39m \u001b[90m-> https://remix.run/docs/en/2.13.1/start/future-flags#v3_fetcherPersist\u001b[39m\n\u001b[33m┗\u001b[39m\n\u001b[7m\u001b[33m warn \u001b[39m\u001b[27m Route discovery/manifest behavior is changing in React Router v7\n\u001b[33m┃\u001b[39m \u001b[90mYou can use the `v3_lazyRouteDiscovery` future flag to opt-in early.\u001b[39m\n\u001b[33m┃\u001b[39m \u001b[90m-> https://remix.run/docs/en/2.13.1/start/future-flags#v3_lazyRouteDiscovery\u001b[39m\n\u001b[33m┗\u001b[39m\n\u001b[7m\u001b[33m warn \u001b[39m\u001b[27m Relative routing behavior for splat routes is changing in React Router v7\n\u001b[33m┃\u001b[39m \u001b[90mYou can use the `v3_relativeSplatPath` future flag to opt-in early.\u001b[39m\n\u001b[33m┃\u001b[39m \u001b[90m-> https://remix.run/docs/en/2.13.1/start/future-flags#v3_relativeSplatPath\u001b[39m\n\u001b[33m┗\u001b[39m\n\u001b[7m\u001b[33m warn \u001b[39m\u001b[27m Data fetching is changing to a single fetch in React Router v7\n\u001b[33m┃\u001b[39m \u001b[90mYou can use the `v3_singleFetch` future flag to opt-in early.\u001b[39m\n\u001b[33m┃\u001b[39m \u001b[90m-> https://remix.run/docs/en/2.13.1/start/future-flags#v3_singleFetch\u001b[39m\n\u001b[33m┗\u001b[39m\n\u001b[7m\u001b[33m warn \u001b[39m\u001b[27m The format of errors thrown on aborted requests is changing in React Router v7\n\u001b[33m┃\u001b[39m \u001b[90mYou can use the `v3_throwAbortReason` future flag to opt-in early.\u001b[39m\n\u001b[33m┃\u001b[39m \u001b[90m-> https://remix.run/docs/en/2.13.1/start/future-flags#v3_throwAbortReason\u001b[39m\n\u001b[33m┗\u001b[39m; 5793 byte server bundle",
+      "note": "Remix v2 compiler build (esbuild-based) of a one-route app",
+      "packages": 575,
+      "versions": [
+        "react@18.3.1",
+        "react-dom@18.3.1",
+        "isbot@5.2.4",
+        "@remix-run/react@2.17.5",
+        "@remix-run/node@2.17.5",
+        "@remix-run/dev@2.17.5"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 32059
+    },
+    {
+      "name": "angular",
+      "passed": true,
+      "detail": "angular 22.3.0 server-rendered a standalone component",
+      "note": "Angular platform-server renderApplication of a zoneless standalone component",
+      "packages": 8,
+      "versions": [
+        "rxjs@7.8.2",
+        "@angular/core@22.3.0",
+        "@angular/platform-browser@22.3.0",
+        "@angular/compiler@22.3.0",
+        "@angular/common@22.3.0",
+        "@angular/platform-server@22.3.0"
+      ],
+      "installFailures": 0,
+      "resolveFailures": 0,
+      "ms": 2937
     }
   ]
 }

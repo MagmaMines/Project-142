@@ -184,7 +184,7 @@ function loadSemver() {
 
 /** Evaluates the installer inside the sandbox and returns its entry points. */
 export function loadInstaller(sandbox, source) {
-  const names = ['npmInstall', 'npmCi', 'installPkg', 'extractPackage', 'fetchMeta', 'pickVersion', 'collectLock', 'INSTALL_BUDGET'];
+  const names = ['npmInstall', 'npmCi', 'installPkg', 'extractPackage', 'fetchMeta', 'pickVersion', 'collectLock', 'INSTALL_BUDGET', 'writeBnpkToVfs', 'resolveInstallPlan', 'linkPackageBins'];
   const factory = new Function('__sandbox__', 'with (__sandbox__) {\n' + source + '\n;return {' + names.join(',') + '};}');
   return factory(sandbox);
 }

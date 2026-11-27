@@ -510,3 +510,40 @@ test('a registry that rejects every range request falls back instead of hanging'
     await new Promise(resolve => server.close(resolve));
   }
 });
+
+test('a clean short 206 ends without requesting a trailing HTTP 416', async () => {
+  kit.resetRangeProbe();
+  const payload = randomBytes(100_000);
+  const rangesRequested = [];
+  let status416Count = 0;
+  const { server, origin } = await startServer((request, response) => {
+    const header = request.headers.range;
+    if (!header) { response.writeHead(200, { 'content-length': payload.length }); response.end(payload); return; }
+    const match = /^bytes=(\d+)-(\d*)$/.exec(header);
+    const start = Number(match[1]);
+    let end = match[2] ? Number(match[2]) : payload.length - 1;
+    rangesRequested.push(`${start}-${end}`);
+    if (start >= payload.length) { status416Count++; response.writeHead(416).end(); return; }
+    if (end >= payload.length) end = payload.length - 1;
+    const body = payload.subarray(start, end + 1);
+    response.writeHead(206, { 'content-type': 'application/octet-stream' });
+    response.end(body);
+  });
+  try {
+    const chunks = [];
+    const result = await kit.downloadInSegments(origin + '/short-cors.tgz', {
+      origin,
+      segmentBytes: 256 * 1024,
+      concurrency: 3,
+      onChunk: chunk => chunks.push(Buffer.from(chunk))
+    });
+    assert.equal(result.bytes, payload.length);
+    assert.deepEqual(Buffer.concat(chunks), payload);
+    assert.equal(status416Count, 0, 'expected zero 416 responses, saw: ' + JSON.stringify(rangesRequested));
+    assert.deepEqual(rangesRequested, ['0-0', '0-262143']);
+  } finally {
+    kit.resetRangeProbe();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+

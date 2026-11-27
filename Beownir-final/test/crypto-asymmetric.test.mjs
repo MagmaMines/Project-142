@@ -10,6 +10,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { loadRuntime } from './helpers/runtime.mjs';
 
 const privatePem = fs.readFileSync(new URL('./fixtures/rsa-2048.pem', import.meta.url), 'utf8');
@@ -117,6 +120,15 @@ test('OAEP with SHA-256 interoperates with OpenSSL in both directions', async ()
 `);
   const nodeOpened = crypto.privateDecrypt({ key: privateKey, ...options }, Buffer.from(fromRuntime, 'base64')).toString();
   assert.equal(nodeOpened, 'from runtime');
+
+  const rawNoSep = crypto.publicEncrypt({ key: publicKey, padding: crypto.constants.RSA_NO_PADDING }, Buffer.concat([Buffer.from([0x00, 0x02]), Buffer.alloc(254, 0x41)]));
+  assert.throws(() => crypto.privateDecrypt(privateKey, rawNoSep));
+  const rtRejectNoSep = run(runtime, `    const crypto = require('crypto');
+    const fs = require('fs');
+    const priv = crypto.createPrivateKey(fs.readFileSync('/project/private.pem', 'utf8'));
+    (() => { try { crypto.privateDecrypt(priv, Buffer.from(${JSON.stringify(rawNoSep.toString('base64'))}, 'base64')); return 'accepted'; } catch (e) { return e.code || 'rejected'; } })();
+`);
+  assert.notEqual(rtRejectNoSep, 'accepted');
 });
 
 test('keys exported by the runtime are readable by OpenSSL and vice versa', async () => {
@@ -144,6 +156,9 @@ test('keys exported by the runtime are readable by OpenSSL and vice versa', asyn
 });
 
 test('unsupported asymmetric features fail loudly instead of returning wrong bytes', async () => {
+  /* Unknown curves, unsupported RSA padding modes (RSA_NO_PADDING), invalid keys,
+   * unknown digests, synchronous RSA keygen and encrypted PEM export fail loudly
+   * with stable Node error codes instead of silently returning bad bytes. */
   const runtime = await runtimeWithKey();
   const result = run(runtime, `    const crypto = require('crypto');
     const fs = require('fs');
@@ -152,24 +167,614 @@ test('unsupported asymmetric features fail loudly instead of returning wrong byt
     const codeOf = fn => { try { fn(); return 'no-throw'; } catch (error) { return error.code || error.name; } };
     ({
       outcomes: [
-        outcome(() => crypto.sign('sha256', Buffer.from('x'), { key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING })),
-        outcome(() => crypto.createECDH('prime256v1')),
-        outcome(() => crypto.createSign('RSA-SHA256').sign({ key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING }, 'hex')),
+        outcome(() => crypto.createECDH('not-a-curve')),
+        outcome(() => crypto.sign('sha256', Buffer.from('x'), { key, padding: crypto.constants.RSA_NO_PADDING })),
         outcome(() => crypto.createPrivateKey('not a key')),
         outcome(() => crypto.publicEncrypt(crypto.createPublicKey(key), Buffer.alloc(300))),
         outcome(() => crypto.publicEncrypt(crypto.createPublicKey(key), Buffer.alloc(4), { padding: crypto.constants.RSA_NO_PADDING })),
+        outcome(() => crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })),
+        outcome(() => key.export({ type: 'pkcs8', format: 'pem', cipher: 'aes-256-cbc', passphrase: 'pw' })),
       ],
-      pssCode: codeOf(() => crypto.sign('sha256', Buffer.from('x'), { key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING })),
+      noPadCode: codeOf(() => crypto.sign('sha256', Buffer.from('x'), { key, padding: crypto.constants.RSA_NO_PADDING })),
       badKeyCode: codeOf(() => crypto.createPrivateKey('not a key')),
       digestCode: codeOf(() => crypto.createSign('sha3-999').sign(key)),
       tooLargeCode: codeOf(() => crypto.publicEncrypt(crypto.createPublicKey(key), Buffer.alloc(300))),
+      syncRsaCode: codeOf(() => crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })),
       pssConstant: crypto.constants.RSA_PKCS1_PSS_PADDING,
     });
 `);
-  assert.deepEqual(plain(result).outcomes, ['threw', 'threw', 'threw', 'threw', 'threw', 'threw']);
-  assert.equal(result.pssCode, 'ERR_CRYPTO_OPERATION_FAILED');
+  assert.deepEqual(plain(result).outcomes, ['threw', 'threw', 'threw', 'threw', 'threw', 'threw', 'threw']);
+  assert.equal(result.noPadCode, 'ERR_CRYPTO_OPERATION_FAILED');
   assert.equal(result.badKeyCode, 'ERR_OSSL_UNSUPPORTED');
   assert.equal(result.digestCode, 'ERR_CRYPTO_INVALID_DIGEST');
   assert.equal(result.tooLargeCode, 'ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE');
+  assert.equal(result.syncRsaCode, 'ERR_CRYPTO_OPERATION_FAILED');
   assert.equal(result.pssConstant, 6);
+});
+
+test('RSA-PSS signatures interoperate with OpenSSL across digests and salt lengths', async () => {
+  const runtime = await runtimeWithKey();
+  const payload = Buffer.from('pss-interop-payload');
+  const nodeSigDigest = crypto.sign('sha256', payload, {
+    key: privateKey,
+    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+  });
+  const nodeSigZero = crypto.sign('sha256', payload, {
+    key: privateKey,
+    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: 0,
+  });
+  const nodeSigSha512 = crypto.sign('sha512', payload, {
+    key: privateKey,
+    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: 20,
+  });
+
+  const actual = run(runtime, `
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const priv = crypto.createPrivateKey(fs.readFileSync('/project/private.pem', 'utf8'));
+    const pub = crypto.createPublicKey(fs.readFileSync('/project/public.pem', 'utf8'));
+    const payload = Buffer.from('pss-interop-payload');
+    const rtSig = crypto.sign('sha256', payload, {
+      key: priv,
+      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+      saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+    });
+    const rtSigMax = crypto.createSign('sha256').update(payload).sign({
+      key: priv,
+      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+      saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN,
+    });
+    const rtSigSha512 = crypto.sign('sha512', payload, {
+      key: priv,
+      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+      saltLength: 20,
+    });
+    ({
+      verifyNodeDigest: crypto.verify('sha256', payload, { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: -1 }, Buffer.from(${JSON.stringify(nodeSigDigest.toString('base64'))}, 'base64')),
+      verifyNodeZero: crypto.verify('sha256', payload, { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 0 }, Buffer.from(${JSON.stringify(nodeSigZero.toString('base64'))}, 'base64')),
+      verifyNodeSha512: crypto.verify('sha512', payload, { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 20 }, Buffer.from(${JSON.stringify(nodeSigSha512.toString('base64'))}, 'base64')),
+      rejectWrongSalt: crypto.verify('sha256', payload, { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 16 }, Buffer.from(${JSON.stringify(nodeSigDigest.toString('base64'))}, 'base64')),
+      rejectTampered: crypto.verify('sha256', Buffer.from('tampered'), { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: -1 }, Buffer.from(${JSON.stringify(nodeSigDigest.toString('base64'))}, 'base64')),
+      rtSigB64: rtSig.toString('base64'),
+      rtSigMaxB64: rtSigMax.toString('base64'),
+      rtSigSha512B64: rtSigSha512.toString('base64'),
+    });
+  `);
+
+  assert.equal(actual.verifyNodeDigest, true);
+  assert.equal(actual.verifyNodeZero, true);
+  assert.equal(actual.verifyNodeSha512, true);
+  assert.equal(actual.rejectWrongSalt, false);
+  assert.equal(actual.rejectTampered, false);
+  assert.equal(crypto.verify('sha256', payload, { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST }, Buffer.from(actual.rtSigB64, 'base64')), true);
+  assert.equal(crypto.verify('sha256', payload, { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN }, Buffer.from(actual.rtSigMaxB64, 'base64')), true);
+  assert.equal(crypto.verify('sha512', payload, { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 20 }, Buffer.from(actual.rtSigSha512B64, 'base64')), true);
+});
+
+test('ECDSA, EC KeyObject import/export, diffieHellman and generateKeyPair interoperate with Node 22', async () => {
+  const runtime = await runtimeWithKey();
+  const payload = Buffer.from('beownir-ecdsa-vector');
+
+  for (const [namedCurve, digest] of [['prime256v1', 'sha256'], ['secp384r1', 'sha384'], ['secp521r1', 'sha512']]) {
+    const alice = crypto.generateKeyPairSync('ec', { namedCurve });
+    const bob = crypto.generateKeyPairSync('ec', { namedCurve });
+    const nodeSigDer = crypto.sign(digest, payload, alice.privateKey);
+    const nodeSigP1363 = crypto.sign(digest, payload, { key: alice.privateKey, dsaEncoding: 'ieee-p1363' });
+    const nodeSecret = crypto.diffieHellman({ privateKey: alice.privateKey, publicKey: bob.publicKey }).toString('hex');
+
+    const res = run(runtime, `
+      const crypto = require('crypto');
+      const aPrivPkcs8 = ${JSON.stringify(alice.privateKey.export({ format: 'pem', type: 'pkcs8' }))};
+      const aPrivSec1 = ${JSON.stringify(alice.privateKey.export({ format: 'pem', type: 'sec1' }))};
+      const aPubSpki = ${JSON.stringify(alice.publicKey.export({ format: 'pem', type: 'spki' }))};
+      const aPrivJwk = ${JSON.stringify(alice.privateKey.export({ format: 'jwk' }))};
+      const bPubDer = Buffer.from(${JSON.stringify(bob.publicKey.export({ format: 'der', type: 'spki' }).toString('base64'))}, 'base64');
+
+      const k1 = crypto.createPrivateKey(aPrivPkcs8);
+      const k2 = crypto.createPrivateKey(aPrivSec1);
+      const k3 = crypto.createPrivateKey({ key: aPrivJwk, format: 'jwk' });
+      const pub = crypto.createPublicKey(aPubSpki);
+      const bPub = crypto.createPublicKey({ key: bPubDer, format: 'der', type: 'spki' });
+
+      const sigDer = crypto.sign(${JSON.stringify(digest)}, Buffer.from('beownir-ecdsa-vector'), k1);
+      const sigP1363 = crypto.sign(${JSON.stringify(digest)}, Buffer.from('beownir-ecdsa-vector'), { key: k1, dsaEncoding: 'ieee-p1363' });
+
+      const gen = crypto.generateKeyPairSync('ec', { namedCurve: ${JSON.stringify(namedCurve)} });
+      const genPubFromPriv = crypto.createPublicKey(gen.privateKey);
+      ({
+        keyType: k1.asymmetricKeyType,
+        namedCurve: k1.asymmetricKeyDetails.namedCurve,
+        sec1Equals: k1.equals(k2),
+        jwkEquals: k1.equals(k3),
+        pubMatches: crypto.createPublicKey(k1).equals(pub),
+        exportedSec1: k1.export({ format: 'pem', type: 'sec1' }),
+        exportedPkcs8: k1.export({ format: 'pem', type: 'pkcs8' }),
+        exportedJwk: k1.export({ format: 'jwk' }),
+        verifyNodeDer: crypto.verify(${JSON.stringify(digest)}, Buffer.from('beownir-ecdsa-vector'), pub, Buffer.from(${JSON.stringify(nodeSigDer.toString('base64'))}, 'base64')),
+        verifyNodeP1363: crypto.verify(${JSON.stringify(digest)}, Buffer.from('beownir-ecdsa-vector'), { key: pub, dsaEncoding: 'ieee-p1363' }, Buffer.from(${JSON.stringify(nodeSigP1363.toString('base64'))}, 'base64')),
+        rejectTampered: crypto.verify(${JSON.stringify(digest)}, Buffer.from('tampered'), pub, Buffer.from(${JSON.stringify(nodeSigDer.toString('base64'))}, 'base64')),
+        dhSecret: crypto.diffieHellman({ privateKey: k1, publicKey: bPub }).toString('hex'),
+        sigDerB64: sigDer.toString('base64'),
+        sigP1363B64: sigP1363.toString('base64'),
+        genPrivPem: gen.privateKey.export({ format: 'pem', type: 'pkcs8' }),
+        genPubPem: gen.publicKey.export({ format: 'pem', type: 'spki' }),
+        genPubEq: genPubFromPriv.equals(gen.publicKey),
+      });
+    `);
+
+    assert.equal(res.keyType, 'ec');
+    assert.equal(res.namedCurve, namedCurve);
+    assert.equal(res.sec1Equals, true);
+    assert.equal(res.jwkEquals, true);
+    assert.equal(res.pubMatches, true);
+    assert.equal(crypto.createPrivateKey(res.exportedSec1).equals(alice.privateKey), true);
+    assert.equal(crypto.createPrivateKey(res.exportedPkcs8).equals(alice.privateKey), true);
+    assert.equal(crypto.createPrivateKey({ key: res.exportedJwk, format: 'jwk' }).equals(alice.privateKey), true);
+    assert.equal(res.verifyNodeDer, true);
+    assert.equal(res.verifyNodeP1363, true);
+    assert.equal(res.rejectTampered, false);
+    assert.equal(res.dhSecret, nodeSecret);
+    assert.equal(crypto.verify(digest, payload, alice.publicKey, Buffer.from(res.sigDerB64, 'base64')), true);
+    assert.equal(crypto.verify(digest, payload, { key: alice.publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(res.sigP1363B64, 'base64')), true);
+    assert.equal(res.genPubEq, true);
+    const rtGenPriv = crypto.createPrivateKey(res.genPrivPem);
+    const rtGenPub = crypto.createPublicKey(res.genPubPem);
+    assert.equal(rtGenPriv.asymmetricKeyDetails.namedCurve, namedCurve);
+    assert.equal(crypto.verify(digest, payload, rtGenPub, crypto.sign(digest, payload, rtGenPriv)), true);
+  }
+
+  // Async WebCrypto generateKeyPair('rsa') and promisify(generateKeyPair)('rsa-pss')
+  const asyncRes = await runtime.evaluate(`(async () => {
+    const crypto = require('crypto');
+    const util = require('util');
+    const gen = util.promisify(crypto.generateKeyPair);
+    const rsa = await gen('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { format: 'pem', type: 'spki' },
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' },
+    });
+    const ec = await new Promise((resolve, reject) => crypto.generateKeyPair('ec', { namedCurve: 'P-256' }, (err, publicKey, privateKey) => err ? reject(err) : resolve({ publicKey, privateKey })));
+    const sig = crypto.sign('sha256', Buffer.from('async-rsa'), rsa.privateKey);
+    const ecSig = crypto.sign('sha256', Buffer.from('async-ec'), ec.privateKey);
+    return JSON.stringify({
+      rsaVerified: crypto.verify('sha256', Buffer.from('async-rsa'), rsa.publicKey, sig),
+      ecVerified: crypto.verify('sha256', Buffer.from('async-ec'), ec.publicKey, ecSig),
+      rsaPubPem: rsa.publicKey,
+      rsaSigB64: sig.toString('base64'),
+    });
+  })()`).then(JSON.parse);
+  assert.equal(asyncRes.rsaVerified, true);
+  assert.equal(asyncRes.ecVerified, true);
+  assert.equal(crypto.verify('sha256', Buffer.from('async-rsa'), crypto.createPublicKey(asyncRes.rsaPubPem), Buffer.from(asyncRes.rsaSigB64, 'base64')), true);
+});
+
+test('extended digests (sha224, sha512-224, sha512-256, ripemd160) match OpenSSL byte for byte', () => {
+  const runtime = loadRuntime();
+  const payload = Buffer.from('beownir-extended-digest-vector');
+  for (const alg of ['sha224', 'sha512-224', 'sha512-256', 'ripemd160']) {
+    const expectedHash = crypto.createHash(alg).update(payload).digest('hex');
+    const expectedHmac = crypto.createHmac(alg, 'hmac-key').update(payload).digest('hex');
+    const actual = run(runtime, `
+      const crypto = require('crypto');
+      const data = Buffer.from('beownir-extended-digest-vector');
+      ({
+        hash: crypto.createHash(${JSON.stringify(alg)}).update(data).digest('hex'),
+        oneshot: crypto.hash(${JSON.stringify(alg)}, data),
+        hmac: crypto.createHmac(${JSON.stringify(alg)}, 'hmac-key').update(data).digest('hex'),
+        listed: crypto.getHashes().includes(${JSON.stringify(alg)}),
+      });
+    `);
+    assert.equal(actual.hash, expectedHash);
+    assert.equal(actual.oneshot, expectedHash);
+    assert.equal(actual.hmac, expectedHmac);
+    assert.equal(actual.listed, true);
+  }
+});
+
+test('X509Certificate parses OpenSSL certificates and matches Node 22 fields & checks', async t => {
+  let certPem;
+  let caPem;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-x509-'));
+  try {
+    try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); }
+    catch { t.skip('openssl CLI not available'); return; }
+    const keyPath = path.join(tmp, 'key.pem');
+    const certPath = path.join(tmp, 'cert.pem');
+    const caPath = path.join(tmp, 'ca.pem');
+    fs.writeFileSync(keyPath, privatePem);
+    execFileSync('openssl', [
+      'req', '-x509', '-new', '-key', keyPath,
+      '-subj', '/C=US/ST=California/O=Beownir/OU=Runtime/CN=example.com/emailAddress=admin@example.com',
+      '-addext', 'subjectAltName=DNS:example.com,DNS:*.sub.example.com,IP:127.0.0.1,email:alt@example.com',
+      '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:1',
+      '-addext', 'extendedKeyUsage=serverAuth,clientAuth',
+      '-addext', 'authorityInfoAccess=OCSP;URI:http://ocsp.example.com,caIssuers;URI:http://ca.example.com/ca.crt',
+      '-days', '365', '-out', certPath,
+    ]);
+    execFileSync('openssl', [
+      'req', '-x509', '-new', '-key', keyPath,
+      '-subj', '/CN=Other Root CA',
+      '-days', '30', '-out', caPath,
+    ]);
+    certPem = fs.readFileSync(certPath, 'utf8');
+    caPem = fs.readFileSync(caPath, 'utf8');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const expected = new crypto.X509Certificate(certPem);
+  const runtime = await runtimeWithKey();
+  runtime.FS['/project/cert.pem'] = { c: certPem };
+  runtime.FS['/project/ca.pem'] = { c: caPem };
+  const actual = run(runtime, `
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const pem = fs.readFileSync('/project/cert.pem', 'utf8');
+    const cert = new crypto.X509Certificate(pem);
+    const other = new crypto.X509Certificate(fs.readFileSync('/project/ca.pem', 'utf8'));
+    const priv = crypto.createPrivateKey(fs.readFileSync('/project/private.pem', 'utf8'));
+    const fromDer = new crypto.X509Certificate(cert.raw);
+    const pubFromPem = crypto.createPublicKey(pem);
+    const legacy = cert.toLegacyObject();
+    ({
+      subject: cert.subject,
+      issuer: cert.issuer,
+      subjectAltName: cert.subjectAltName,
+      infoAccess: cert.infoAccess,
+      validFrom: cert.validFrom,
+      validTo: cert.validTo,
+      validFromIso: cert.validFromDate.toISOString(),
+      validToIso: cert.validToDate.toISOString(),
+      serialNumber: cert.serialNumber,
+      fingerprint: cert.fingerprint,
+      fingerprint256: cert.fingerprint256,
+      fingerprint512: cert.fingerprint512,
+      ca: cert.ca,
+      keyUsage: cert.keyUsage,
+      keyType: cert.publicKey.asymmetricKeyType,
+      pubSpki: cert.publicKey.export({ type: 'spki', format: 'pem' }),
+      pubFromPemMatches: pubFromPem.equals(cert.publicKey),
+      derMatches: fromDer.fingerprint256 === cert.fingerprint256,
+      toJsonMatches: cert.toJSON() === cert.toString() && cert.toString().includes('-----BEGIN CERTIFICATE-----'),
+      hostExact: cert.checkHost('example.com'),
+      hostWild: cert.checkHost('a.sub.example.com'),
+      hostDeep: cert.checkHost('a.b.sub.example.com'),
+      hostMiss: cert.checkHost('evil.com'),
+      emailHit: cert.checkEmail('alt@example.com'),
+      emailMiss: cert.checkEmail('other@example.com'),
+      ipHit: cert.checkIP('127.0.0.1'),
+      ipMiss: cert.checkIP('10.0.0.1'),
+      issuedSelf: cert.checkIssued(cert),
+      issuedOther: cert.checkIssued(other),
+      privMatch: cert.checkPrivateKey(priv),
+      verifySelf: cert.verify(cert.publicKey),
+      verifyOtherPub: (() => {
+        // flip modulus bit via fresh test key fails verify: test tampered cert raw verify fails
+        const der = Buffer.from(cert.raw);
+        der[der.length - 5] ^= 0xff;
+        try { return new crypto.X509Certificate(der).verify(cert.publicKey); } catch { return false; }
+      })(),
+      legacyModulus: legacy.modulus,
+      legacyBits: legacy.bits,
+      legacyExponent: legacy.exponent,
+      legacySubject: legacy.subject,
+      legacyCa: legacy.ca,
+      legacyExtUsage: legacy.ext_key_usage,
+      legacySan: legacy.subjectaltname,
+    });
+  `);
+
+  const expectedLegacy = expected.toLegacyObject();
+  assert.equal(actual.subject, expected.subject);
+  assert.equal(actual.issuer, expected.issuer);
+  assert.equal(actual.subjectAltName, expected.subjectAltName);
+  assert.equal(actual.infoAccess, expected.infoAccess);
+  assert.equal(actual.validFrom, expected.validFrom);
+  assert.equal(actual.validTo, expected.validTo);
+  assert.equal(actual.validFromIso, expected.validFromDate.toISOString());
+  assert.equal(actual.validToIso, expected.validToDate.toISOString());
+  assert.equal(actual.serialNumber, expected.serialNumber);
+  assert.equal(actual.fingerprint, expected.fingerprint);
+  assert.equal(actual.fingerprint256, expected.fingerprint256);
+  assert.equal(actual.fingerprint512, expected.fingerprint512);
+  assert.equal(actual.ca, expected.ca);
+  assert.deepEqual(plain(actual.keyUsage), expected.keyUsage);
+  assert.equal(actual.keyType, 'rsa');
+  assert.equal(actual.pubSpki, publicPem);
+  assert.equal(actual.pubFromPemMatches, true);
+  assert.equal(actual.derMatches, true);
+  assert.equal(actual.toJsonMatches, true);
+  assert.equal(actual.hostExact, expected.checkHost('example.com'));
+  assert.equal(actual.hostWild, expected.checkHost('a.sub.example.com'));
+  assert.equal(actual.hostDeep, expected.checkHost('a.b.sub.example.com'));
+  assert.equal(actual.hostMiss, expected.checkHost('evil.com'));
+  assert.equal(actual.emailHit, expected.checkEmail('alt@example.com'));
+  assert.equal(actual.emailMiss, expected.checkEmail('other@example.com'));
+  assert.equal(actual.ipHit, expected.checkIP('127.0.0.1'));
+  assert.equal(actual.ipMiss, expected.checkIP('10.0.0.1'));
+  assert.equal(actual.issuedSelf, true);
+  assert.equal(actual.issuedOther, false);
+  assert.equal(actual.privMatch, true);
+  assert.equal(actual.verifySelf, true);
+  assert.equal(actual.verifyOtherPub, false);
+  assert.equal(actual.legacyModulus, expectedLegacy.modulus);
+  assert.equal(actual.legacyBits, expectedLegacy.bits);
+  assert.equal(actual.legacyExponent, expectedLegacy.exponent);
+  assert.deepEqual(plain(actual.legacySubject), plain(expectedLegacy.subject));
+  assert.equal(actual.legacyCa, expectedLegacy.ca);
+  assert.deepEqual(plain(actual.legacyExtUsage), expectedLegacy.ext_key_usage);
+  assert.equal(actual.legacySan, expectedLegacy.subjectaltname);
+});
+
+test('X509Certificate verifies OpenSSL ECDSA certificates and checks private keys', async t => {
+  let ecCertPem, ecPrivPem;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-x509-ec-'));
+  try {
+    try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); }
+    catch { t.skip('openssl CLI not available'); return; }
+    const keyPath = path.join(tmp, 'ec.pem');
+    const certPath = path.join(tmp, 'ec-cert.pem');
+    execFileSync('openssl', ['ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', keyPath]);
+    execFileSync('openssl', ['req', '-x509', '-new', '-key', keyPath, '-subj', '/CN=ec.example.test', '-days', '30', '-out', certPath]);
+    ecPrivPem = fs.readFileSync(keyPath, 'utf8');
+    ecCertPem = fs.readFileSync(certPath, 'utf8');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  const runtime = loadRuntime();
+  const actual = run(runtime, `
+    const crypto = require('crypto');
+    const cert = new crypto.X509Certificate(${JSON.stringify(ecCertPem)});
+    const priv = crypto.createPrivateKey(${JSON.stringify(ecPrivPem)});
+    ({
+      keyType: cert.publicKey.asymmetricKeyType,
+      curve: cert.publicKey.asymmetricKeyDetails.namedCurve,
+      checkPriv: cert.checkPrivateKey(priv),
+      verified: cert.verify(cert.publicKey),
+      hostHit: cert.checkHost('ec.example.test'),
+    });
+  `);
+  assert.equal(actual.keyType, 'ec');
+  assert.equal(actual.curve, 'prime256v1');
+  assert.equal(actual.checkPriv, true);
+  assert.equal(actual.verified, true);
+  assert.equal(actual.hostHit, 'ec.example.test');
+});
+
+test('Certificate verifies OpenSSL SPKAC and extracts challenge and public key', async t => {
+  let spkacB64;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-spkac-'));
+  try {
+    try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); }
+    catch { t.skip('openssl CLI not available'); return; }
+    const keyPath = path.join(tmp, 'key.pem');
+    fs.writeFileSync(keyPath, privatePem);
+    const spkacOut = execFileSync('openssl', ['spkac', '-key', keyPath, '-challenge', 'beownir-challenge-42'], { encoding: 'utf8' });
+    spkacB64 = spkacOut.trim().replace(/^SPKAC\s*=\s*/i, '');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const runtime = await runtimeWithKey();
+  const badBuf = Buffer.from(spkacB64, 'base64');
+  badBuf[badBuf.length - 3] ^= 0xff;
+  const badB64 = badBuf.toString('base64');
+
+  const actual = run(runtime, `
+    const crypto = require('crypto');
+    const spkac = ${JSON.stringify(spkacB64)};
+    const bad = ${JSON.stringify(badB64)};
+    const inst = crypto.Certificate();
+    ({
+      isInst: inst instanceof crypto.Certificate,
+      staticVerify: crypto.Certificate.verifySpkac(spkac),
+      instVerify: inst.verifySpkac(Buffer.from(spkac)),
+      badVerify: crypto.Certificate.verifySpkac(bad),
+      invalidVerify: crypto.Certificate.verifySpkac('not-valid-spkac'),
+      challenge: crypto.Certificate.exportChallenge(spkac).toString('utf8'),
+      instChallenge: inst.exportChallenge(spkac).toString('utf8'),
+      badChallenge: crypto.Certificate.exportChallenge('not-valid'),
+      pubPem: crypto.Certificate.exportPublicKey(spkac).toString('utf8'),
+      instPubPem: inst.exportPublicKey(Buffer.from(spkac)).toString('utf8'),
+    });
+  `);
+
+  assert.equal(actual.isInst, true);
+  assert.equal(actual.staticVerify, true);
+  assert.equal(actual.instVerify, true);
+  assert.equal(actual.badVerify, false);
+  assert.equal(actual.invalidVerify, false);
+  assert.equal(actual.challenge, 'beownir-challenge-42');
+  assert.equal(actual.instChallenge, 'beownir-challenge-42');
+  assert.equal(actual.badChallenge, '');
+  assert.equal(actual.pubPem, publicPem);
+  assert.equal(actual.instPubPem, publicPem);
+});
+
+test('Ed25519 keys, deterministic signatures, X.509 certificates, and X25519 diffieHellman match OpenSSL', async t => {
+  const edPair = crypto.generateKeyPairSync('ed25519');
+  const payload = Buffer.from('beownir-ed25519-rfc8032-vector');
+  const nodeEdSig = crypto.sign(null, payload, edPair.privateKey);
+  const edPrivPem = edPair.privateKey.export({ format: 'pem', type: 'pkcs8' });
+  const edPubPem = edPair.publicKey.export({ format: 'pem', type: 'spki' });
+  const edPrivJwk = edPair.privateKey.export({ format: 'jwk' });
+  const edPubJwk = edPair.publicKey.export({ format: 'jwk' });
+
+  const xNodeA = crypto.generateKeyPairSync('x25519');
+  const xNodeAPubDerHex = xNodeA.publicKey.export({ format: 'der', type: 'spki' }).toString('hex');
+
+  let edCertPem = '';
+  let edCertKeyPem = '';
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-x509-ed-'));
+  try {
+    execFileSync('openssl', ['version'], { stdio: 'ignore' });
+    const keyPath = path.join(tmp, 'ed.pem');
+    const certPath = path.join(tmp, 'ed-cert.pem');
+    execFileSync('openssl', ['genpkey', '-algorithm', 'Ed25519', '-out', keyPath]);
+    execFileSync('openssl', ['req', '-x509', '-new', '-key', keyPath, '-subj', '/CN=ed25519.example.test', '-days', '30', '-out', certPath]);
+    edCertKeyPem = fs.readFileSync(keyPath, 'utf8');
+    edCertPem = fs.readFileSync(certPath, 'utf8');
+  } catch {
+    edCertPem = '';
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const runtime = loadRuntime();
+  const actual = await run(runtime, `(async () => {
+    const crypto = require('crypto');
+    const util = require('util');
+
+    // Node Ed25519 -> Beownir verification & deterministic byte-for-byte signing
+    const privFromPem = crypto.createPrivateKey(${JSON.stringify(edPrivPem)});
+    const pubFromPem = crypto.createPublicKey(${JSON.stringify(edPubPem)});
+    const privFromJwk = crypto.createPrivateKey({ key: ${JSON.stringify(edPrivJwk)}, format: 'jwk' });
+    const pubFromJwk = crypto.createPublicKey({ key: ${JSON.stringify(edPubJwk)}, format: 'jwk' });
+    const rtSigHex = crypto.sign(null, Buffer.from(${JSON.stringify(payload.toString('hex'))}, 'hex'), privFromPem).toString('hex');
+
+    let badDigestCode = null;
+    try { crypto.sign('sha256', Buffer.from('x'), privFromPem); } catch (e) { badDigestCode = e.code; }
+
+    // Native Ed25519 generation (sync + async promisify)
+    const genSync = crypto.generateKeyPairSync('ed25519');
+    const genAsync = await util.promisify(crypto.generateKeyPair)('ed25519');
+    const genSig = crypto.sign(undefined, Buffer.from('async-okp'), genAsync.privateKey);
+
+    // X25519 diffieHellman against Node key + self-roundtrip + all-zero low-order rejection
+    const xB = crypto.generateKeyPairSync('x25519');
+    const xAPub = crypto.createPublicKey({ key: Buffer.from(${JSON.stringify(xNodeAPubDerHex)}, 'hex'), format: 'der', type: 'spki' });
+    const sharedWithNode = crypto.diffieHellman({ privateKey: xB.privateKey, publicKey: xAPub });
+    const xC = await util.promisify(crypto.generateKeyPair)('x25519');
+    const self1 = crypto.diffieHellman({ privateKey: xB.privateKey, publicKey: xC.publicKey });
+    const self2 = crypto.diffieHellman({ privateKey: xC.privateKey, publicKey: xB.publicKey });
+    let lowOrderCode = null;
+    try {
+      const zeroPub = crypto.createPublicKey({ key: Buffer.from('302a300506032b656e032100' + '00'.repeat(32), 'hex'), format: 'der', type: 'spki' });
+      crypto.diffieHellman({ privateKey: xB.privateKey, publicKey: zeroPub });
+    } catch (e) { lowOrderCode = e.code; }
+
+    let x509Check = null;
+    if (${JSON.stringify(Boolean(edCertPem))}) {
+      const cert = new crypto.X509Certificate(${JSON.stringify(edCertPem)});
+      const certPriv = crypto.createPrivateKey(${JSON.stringify(edCertKeyPem)});
+      const badCert = crypto.generateKeyPairSync('ed25519').publicKey;
+      x509Check = {
+        keyType: cert.publicKey.asymmetricKeyType,
+        verified: cert.verify(cert.publicKey),
+        wrongKeyVerified: cert.verify(badCert),
+        checkPriv: cert.checkPrivateKey(certPriv),
+        hostHit: cert.checkHost('ed25519.example.test'),
+      };
+    }
+
+    return {
+      asymmetricKeyType: privFromPem.asymmetricKeyType,
+      details: privFromPem.asymmetricKeyDetails,
+      jwkRoundtripEq: privFromJwk.equals(privFromPem) && pubFromJwk.equals(pubFromPem),
+      exportJwk: genSync.privateKey.export({ format: 'jwk' }),
+      rtSigHex,
+      verifyNodeSig: crypto.verify(null, Buffer.from(${JSON.stringify(payload.toString('hex'))}, 'hex'), pubFromJwk, Buffer.from(${JSON.stringify(nodeEdSig.toString('hex'))}, 'hex')),
+      rejectTamper: crypto.verify(null, Buffer.from('tamper'), pubFromPem, Buffer.from(${JSON.stringify(nodeEdSig.toString('hex'))}, 'hex')),
+      verifyAsyncGen: crypto.verify(null, Buffer.from('async-okp'), genAsync.publicKey, genSig),
+      badDigestCode,
+      xBType: xB.privateKey.asymmetricKeyType,
+      xBPubDerHex: xB.publicKey.export({ format: 'der', type: 'spki' }).toString('hex'),
+      sharedWithNodeHex: sharedWithNode.toString('hex'),
+      selfMatch: self1.equals(self2),
+      lowOrderCode,
+      x509Check,
+    };
+  })()`);
+
+  assert.equal(actual.asymmetricKeyType, 'ed25519');
+  assert.deepEqual(plain(actual.details), {});
+  assert.equal(actual.jwkRoundtripEq, true);
+  assert.equal(actual.exportJwk.kty, 'OKP');
+  assert.equal(actual.exportJwk.crv, 'Ed25519');
+  // RFC 8032 signatures are strictly deterministic: exact byte-for-byte match with OpenSSL.
+  assert.equal(actual.rtSigHex, nodeEdSig.toString('hex'));
+  assert.equal(actual.verifyNodeSig, true);
+  assert.equal(actual.rejectTamper, false);
+  assert.equal(actual.verifyAsyncGen, true);
+  assert.equal(actual.badDigestCode, 'ERR_OSSL_INVALID_DIGEST');
+  assert.equal(actual.xBType, 'x25519');
+  assert.equal(actual.selfMatch, true);
+  assert.equal(actual.lowOrderCode, 'ERR_OSSL_FAILED_DURING_DERIVATION');
+
+  const nodeXBPub = crypto.createPublicKey({ key: Buffer.from(actual.xBPubDerHex, 'hex'), format: 'der', type: 'spki' });
+  const nodeExpectedShared = crypto.diffieHellman({ privateKey: xNodeA.privateKey, publicKey: nodeXBPub }).toString('hex');
+  assert.equal(actual.sharedWithNodeHex, nodeExpectedShared);
+
+  if (edCertPem) {
+    assert.deepEqual(plain(actual.x509Check), {
+      keyType: 'ed25519',
+      verified: true,
+      wrongKeyVerified: false,
+      checkPriv: true,
+      hostHit: 'ed25519.example.test',
+    });
+  } else {
+    t.diagnostic('openssl ed25519 cert generation unavailable; skipped x509 sub-assert');
+  }
+});
+
+test('SHA-3, SHAKE XOF, and BLAKE2 hashes, HMACs, and RSA-SHA3 signatures match OpenSSL', () => {
+  const runtime = loadRuntime();
+  const payload = Buffer.from('beownir-keccak-blake2-vector-'.repeat(12));
+  const longKey = Buffer.alloc(170, 0x5a);
+  const algorithms = ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512', 'shake128', 'shake256', 'blake2b512', 'blake2s256'];
+
+  for (const alg of algorithms) {
+    const expEmpty = crypto.createHash(alg).digest('hex');
+    const expPayload = crypto.createHash(alg).update(payload).digest('hex');
+    const expHmac = alg.startsWith('shake') ? null : crypto.createHmac(alg, longKey).update(payload).digest('hex');
+    const actual = run(runtime, `
+      const crypto = require('crypto');
+      const data = Buffer.from(${JSON.stringify(payload.toString())});
+      const key = Buffer.alloc(170, 0x5a);
+      ({
+        empty: crypto.createHash(${JSON.stringify(alg)}).digest('hex'),
+        hash: crypto.createHash(${JSON.stringify(alg)}).update(data).digest('hex'),
+        oneshot: crypto.hash(${JSON.stringify(alg)}, data),
+        hmac: ${JSON.stringify(alg)}.startsWith('shake') ? null : crypto.createHmac(${JSON.stringify(alg)}, key).update(data).digest('hex'),
+        listed: crypto.getHashes().includes(${JSON.stringify(alg)}),
+      });
+    `);
+    assert.equal(actual.empty, expEmpty, `${alg} empty digest`);
+    assert.equal(actual.hash, expPayload, `${alg} digest`);
+    assert.equal(actual.oneshot, expPayload, `${alg} crypto.hash`);
+    assert.equal(actual.hmac, expHmac, `${alg} HMAC`);
+    assert.equal(actual.listed, true, `${alg} listed in getHashes()`);
+  }
+
+  for (const [xof, outLen] of [['shake128', 0], ['shake128', 32], ['shake128', 99], ['shake256', 64]]) {
+    const exp = crypto.createHash(xof, { outputLength: outLen }).update(payload).digest('hex');
+    const actual = run(runtime, `
+      const crypto = require('crypto');
+      crypto.createHash(${JSON.stringify(xof)}, { outputLength: ${outLen} }).update(${JSON.stringify(payload.toString())}).copy().digest('hex');
+    `);
+    assert.equal(actual, exp, `${xof} outputLength=${outLen}`);
+  }
+
+  const rsaRes = run(runtime, `
+    const crypto = require('crypto');
+    let badXofLenCode = null;
+    try { crypto.createHash('sha256', { outputLength: 16 }); } catch (e) { badXofLenCode = e.code; }
+    const msg = Buffer.from('sha3-rsa-interop');
+    const sigs = {};
+    for (const alg of ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512']) {
+      sigs[alg] = crypto.sign(alg, msg, ${JSON.stringify(privatePem)}).toString('hex');
+    }
+    ({ badXofLenCode, sigs });
+  `);
+  assert.equal(rsaRes.badXofLenCode, 'ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH');
+  for (const alg of ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512']) {
+    const sig = Buffer.from(rsaRes.sigs[alg], 'hex');
+    assert.equal(crypto.verify(alg, Buffer.from('sha3-rsa-interop'), publicPem, sig), true, `OpenSSL verifies ${alg} RSA sig`);
+    const nodeSig = crypto.sign(alg, Buffer.from('sha3-rsa-interop'), privateKey).toString('hex');
+    assert.equal(run(runtime, `require('crypto').verify(${JSON.stringify(alg)}, Buffer.from('sha3-rsa-interop'), ${JSON.stringify(publicPem)}, Buffer.from(${JSON.stringify(nodeSig)}, 'hex'))`), true);
+  }
 });

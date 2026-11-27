@@ -3,8 +3,8 @@
 # The whole product is `o/site/index.html` (plus the service worker that turns
 # on cross-origin isolation on hosts that cannot send headers themselves).
 # Netlify only reads `netlify.toml` from the repository root, which is why this
-# file exists next to `o/netlify.toml` — that one is used by `o/deploy/*` when a
-# deployment is configured with `base = "o"` instead. Keep the two in sync;
+# file exists next to `o/netlify.toml` — that one is used when a deployment is
+# configured with `base = "o"` instead. Keep the two in sync;
 # `test/deployment.test.mjs` fails if their isolation headers drift apart.
 [build]
   publish = "o/site"
@@ -15,9 +15,9 @@
   [build.environment]
     NODE_VERSION = "22"
 
-# Cross-origin isolation is what gives the runtime SharedArrayBuffer, JSPI and
-# the WASIX profile. Without these two headers the IDE still boots, but in the
-# limited single-threaded profile.
+# Cross-origin isolation is what gives the runtime SharedArrayBuffer, worker_threads,
+# and parallel tarball extraction. Without these two headers the IDE still boots
+# in single-threaded fallback mode.
 [[headers]]
   for = "/*"
   [headers.values]

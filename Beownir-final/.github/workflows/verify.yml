@@ -25,9 +25,14 @@ jobs:
         run: npm run verify
       - name: Compare the runtime with the running Node
         run: npm run differential
-      - name: Build the deploy, serve it the way Netlify does and check it from outside
+      - name: Verify static deployment server and headers
         run: |
           node tools/deploy-files.mjs
           node tools/serve-static.mjs 8099 &
+          SERVER_PID=$!
+          trap "kill $SERVER_PID 2>/dev/null || true" EXIT
           for i in $(seq 1 40); do curl -fsS -o /dev/null http://127.0.0.1:8099/ && break; sleep 0.5; done
-          node o/deploy/check.mjs --ide http://127.0.0.1:8099/
+          curl -fsSI http://127.0.0.1:8099/ | grep -qi "cross-origin-opener-policy: same-origin"
+          curl -fsSI http://127.0.0.1:8099/ | grep -qi "cross-origin-embedder-policy: require-corp"
+          curl -fsSI http://127.0.0.1:8099/coi-sw.js | grep -qi "service-worker-allowed: /"
+          npm run standalone:smoke

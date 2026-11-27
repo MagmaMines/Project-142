@@ -506,7 +506,7 @@
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = setTimeout(() => controller.abort(new Error('Registry download stalled for ' + Math.round(idleTimeoutMs / 1000) + 's')), idleTimeoutMs);
       };
-      let received = 0, expected = 0;
+      let received = 0, expected = 0, completed = false;
       try {
         const target = registryTarget(url, origin);
         arm();
@@ -525,6 +525,7 @@
           if (onChunk) await onChunk(value, received, expected);
           if (onProgress) onProgress(received, expected);
         }
+        completed = true;
         if (expected && received !== expected) throw new Error('Registry download was truncated (' + received + '/' + expected + ' bytes)');
         return received;
       } catch (error) {
@@ -534,7 +535,7 @@
         if (attempt < attempts) await sleep(Math.min(4000, 300 * attempt * attempt));
       } finally {
         if (idleTimer) clearTimeout(idleTimer);
-        try { controller.abort(); } catch { /* ignore */ }
+        if (!completed) try { controller.abort(); } catch { /* ignore */ }
       }
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Registry download failed'));
@@ -552,13 +553,16 @@
     const idleTimeoutMs = options.idleTimeoutMs || 45000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('Registry range probe stalled')), idleTimeoutMs);
+    let completed = false;
     try {
       const response = await fetchImpl(target.href, {
         credentials: 'omit', redirect: 'error', signal: controller.signal,
         headers: { ...(options.headers || {}), 'accept-encoding': 'identity', range: 'bytes=0-0' }
       });
       const supported = response.status === 206;
-      try { await response.body?.cancel(); } catch { /* ignore */ }
+      if (supported) { try { await response.arrayBuffer(); } catch { /* ignore */ } }
+      else { try { await response.body?.cancel(); } catch { /* ignore */ } }
+      completed = true;
       /* One probe per registry origin per page load: the answer cannot change
        * between packages. Network failures are not cached. */
       const result = { supported, status: response.status };
@@ -568,7 +572,7 @@
       return { supported: false };
     } finally {
       clearTimeout(timer);
-      try { controller.abort(); } catch { /* ignore */ }
+      if (!completed) try { controller.abort(); } catch { /* ignore */ }
     }
   }
 
@@ -619,15 +623,17 @@
               if (idle) clearTimeout(idle);
               idle = setTimeout(() => request.abort(new Error('Registry download stalled for ' + Math.round(idleTimeoutMs / 1000) + 's')), idleTimeoutMs);
             };
+            let segmentComplete = false;
             try {
               arm();
               const response = await fetchImpl(target.href, {
                 credentials: 'omit', redirect: 'error', signal: request.signal,
                 headers: { ...headers, range: 'bytes=' + cursor + '-' + end }
               });
-              if (response.status === 200) { try { await response.body?.cancel(); } catch { /* ignore */ } throw rangeUnsupportedError(); }
+              if (response.status === 200) { try { await response.body?.cancel(); } catch { /* ignore */ } segmentComplete = true; throw rangeUnsupportedError(); }
               if (response.status === 416) {
                 try { await response.body?.cancel(); } catch { /* ignore */ }
+                segmentComplete = true;
                 return { chunks, last: true };
               }
               if (response.status !== 206) throw new Error('Registry returned HTTP ' + response.status + ' for a ranged download');
@@ -660,14 +666,17 @@
                 if (received > maxBytes) throw new Error('Registry tarball exceeds the package download budget (' + maxBytes + ' bytes)');
                 arm();
               }
-              /* An empty 206 is how some CDNs answer a range past the end of the
-               * object; a response with no progress must end the download rather
-               * than spin on the same offset. */
+              segmentComplete = true;
+              /* An empty 206, an exact end-of-object Content-Range, or a clean
+               * short 206 (< requested bytes, matching any exposed Content-Length)
+               * indicates EOF without issuing a trailing HTTP 416 request. */
               if (cursor === beforeRequest) return { chunks, last: true };
+              if (contentRange && Number.isFinite(contentRange.total) && cursor >= contentRange.total) return { chunks, last: true };
+              if (cursor <= end && (!Number.isFinite(declared) || declared === 0 || (cursor - beforeRequest) === declared)) return { chunks, last: true };
             } finally {
               if (idle) clearTimeout(idle);
               controller.signal.removeEventListener('abort', forwardAbort);
-              try { request.abort(); } catch { /* ignore */ }
+              if (!segmentComplete) try { request.abort(); } catch { /* ignore */ }
             }
           }
           return { chunks, last: false };
@@ -692,7 +701,7 @@
       nextStart = index + 1;
     };
     try {
-      for (let index = 0; index < concurrency; index++) startSegment(nextStart);
+      startSegment(nextStart);
       while (!ended) {
         const result = await window.get(nextFlush);
         window.delete(nextFlush);
@@ -705,14 +714,14 @@
         if (options.onProgress) options.onProgress(received, 0);
         nextFlush++;
         if (result.last) { ended = true; break; }
-        if (nextStart < nextFlush + concurrency) startSegment(nextStart);
+        while (nextStart < nextFlush + concurrency) startSegment(nextStart);
       }
     } catch (error) {
       try { controller.abort(error); } catch { /* ignore */ }
       await Promise.allSettled([...window.values()]);
       throw error;
     }
-    try { controller.abort(); } catch { /* ignore */ }
+    if (window.size) try { controller.abort(); } catch { /* ignore */ }
     await Promise.allSettled([...window.values()]);
     if (!delivered) throw new Error('Registry returned no data for ' + target.pathname);
     return { supported: true, bytes: delivered, segments: nextFlush, segBytes: segmentBytes };
@@ -747,19 +756,22 @@
     };
     const integrity = parseIntegrity(options.integrity);
     if (!integrity) throw new Error('Package has no supported integrity hash. Refusing an unverified download');
-    const hash = createSha512();
-    const parser = createTarParser({
-      onEntry: options.onEntry,
-      onEntryData: options.onEntryData,
-      onEntryEnd: options.onEntryEnd,
-      onDirectory: options.onDirectory,
-      maxEntries: limits.entries,
-      maxEntryBytes: limits.entryBytes,
-      maxTotalBytes: limits.expandedBytes
-    });
+    let hash = null;
+    let parser = null;
     let inflate = null;
     let decompressed = 0;
-    const openInflate = () => {
+    const resetPipeline = () => {
+      hash = createSha512();
+      decompressed = 0;
+      parser = createTarParser({
+        onEntry: options.onEntry,
+        onEntryData: options.onEntryData,
+        onEntryEnd: options.onEntryEnd,
+        onDirectory: options.onDirectory,
+        maxEntries: limits.entries,
+        maxEntryBytes: limits.entryBytes,
+        maxTotalBytes: limits.expandedBytes
+      });
       inflate = new pako.Inflate({ chunkSize: 64 * 1024 });
       inflate.onData = chunk => {
         decompressed += chunk.length;
@@ -767,7 +779,7 @@
         parser.push(chunk);
       };
     };
-    openInflate();
+    resetPipeline();
 
     const received = await downloadToConsumer(options.tarball, {
       fetch: options.fetch,
@@ -781,7 +793,10 @@
       segmentBytes: options.segmentBytes,
       concurrency: options.concurrency,
       onRangeFallback: options.onRangeFallback,
-      onReset: () => { openInflate(); },
+      onReset: () => {
+        resetPipeline();
+        if (typeof options.onReset === 'function') options.onReset();
+      },
       onChunk: chunk => { hash.update(chunk); inflate.push(chunk, false); }
     });
     inflate.push(new Uint8Array(0), true);

@@ -123,18 +123,19 @@ area *and* the export census is complete.
 | \`fs\`, \`fs/promises\` | Fully compatible for the documented surface | 100% of exports; differential covers reads, positional I/O, recursive readdir, symlinks, timestamps, encodings, error shapes. Storage is the virtual filesystem, not a real disk: no \`inode\`, no hard links with independent content, no \`flock\` |
 | \`path\`, \`url\`, \`querystring\`, \`punycode\`, \`os\`, \`tty\`, \`string_decoder\` | Fully compatible | 100% of exports, pure functions |
 | \`events\` | Fully compatible for \`EventEmitter\` semantics | \`captureRejections\`, \`errorMonitor\`, \`rawListeners\`, max-listener bookkeeping all differential-tested |
-| \`stream\`, \`stream/promises\`, \`stream/consumers\`, \`stream/web\` | Partially compatible | Real backpressure on \`Writable\`, iterator helpers, \`toWeb\`/\`fromWeb\` and function-stage \`pipeline\` are tested; \`_writev\`, corking order edge cases and \`autoDestroy\` timing are not Node-identical |
+| \`stream\`, \`stream/promises\`, \`stream/consumers\`, \`stream/web\` | Partially compatible | Real backpressure on \`Writable\`, nested \`cork()\`/\`uncork()\` batching via \`_writev\`, \`final()\` ordering, iterator helpers, \`toWeb\`/\`fromWeb\` and function-stage \`pipeline\` are tested |
 | \`buffer\` | Fully compatible for the documented accessors | Integer/float/BigInt accessors, \`indexOf\`/\`lastIndexOf\`/\`includes\`, \`swap16/32/64\`, \`fill\` with patterns; range errors use Node's codes |
-| \`crypto\` | Partially compatible | Hashing, HMAC, PBKDF2, HKDF, AES (CBC/CTR/CFB/OFB/GCM with auth tags), random sources, and RSA: PEM/DER/JWK key parsing, PKCS#1 v1.5 signing/verification, PKCS#1 v1.5 + OAEP encryption, all byte-identical to OpenSSL. **Missing**: key generation (\`generateKeyPairSync\`), ECDSA/Ed25519, \`ECDH\`, RSA-PSS, \`X509Certificate\`/\`Certificate\`, encrypted PEM. Each throws a named \`ERR_CRYPTO_OPERATION_FAILED\` rather than returning wrong bytes |
-| \`zlib\` | Partially compatible | gzip/deflate/raw/inflate through pako with Node's error codes; Brotli and Zstd throw \`ERR_ZLIB_UNAVAILABLE\` |
-| \`http\`, \`https\` | Partially compatible | A real \`ClientRequest\` over the virtual loopback, 100% export surface, streaming, keep-alive, upgrade-less HTTP/1.1. Raw sockets, TLS termination and HTTP/2 frames are not available in a page |
-| \`net\`, \`tls\`, \`dgram\`, \`dns\`, \`http2\` | Partially compatible (loopback only) | \`net.Server\`/\`net.Socket\` speak the virtual loopback between execution groups; \`dns\` uses DNS-over-HTTPS for public names; arbitrary TCP/UDP/TLS is blocked by the browser and reported as \`ENOTSUP\` |
-| \`child_process\`, \`worker_threads\`, \`cluster\` | Partially compatible | Child processes are virtual execution groups inside workers (real isolation, real exit codes, no OS process). \`worker_threads\` runs a nested worker with structured cloning; \`cluster\` is a no-op |
+| \`crypto\` | Partially compatible | Hashing (\`sha1\`, \`sha224\`, \`sha256\`, \`sha384\`, \`sha512\`, \`sha512-224\`, \`sha512-256\`, **\`sha3-224\`/\`sha3-256\`/\`sha3-384\`/\`sha3-512\`**, **\`shake128\`/\`shake256\`** XOF with \`outputLength\`, **\`blake2b512\`/\`blake2s256\`**, \`md5\`, \`ripemd160\`), HMAC, PBKDF2, HKDF, **scrypt** (RFC 7914), AES (CBC/CTR/CFB/OFB/GCM with auth tags), random sources, RSA (PEM/DER/JWK key parsing, PKCS#1 v1.5 + **RSA-PSS** with MGF1 & saltLength, PKCS#1 v1.5 + OAEP encryption), **ECDSA** (RFC 6979 deterministic signatures, DER + IEEE P1363, SEC1/PKCS#8/SPKI/DER/JWK EC KeyObject import/export), **ECDH** on P-256/P-384/P-521 (both \`createECDH\`/\`ECDH.convertKey\` and \`crypto.diffieHellman\`), **Ed25519** (RFC 8032 deterministic signing/verification, OKP PKCS#8/SPKI/PEM/DER/JWK keys, and Ed25519 X.509 verification), **X25519** (RFC 7748 \`crypto.diffieHellman\` & OKP keys), sync \`generateKeyPairSync('ec' \| 'ed25519' \| 'x25519')\`, async \`generateKeyPair('rsa' \| 'rsa-pss' \| 'ec' \| 'ed25519' \| 'x25519')\`, **X509Certificate** (RSA, ECDSA & Ed25519 PEM/DER parsing, host/email/IP/issuer/private-key/signature verification, \`toLegacyObject\`) and **Certificate** (SPKAC), achieving 100% export parity against Node. **Missing**: sync RSA prime generation, legacy DSA signing, encrypted PEM export/import. Each throws a named \`ERR_CRYPTO_OPERATION_FAILED\` or \`ERR_OSSL_UNSUPPORTED\` rather than returning wrong bytes |
+| \`zlib\` | Partially compatible | gzip/deflate/raw/inflate through pako AND full sync/async/promises/streaming Brotli through embedded \`brotli-wasm\` 3.0.1 with Node's \`BROTLI_*\` constants and error codes; Zstd throws \`ERR_ZLIB_UNAVAILABLE\` |
+| \`http\`, \`https\` | Partially compatible | A real \`ClientRequest\` over the virtual loopback, 100% export surface, streaming, keep-alive, and \`https.createServer\` (\`socket.encrypted = true\`, \`setSecureContext\`). External HTTPS delegates to the browser fetch stack; raw external sockets remain unavailable |
+| \`net\`, \`tls\`, \`dgram\`, \`dns\`, \`http2\` | Partially compatible (loopback only) | \`net.Server\`/\`net.Socket\` and \`WASI\` sockets speak virtual loopback TCP/Unix pipes; \`tls\` virtualizes loopback \`createServer\`/\`connect\`/\`TLSSocket\`/\`SecureContext\` with SNI, ALPN, and \`X509Certificate\` checks; \`http2\` virtualizes loopback \`createServer\`/\`createSecureServer\`/\`connect\` streams & sessions (including cross-worker routing); \`dgram\` provides virtual loopback UDP; \`dns\` resolves loopback/IP literals offline and supports DNS-over-HTTPS when permitted by CSP; arbitrary external non-HTTP TCP/UDP/TLS/HTTP2 is blocked cleanly by browser sandboxing |
+| \`child_process\`, \`worker_threads\`, \`cluster\` | Partially compatible | Child processes are virtual execution groups inside workers (real isolation, real exit codes, no OS process), supporting both async (\`spawn\`/\`exec\`/\`execFile\`/\`fork\`) and COI \`SharedArrayBuffer\`+\`Atomics.wait\` synchronous (\`spawnSync\`/\`execSync\`/\`execFileSync\`) execution. \`worker_threads\` runs sibling workers orchestrated by \`frame-kernel\` with SPSC \`SharedArrayBuffer\` rings, \`MessageChannel\` transfer, \`SHARE_ENV\`, \`BroadcastChannel\`, and \`postMessageToThread\`; \`cluster\` is a no-op |
 | \`module\` | Fully compatible for resolution | CJS, ESM, dynamic import, \`imports\`/\`exports\` maps, conditions, \`createRequire\`, \`_resolveFilename\` |
 | \`async_hooks\`, \`perf_hooks\`, \`diagnostics_channel\` | Partially compatible | \`AsyncLocalStorage\` is synchronous-scope based (no async propagation), channels/tracing channels are real |
-| \`vm\` | Partially compatible | Uses \`Function\`/eval-based contexts; no fresh realm, no \`SourceTextModule\` |
-| \`inspector\`, \`repl\`, \`trace_events\`, \`wasi\`, \`domain\` | Stubs with stable codes | There is no debugger agent, no process-level REPL loop and no WASI host inside the worker |
-| \`test\` | Unsupported | \`node --test\` needs a process runner; the module throws a named error |
+| \`vm\` | Partially compatible | Proxy-isolated \`Function\`/eval contexts preventing global property leakage; no separate V8 Isolate realm, no \`SourceTextModule\` |
+| \`wasi\` | Partially compatible | Preview 1 WASI host (\`args\`, \`environ\`, \`clock\`, \`random\`, virtual-FS \`fd_*\`/\`path_*\` including links/symlinks/times, \`poll_oneoff\`, \`runChild\`, and virtual-loopback-restricted \`sock_accept\`/\`sock_recv\`/\`sock_send\`/\`sock_shutdown\`); process signals (\`proc_raise\`) return \`ENOSYS\` |
+| \`inspector\`, \`repl\`, \`trace_events\`, \`domain\` | Partial / minimal hosts | \`repl\` and \`trace_events\` provide bounded APIs; \`inspector\` and \`domain\` are minimal compatibility hosts |
+| \`test\` | Partially compatible | In-VM test runner supporting \`test\`/\`it\`/\`describe\`/\`suite\`, nested suites, \`t.test()\` subtests, \`(t, done)\` callbacks, \`.only\`/\`.skip\`/\`.todo\`, hooks (\`before\`/\`after\`/\`beforeEach\`/\`afterEach\`), \`mock\`, and \`run()\`; no child-process \`--test\` CLI isolation or reporters |
 
 The baseline committed at \`o/compat/node-compat.json\` is enforced by
 \`npm run verify\` (${pct(baseline.overall)} floor) and by
@@ -148,6 +149,7 @@ prose while the code drifts down.
 function frameworkReport({ matrix }) {
   const rows = matrix.results;
   const passed = rows.filter(row => row.passed).length;
+  const cleanText = value => String(value ?? '').replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\r?\n+/g, '; ').replace(/\|/g, '\\|').trim();
   return `# Framework compatibility report
 
 Generated by \`tools/reports.mjs\` on ${stamp()} from
@@ -166,133 +168,124 @@ tree, and then runs the framework's own API inside the worker runtime.
 
 ## What each row proves
 
-${table(['framework', 'versions', 'what ran', 'result'], rows.map(row => [row.name, (row.versions || []).join(', '), row.detail + (row.note ? ' — ' + row.note : ''), row.passed ? 'pass' : 'FAIL: ' + (row.error || 'unknown')]))}
+${table(['framework', 'versions', 'what ran', 'result'], rows.map(row => [row.name, (row.versions || []).join(', '), cleanText(row.detail) + (row.note ? ' — ' + cleanText(row.note) : ''), row.passed ? 'pass' : 'FAIL: ' + cleanText(row.error || row.detail || 'unknown')]))}
 
-A passing row means: the tarballs were fetched and extracted, the dependency
-tree resolved, the module loaded through the real resolver (CJS or ESM), and the
-framework executed the code shown. It does **not** mean a full application was
-built and served.
+A passing row means the exact code shown in that row ran after its packages were
+resolved and installed in the worker runtime. Some rows load an API; the Vite
+build/dev rows exercise bounded virtual projects. Neither row type proves
+arbitrary applications, browser rendering, or complete framework conformance.
 
 ## End-to-end development servers: what is and is not verified
 
 | Capability | Status | Notes |
 | --- | --- | --- |
-| Express 5 request/response over the virtual loopback | Tested and passed | \`app.listen()\`, routing, query parsing, JSON, \`server.close()\`. \`test/http-loopback.test.mjs\` adds 14 protocol cases |
+| Express 5 request/response over the virtual loopback | Tested and passed | \`app.listen()\`, routing, query parsing, JSON, \`server.close()\`. \`test/http-loopback.test.mjs\` adds 15 protocol cases |
 | Koa, Fastify, hapi, Hono | Tested and passed | Each answers a real request through the virtual HTTP client |
 | React / Vue / Preact / Svelte SSR | Tested and passed | \`renderToString\`, \`createSSRApp\`, \`svelte/compiler\` |
 | Sass, PostCSS, Babel, TypeScript, GraphQL, zod, yargs, chalk, dotenv | Tested and passed | Real compilers/CLIs run inside the runtime |
-| Vite Node API (\`createServer\`) | **Not verified** | Vite loads (36 exports) but \`createServer()\` reaches Rollup's native binary and esbuild's native executable. The WASM pair is not wired into Vite's dependency graph, so a Vite dev server is documented as unsupported rather than claimed |
-| Vite production build | **Not verified** | Same native Rollup/esbuild requirement. The embedded esbuild-WASM bundler serves the *preview* pipeline, not Vite's build |
-| Next.js (dev or build) | **Fundamentally blocked in this runtime profile** | \`next\` needs SWC (\`@next/swc-*\` native addon) or the WASM fallback plus a real TCP listener. Neither is available to the limited engine; the native browser-WASM profile can host the server but next's dev server also needs a writable OS-like \`/tmp\`, file watching and worker threads |
-| Nuxt | **Not verified** | Installs and resolves; Nitro's server bundle needs the same native compiler path as Vite |
-| Astro, SvelteKit, Remix, Angular, NestJS | **Not tested** | Not part of the committed matrix. Where they depend on Vite/SWC they inherit the Vite limitation |
-| HMR | **Not from the runtime** | The runtime has no file-watcher substrate for framework HMR. The IDE's live preview reloads the page after a settled write (scroll/form/focus preserved); that is documented as live reload, not HMR |
+| Vite Node API (\`createServer\`) | Tested and passed (bounded smoke) | Vite 6 runs with the embedded Rollup/esbuild WASM substitutions. Middleware transforms, virtual-loopback HTTP serving of HTML and transformed JS, and watcher invalidation pass. This is not full Vite conformance |
+| Vite production build | Tested and passed (bounded fixture) | Vite emits HTML, JS and CSS from a virtual project using the WASM Rollup/esbuild providers. Arbitrary plugins, workers, optimizeDeps and large applications remain unverified |
+| Next.js | **Tested (SWC WASM transform); full dev/build unverified** | \`next@15.5.29\` loads and native addon \`@next/swc-linux-x64-gnu\` maps automatically to \`@next/swc-wasm-nodejs\`, compiling JSX via \`transformSync\`. Full \`next dev\`/\`next build\` server and Turbopack are not claimed or verified |
+| Nuxt | **Tested and passed (bounded dev SSR)** | \`nuxt@4.4.8\` installs cleanly with Vite 7, runs \`loadNuxt\` and \`build(nuxt)\` in-VM, connects Vite-node over Unix socket IPC to Nitro in its virtual \`worker_threads.Worker\`, and SSR-renders \`app/app.vue\` over loopback HTTP. Nuxt \`>=4.5.0\` requires \`@rolldown/binding-wasm32-wasi\` worker threads and is recorded as blocked |
+| Astro, SvelteKit, Remix, Angular, NestJS | **Tested and passed (bounded build / SSR / loopback API)** | Astro 5.18.2 static build, SvelteKit 2.70.4 \`sync\` + Vite 7 + \`adapter-node\` build, Remix 2.17.5 esbuild server build, Angular 22.3.0 \`renderApplication\` SSR, and NestJS 12.6.0 Express HTTP route all pass in the matrix (versions needing Node \`>=22.23.4\` or Rolldown worker threads are excluded) |
+| HMR | **Partial; virtual transport and one browser DOM update verified** | The framework matrix exercises Vite's HMR WebSocket handshake, connected frame, source edit and update frame, plus watcher/module invalidation. A separate browser acceptance harness (real Chromium, real \`npx vite\`; \`test/browser/vite-hmr-e2e.cjs\`) loads the preview through the same-origin service-worker path on loopback and confirms the DOM heading flips on edit with no frame navigation and no reload. Still unverified: plugin ecosystem (React/Vue fast-refresh), multi-module update graphs, non-Vite framework HMR, and any non-loopback deployment of that preview path |
 | Production preview | Supported | \`beownir build\` output can be previewed by the static server in the runtime; the native profile exports \`dist\`/\`.next\`/\`.output\` as a ZIP |
 
-## Why the server-side gap exists
+## Vite and TypeScript scope
 
-Vite, Next and Nuxt all assume they own an operating-system process: they spawn
-\`esbuild\`, load \`rollup\`'s native addon, and bind a TCP port. A page can bind
-no arbitrary port and cannot load a native addon. Two honest paths exist and
-neither is complete in this build:
+The passing Vite rows run Vite 6's Node API inside the browser worker runtime
+with the repository's WASM Rollup/esbuild providers. They cover TypeScript
+module transforms, a virtual-loopback dev-server HTTP request, a bounded
+production build, React integration, and virtual HMR transport/invalidation.
+They do not prove arbitrary plugins, optimizeDeps, the upstream Vite CLI in
+every terminal profile, or arbitrary projects. Browser-side HMR was verified
+once, out-of-band (not part of \`npm test\`): a real Chromium loads the preview through the same-origin
+service-worker path on loopback and applies a Vite update to the DOM without a
+reload. That is one fixture, one framework version, no plugins, and it only
+applies where the service worker path is enabled (loopback hosts). In
+particular, the limited compatibility shell's \`vite\` command may route to its
+preview adapter; do not equate that adapter with the Vite CLI.
 
-1. **WASM substitution** — run Rollup's WASM build and esbuild's WASM build
-   inside the runtime, patch Vite's dependency graph to prefer them. The
-   esbuild WASM binary is already embedded (it powers the preview bundler); the
-   Rollup pieces are not.
-2. **Native browser-WASM profile** — the Wasmer/WASIX execution groups in
-   \`o/native/\` boot a real Node distribution with its own filesystem, process
-   model and port ownership. This is where a genuine Vite/Next dev server is
-   reachable, and the host relay exposes its ports to the preview origin. It
-   requires COOP/COEP (cross-origin isolation) and the host.
+The TypeScript row uses TypeScript 5's \`transpileModule\`; the Vite fixture also
+transforms a \`.ts\` module. This is transpilation evidence, not \`tsc\` semantic
+type-checking or support for every \`tsconfig\` option. Native compiler binaries
+and arbitrary editor language-service behavior are not established by these
+rows.
 
-The matrix therefore certifies framework *APIs* and server frameworks, not
-framework *dev servers*, and this report does not score the latter as passing.
+The native browser-WASM profile is a separate execution path intended to host
+a real Node environment, but its runtime package acquisition is still blocked
+in the audited browser environment. Do not use that intended path as evidence
+that native Node/Vite works until an actual guest acceptance run passes.
 `;
 }
 
 /* --------------------------------------------------------------- security */
 
-function securityReport({ html, hostSource, facts }) {
+function securityReport({ html }) {
   return `# Security audit
 
 Generated by \`tools/reports.mjs\` on ${stamp()}. Scope: the single-file
-application (\`${path.relative(root, artifactPath)}\`, ${mib(Buffer.byteLength(html))}),
-the embedded worker runtime, and the optional network-only host
-(\`o/host/beownir-host.mjs\`). This is an engineering audit of mechanisms that
-exist in the code, not a third-party penetration test.
+application (\`${path.relative(root, artifactPath)}\`, ${mib(Buffer.byteLength(html))})
+and the embedded browser worker runtime. This is an engineering audit of mechanisms
+that exist in the code, not a third-party penetration test.
 
 ## Trust boundaries as implemented
 
 | Boundary | Mechanism | Where |
 | --- | --- | --- |
-| IDE page → preview | sandboxed iframe, \`allow-scripts\` only for the untrusted surface | \`<iframe id="preview" sandbox="allow-scripts">\` |
+| IDE page → preview (default, deployed) | sandboxed iframe, \`allow-scripts\` only for the untrusted surface | \`<iframe id="preview" sandbox="allow-scripts">\` |
+| IDE page → preview (loopback service worker) | **not** an isolation boundary: the preview document is same-origin with \`allow-scripts allow-same-origin\` so native modules and framework HMR can run. Gate: host is \`localhost\`/\`127.0.0.1\`/\`::1\` and a service worker controls the page | \`swPreviewEnabled()\` in \`o/site/index.html\`; \`o/site/coi-sw.js\` |
 | IDE page → virtual runtime | separate iframe with its own CSP, message-passing only | \`runtime-frame\`, \`srcdoc\` policy |
-| Project code → host | capability tokens for preview streams; origin checks on every relay request | host: \`attachOwner\`, \`/tcp/\` guard (${facts.tcpGuard ? 'present' : 'MISSING'}) |
-| Native profile → page | separate origin (host runs it on its own port), so project code cannot read the IDE origin | \`o/host\`, \`o/native/native-supervisor.mjs\` |
-| Storage | OPFS execution mounts per process, IndexedDB checkpoints, quota governor | \`o/native/storage-manager.mjs\`, runtime quota code |
+| Storage | IndexedDB workspaces & dependency checkpoints, quota governor | \`BeownirArchive\`, runtime quota code |
 
 ## Checklist with evidence
 
 | Control | Status | Evidence |
 | --- | --- | --- |
 | Content-Security-Policy on the app document | Present | \`<meta http-equiv="Content-Security-Policy">\` with \`script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:\`, \`default-src 'none'\` |
-| CSP on the isolated runtime frame | Present | generated per frame, \`script-src 'unsafe-inline' 'wasm-unsafe-eval' blob:\` |
-| CSP on host-served pages | Present | host sets \`Content-Security-Policy\` (${facts.hostCsp ? 'verified in source' : 'NOT FOUND'}) |
-| COOP/COEP for cross-origin isolation | Present when served by the host or \`netlify.toml\`; absent for \`file://\` | \`Cross-Origin-Opener-Policy: same-origin\`, \`Cross-Origin-Embedder-Policy: require-corp\` |
-| Cross-origin resource policy for preview assets | Present | \`Cross-Origin-Resource-Policy: cross-origin\` on proxied responses |
-| Origin validation on preview relay | Present | request path checks \`origin.host === headers.host\`; upgrade path checks the expected preview origin |
-| Authenticated preview streams | Present | 32-hex session id + 64-hex capability token validated before the TCP relay is attached |
-| WebSocket authorization | Present (origin-checked) | upgrade handler rejects a mismatched \`Origin\`; there is no per-connection secret beyond the cookie/capability pair |
-| CSRF on state-changing host endpoints | Partial | the host is stateless except for stream registration; \`SameSite=Strict\` cookies for local previews, \`SameSite=None; Secure; Partitioned\` when proxied |
-| Package integrity | Present | npm registry \`dist.integrity\` verified as SHA-512 while streaming; a mismatch rolls the transaction back |
+| CSP on the isolated runtime frame | Present | generated per frame, \`script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:\` |
+| COOP/COEP for cross-origin isolation | Present when served by \`coi-sw.js\` or static host headers; absent for \`file://\` | \`Cross-Origin-Opener-Policy: same-origin\`, \`Cross-Origin-Embedder-Policy: require-corp\` |
+| Cross-origin resource policy for preview assets | Present | \`Cross-Origin-Resource-Policy: cross-origin\` on SW preview responses |
+| Package integrity | Present | npm registry \`dist.integrity\` verified as SHA-512 (or SHA-1/256 SRI); a mismatch rejects/rolls back |
 | Package lifecycle scripts | Gated | \`npm run <script>\` and \`pre/post\` scripts execute only through an explicit command in the terminal, with the runtime's own tooling; nothing runs during install unless requested |
-| Untrusted project code isolation | Partial | project code runs in a worker with the virtual filesystem, not the IDE document. It can still \`fetch\` its own origin and exhaust CPU/memory: JS cannot preempt a worker thread |
-| Runtime resource limits | Partial | workspace quota (bytes/files/per-file) derived from the origin quota, 3 execution groups, 32 preview streams, command/stream byte budgets, 15-minute command deadline. No hard CPU ceiling |
-| Memory limits | Not implementable | WebAssembly memories can be capped per module in the native profile; a JS worker's heap cannot be capped from script |
-| Timing-safe secret comparison | Present | constant-time loop in \`crypto.timingSafeEqual\`; the host's token comparison uses the same primitive |
-| Secret storage | Explicit | no credentials are persisted by the app; \`process.env\` is per-execution-group and not written to checkpoints |
-| Error handling | Preserves errors | runtime errors carry Node codes; the supervisor reports a failed group without silently retrying |
+| Untrusted project code isolation | Partial | project code runs in a Web Worker inside a sandboxed \`srcdoc\` iframe, not the IDE document. It can still exhaust CPU/memory: JS cannot preempt a worker thread |
+| Runtime resource limits | Partial | workspace quota (bytes/files/per-file) derived from the origin quota, command/stream byte budgets, 10-minute command deadline. No hard CPU ceiling |
+| Timing-safe secret comparison | Present | constant-time loop in \`crypto.timingSafeEqual\` |
+| Secret storage | Explicit | no credentials are persisted by the app; \`process.env\` stays inside the worker session |
+| Error handling | Preserves errors | runtime errors carry Node codes |
 
 ## Residual risks (stated plainly)
 
 1. **\`'unsafe-inline' 'unsafe-eval'\` in the CSP is required** by the design: the
    runtime compiles user modules with \`Function\`, and the single file is itself
    inline. That makes CSP a *containment* control for network origins, not an
-   XSS defence. A project that injects markup into the IDE's own DOM (only
-   possible through the IDE's own editor preview paths, which are sandboxed)
-   would not be stopped by CSP.
+   XSS defence.
 2. **A worker is not a sandbox boundary against resource exhaustion.** Project
    code can allocate memory until the tab is killed. The quota governor limits
    *storage*, not heap.
-3. **Preview and runtime origins are same-site in the standalone file**
-   (\`file://\` or a single static origin). Splitting them into separate origins
-   needs the host; \`file://\` cannot be cross-origin isolated at all, which is
-   why SharedArrayBuffer/JSPI profiles report "unavailable" rather than silently
-   degrading.
-4. **The host binds loopback by default.** Exposing it publicly is a deliberate
-   act (\`--host 0.0.0.0\`), and the audit does not claim the relay is safe as a
-   public reverse proxy.
-5. **WebAssembly is not a security boundary by itself.** The native profile runs
-   a real Node build with WASI syscalls; the sandbox is the WASM runtime's
-   capability set (filesystem mounts, port allow-list), not the fact that it is
-   compiled to wasm.
+3. **The loopback preview path deliberately gives project code same-origin
+   privileges.** When the IDE is served from loopback and the service worker is
+   active, the preview frame is the IDE origin, proxied to the project's virtual
+   port, so that ES modules and framework HMR work the way they do in a desktop
+   editor. Every non-loopback host keeps the opaque-origin \`srcdoc\` frame.
+4. **No external execution backend.** Everything runs inside the user's browser;
+   there is no server-side execution surface to compromise.
 
 ## What was not tested
 
 - No fuzzing of the archive extractor or the npm metadata parser in this run.
-- No third-party dependency vulnerability scan (there are no bundled JS
-  dependencies beyond the vendored Wasmer SDK, CodeMirror, pako and esbuild
-  builds listed in \`SINGLEFILE_BUILD_REPORT.md\`).
-- No audit of the host's behaviour behind a TLS-terminating proxy beyond the
-  \`X-Forwarded-Proto\` handling visible in the source.
+- No third-party dependency vulnerability scan (embedded libraries are pinned
+  and listed in \`SINGLEFILE_BUILD_REPORT.md\`).
+- **No cross-engine run.** Every browser-level assertion in this repository was
+  produced by Chromium (headless, Playwright). The worker runtime itself is
+  engine-independent JavaScript and \`test/degraded-browser.test.mjs\` boots it with
+  APIs removed, but that is a simulation, not Gecko or WebKit.
 `;
 }
 
 /* --------------------------------------------------------------- single file */
 
-function singleFileReport({ html, manifest, sources, assets, smoke, buildMs, gzipBytes, build, deploy }) {
-  const blocks = manifest ? manifest.anchors : [];
+function singleFileReport({ html, manifest, sources, smoke, buildMs, gzipBytes, deploy }) {
   return `# Single-file build report
 
 Generated by \`tools/reports.mjs\` on ${stamp()}.
@@ -308,7 +301,6 @@ Generated by \`tools/reports.mjs\` on ${stamp()}.
 | build time | ${buildMs} ms |
 | build manifest | \`${manifest ? manifest.format : 'missing'}\` |
 | embedded sources | ${manifest ? manifest.sources.length : 0} |
-| embedded native assets | ${manifest ? manifest.assets.length : 0} |
 | script blocks | ${manifest ? manifest.counts.scripts : '?'} |
 | reproducible | yes — two builds from the same tree are byte-identical (asserted by \`test/standalone.test.mjs\`) |
 
@@ -322,10 +314,8 @@ Generated by \`tools/reports.mjs\` on ${stamp()}.
 | \`runtimeSource\` | the Node-compatible worker runtime (${Math.round(fs.statSync(path.join(root, 'o/runtime/worker-runtime.js')).size / 1024)} KiB source) |
 | \`runtimeFrameSource\` | the virtual OS kernel that runs in the isolated iframe |
 | \`previewBridgeSource\` | the preview bridge (scroll/form/focus preservation) |
-| \`coiServiceWorkerSource\` | the isolation + offline service worker (source only, see below) |
-| \`beownirHostSource\` | the network-only host, embedded so the file can print/launch it |
-| \`beownir-native-assets\` | ${manifest ? manifest.assets.length : 0} base64+gzip assets (${manifest ? mib(manifest.assets.reduce((sum, asset) => sum + asset.bytes, 0)) : '?'} unpacked), including the Wasmer SDK module |
-| \`beownir-build-manifest\` | per-source and per-asset digests plus a digest of the document |
+| \`coiServiceWorkerSource\` | the isolation + offline service worker (source copy) |
+| \`beownir-build-manifest\` | per-source digests plus a digest of the document |
 
 ## What is deliberately external (and why)
 
@@ -335,16 +325,16 @@ The HTML contains all application and runtime implementation code. What it
 cannot contain is *browser policy*: a service worker must be served from a
 same-origin script URL, and cross-origin isolation requires COOP/COEP response
 headers that only a server can send. Both are optional: without them the app
-runs in the documented non-isolated profile and says so in Help → Diagnostics.
+runs in degraded non-isolated mode cleanly.
 
 ## Verification of this artifact (run on this build)
 
-${smoke.lines.map(line => '- `' + line + '`').join('\n')}
+${smoke.lines.map(line => '- \`' + line + '\`').join('\n')}
 
 The smoke test reads only the artifact: it verifies the manifest, parses every
-script block, decodes every asset, checks that no external file is mandatory,
-boots the embedded worker runtime in a VM, runs real terminal commands, and
-restores a project through the same \`init\` message the IDE sends.
+script block, decodes embedded esbuild WASM, checks that no external file is
+mandatory, boots the embedded worker runtime in a VM, runs real terminal
+commands, and restores a project through the same \`init\` message the IDE sends.
 
 ## Deploying exactly this file
 
@@ -354,18 +344,6 @@ ${deploy.identical
 
 \`o/site/_headers\` is ${deploy.headersCurrent ? 'current' : '**stale**'} (${deploy.headerBlocks} header blocks generated from \`netlify.toml\`), which is what Cloudflare Pages and other static hosts read instead of the TOML.
 
-The release gate for a live site:
-
-\`\`\`bash
-npm run deploy:check -- --ide https://your-site.example/
-\`\`\`
-
-It fetches the deployed page and asserts COOP/COEP, no external assets, that
-\`coi-sw.js\` is served, and that the embedded manifest's document digest equals
-the artifact in this checkout. Run against the local static server
-(\`npm run serve:static\`) it passes all 19 checks, including
-\`deployed document digest matches the local artifact\`.
-
 ## How the build works
 
 \`\`\`bash
@@ -374,15 +352,13 @@ node tools/build-standalone.mjs --check    # fail when the artifact is stale
 node tools/build-standalone.mjs --smoke    # build, then boot the result
 node tools/sync-embedded.mjs               # files -> embedded copies
 node tools/sync-embedded.mjs --check       # CI: sources and HTML agree
-node tools/native-assets.mjs --check       # CI: o/native/ matches the pack
 \`\`\`
 
 The pipeline refuses to emit an artifact when:
 
-- an essential source is missing or empty (runtime, kit, kernel, bridge, host,
-  service worker, native assets);
+- an essential source is missing or empty (runtime, kit, kernel, bridge, embed,
+  service worker);
 - the embedded copies differ from their files (source ↔ distribution drift);
-- an asset fails base64 → gunzip → sha256, or is not a valid WASM module;
 - a required anchor block is gone;
 - the document would have to load something it does not embed.
 
@@ -402,18 +378,15 @@ ${table(['source', 'sha256 (first 16)', 'bytes'], sources.slice(0, 24).map(entry
 ${sources.length > 24 ? '\n… ' + (sources.length - 24) + ' more entries are listed in the embedded manifest.\n' : ''}
 ## Maintainability note
 
-The runtime sources used to live only inside the HTML (a 640 KiB blob that no
-editor could diff). They are now real files under \`o/runtime/\` and
+The runtime sources used to live only inside the HTML (a blob that no editor
+could diff). They are now real files under \`o/runtime/\` and
 \`tools/sync-embedded.mjs\` keeps the HTML copy byte-identical; \`--check\` fails
-CI when they diverge. The single file is a *build output*, and it is now
-generated by a tool instead of being edited by hand.
+CI when they diverge.
 `;
 }
 
 /* ------------------------------------------------------------- performance */
 
-/* The smoke report prints aligned lines such as "scripts  13 blocks parse (300 ms)";
- * keep only the human-readable remainder so it can sit inside a table cell. */
 function smokeValue(smoke, prefix) {
   const line = smoke.lines.find(entry => entry.trim().startsWith(prefix));
   return line ? line.trim().slice(prefix.length).trim().replace(/\s+/g, ' ') : '';
@@ -436,13 +409,11 @@ from this checkout on this machine; there are no projections or vendor claims.
 | build time | ${buildMs} ms | wall clock around \`build()\` |
 | script blocks parsed | ${smokeValue(smoke, 'scripts') || 'n/a'} | \`node --check\` per block during the smoke run |
 | worker runtime boot | ${(smoke.timings.bootMs || 0).toFixed(0)} ms | VM boot of the embedded runtime source |
-| asset decode | ${smokeValue(smoke, 'assets') || 'n/a'} | base64 → gunzip → sha256 for every asset |
+| wasm decode | ${smokeValue(smoke, 'wasm') || 'n/a'} | gzip decode + WASM magic check of esbuild.wasm |
 | smoke total | ${(smoke.timings.totalMs || 0).toFixed(0)} ms | verification + boot + 6 command checks |
 
-Startup in a browser is higher than the VM boot above: the browser must parse a
-${mib(Buffer.byteLength(html))} document, compile ${(smoke.timings.parseMs || 0).toFixed(0)} ms
-of script, and (for the native profile) compile the Wasmer SDK module. Those
-numbers were not measured in this environment, so they are not claimed.
+Startup in a browser parses the ${mib(Buffer.byteLength(html))} document and runs
+everything purely in JS/WASM workers without downloading external runtime packs.
 
 ## Test-suite and differential cost
 
@@ -461,10 +432,10 @@ ${table(['framework', 'packages', 'wall clock'], slowest.map(row => [row.name, r
 
 Fastest rows: ${[...installRows].sort((a, b) => a.ms - b.ms).slice(0, 3).map(row => row.name + ' ' + row.ms + ' ms').join(', ')}.
 
-These are dominated by network latency and registry throughput, not by the
-runtime: the installer streams tarballs in 4 MiB byte ranges with up to three
-parallel requests and never buffers a whole tarball, so peak memory stays near
-\`concurrency × segmentBytes\` (about 12 MiB) regardless of package size.
+Concurrent \`npm install\` resolves trees in parallel, caches registry metadata
+and tarballs across installs, hoists \`node_modules\`, and uses a
+SharedArrayBuffer extraction worker pool (falling back cleanly to packeted range
+streaming for huge packages).
 
 ## Memory and storage
 
@@ -473,16 +444,11 @@ parallel requests and never buffers a whole tarball, so peak memory stays near
 | workspace quota | max(64 MiB, min(20 GiB, origin quota / 2)) | \`workspaceBudgetFromQuota\` |
 | per-file cap | min(256 MiB, workspace / 4) | same |
 | entries | 20,000 paths | same |
-| execution groups | 3 concurrent | \`native-supervisor\` / IDE kernel |
-| preview streams | 32 concurrent | \`tcpOpen\` guard |
-| checkpoint | dependencies + build output, never rebuildable caches | \`o/native/workspace-cache.cjs\` |
+| dependency checkpoints | IndexedDB per-project cache | \`BeownirDependencyCache\` |
 
 ## What is not measured here
 
-- Browser rendering, HMR latency, and time-to-first-paint: no browser was run
-  in this environment.
-- Native WASM profile startup: requires cross-origin isolation and the host,
-  neither available headlessly here.
+- Browser rendering, HMR latency, and time-to-first-paint in this summary.
 - Large single-file edits (MB-scale) in the editor.
 
 Where a number above comes from a different machine or run (the framework
@@ -518,12 +484,6 @@ export async function generate({ fast = false } = {}) {
   const matrix = readJson('o/compat/framework-matrix.json');
   const baseline = readJson('o/compat/node-compat.json');
 
-  const hostSource = fs.readFileSync(path.join(root, 'o/host/beownir-host.mjs'), 'utf8');
-  const facts = {
-    hostCsp: hostSource.includes('Content-Security-Policy'),
-    tcpGuard: hostSource.includes('"/tcp/"') || hostSource.includes("'/tcp/'"),
-  };
-
   const publishedPath = path.join(root, 'o', 'site', 'index.html');
   const published = fs.existsSync(publishedPath) ? fs.readFileSync(publishedPath) : Buffer.alloc(0);
   const { checkHeaders } = await import('./deploy-files.mjs');
@@ -537,8 +497,8 @@ export async function generate({ fast = false } = {}) {
   const files = {
     'NODE_COMPATIBILITY_REPORT.md': nodeReport({ compat, full, differential, tests, baseline }),
     'FRAMEWORK_COMPATIBILITY_REPORT.md': frameworkReport({ matrix }),
-    'SECURITY_AUDIT.md': securityReport({ html, hostSource, facts }),
-    'SINGLEFILE_BUILD_REPORT.md': singleFileReport({ html, manifest, sources: built.sources, assets: built.assets, smoke, buildMs, gzipBytes, build: built, deploy }),
+    'SECURITY_AUDIT.md': securityReport({ html }),
+    'SINGLEFILE_BUILD_REPORT.md': singleFileReport({ html, manifest, sources: built.sources, smoke, buildMs, gzipBytes, deploy }),
     'PERFORMANCE_REPORT.md': performanceReport({ html, gzipBytes, buildMs, smoke, differential, tests, matrix, compat }),
   };
   for (const [name, contents] of Object.entries(files)) fs.writeFileSync(path.join(root, name), contents);

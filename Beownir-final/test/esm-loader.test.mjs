@@ -202,3 +202,33 @@ test('import() of a Node builtin resolves to its namespace', async () => {
   write({ '/project/esm/builtin.mjs': `export const load = () => import('node:path').then(mod => mod.join('/a', 'b'));` });
   assert.equal(await load('/project/esm/builtin.mjs').load(), '/a/b');
 });
+
+test('circular ESM live bindings resolve hoisted functions, bottom exports and star re-exports', () => {
+  dir('/project/esm/cycle');
+  write({
+    '/project/esm/cycle/index.mjs': `'use strict';
+import { sequence } from './sequence.mjs';
+function defineMiddleware(fn) { return fn; }
+export { defineMiddleware, sequence };`,
+    '/project/esm/cycle/sequence.mjs': `import { apiContextRoutesSymbol } from './render-context.mjs';
+import { defineMiddleware } from './index.mjs';
+function sequence(label) { return defineMiddleware(() => label + ':' + String(apiContextRoutesSymbol.description)); }
+export { sequence };`,
+    '/project/esm/cycle/render-context.mjs': `import { sequence } from './index.mjs';
+const apiContextRoutesSymbol = Symbol.for('context.routes');
+class RenderContext {
+  static run() { return sequence('ok')(); }
+}
+export { RenderContext, apiContextRoutesSymbol };`,
+    '/project/esm/cycle/barrel-a.mjs': `export * from './barrel-b.mjs';
+export const aValue = 41;`,
+    '/project/esm/cycle/barrel-b.mjs': `import { aValue } from './barrel-a.mjs';
+export const bRead = () => aValue + 1;`,
+  });
+  const ctx = load('/project/esm/cycle/render-context.mjs');
+  assert.equal(ctx.RenderContext.run(), 'ok:context.routes');
+  const barrel = load('/project/esm/cycle/barrel-a.mjs');
+  assert.equal(barrel.bRead(), 42);
+  const pong = load('/project/esm/pong.mjs');
+  assert.equal(pong.fromPing(), 'ping');
+});

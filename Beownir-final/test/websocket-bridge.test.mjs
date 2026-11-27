@@ -74,3 +74,205 @@ test('a WebSocket to a port nobody listens on reports an error and closes', asyn
   assert.ok(kinds.includes('error'), 'an error event must be sent');
   assert.equal(kinds[kinds.length - 1], 'close');
 });
+
+test('preview VirtualWebSocket handles Blob, ArrayBuffer, primitives, and FIFO close ordering', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const vm = await import('node:vm');
+  const { fileURLToPath } = await import('node:url');
+  const bridgePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'o', 'runtime', 'preview-bridge.js');
+  const source = fs.readFileSync(bridgePath, 'utf8');
+
+  const sent = [];
+  const listeners = new Map();
+  let portRef = null;
+  const fakeWindow = {
+    __BEOWNIR_PREVIEW_CONFIG__: { port: 5173, path: '/', token: 'tok' },
+    addEventListener(type, fn) { (listeners.get(type) || listeners.set(type, new Set()).get(type)).add(fn); },
+    removeEventListener(type, fn) { listeners.get(type)?.delete(fn); },
+    history: { pushState() {}, replaceState() {} },
+    location: { href: 'http://localhost:5173/', pathname: '/', search: '', hash: '' },
+    document: { readyState: 'complete', addEventListener() {}, querySelectorAll: () => [] },
+    XMLHttpRequest: function() {},
+    WebSocket: function() {},
+  };
+  const fakePort = {
+    start() {},
+    postMessage(msg) { sent.push(msg); },
+    onmessage: null,
+  };
+  const context = {
+    window: fakeWindow,
+    parent: fakeWindow,
+    document: fakeWindow.document,
+    location: fakeWindow.location,
+    history: fakeWindow.history,
+    console: { log() {}, info() {}, warn() {}, error() {}, debug() {} },
+    URL,
+    Blob,
+    Request,
+    Response,
+    Headers,
+    DOMException,
+    EventTarget,
+    Event: typeof Event !== 'undefined' ? Event : class Event { constructor(t) { this.type = t; } },
+    MessageEvent: typeof MessageEvent !== 'undefined' ? MessageEvent : class MessageEvent { constructor(t, o) { this.type = t; Object.assign(this, o); } },
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    setTimeout,
+    clearTimeout,
+    Promise,
+  };
+  vm.runInNewContext(source, context, { filename: 'preview-bridge.js' });
+  for (const fn of listeners.get('message') || []) {
+    fn({ source: fakeWindow, data: { type: 'beownir-preview', token: 'tok' }, ports: [fakePort] });
+  }
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  const ws = new fakeWindow.WebSocket('ws://localhost:5173/ws');
+  await new Promise(resolve => setTimeout(resolve, 10));
+  fakePort.onmessage({ data: { type: 'wsevent', id: ws.id, event: 'open', protocol: '' } });
+
+  ws.send(new Blob([new Uint8Array([0xde, 0xad, 0xbe, 0xef])]));
+  ws.send(12345);
+  ws.send(new Uint8Array([1, 2, 3, 4]).subarray(1, 3).buffer.slice(1, 3));
+  ws.close(1000, 'bye');
+
+  await new Promise(resolve => setTimeout(resolve, 40));
+  const wsMsgs = sent.filter(m => m.type === 'ws');
+  assert.deepEqual(wsMsgs.map(m => m.op), ['open', 'send', 'send', 'send', 'close']);
+  assert.equal(wsMsgs[1].binary, true);
+  assert.deepEqual(Array.from(wsMsgs[1].data), [0xde, 0xad, 0xbe, 0xef]);
+  assert.equal(wsMsgs[2].binary, false);
+  assert.equal(wsMsgs[2].data, '12345');
+  assert.equal(wsMsgs[3].binary, true);
+  assert.deepEqual(Array.from(wsMsgs[3].data), [2, 3]);
+  assert.equal(wsMsgs[4].code, 1000);
+});
+
+test('preview module rewriter ignores strings, comments, regexes, templates, and member import() while rewriting ESM imports', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const vm = await import('node:vm');
+  const { fileURLToPath } = await import('node:url');
+  const bridgePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'o', 'runtime', 'preview-bridge.js');
+  const source = fs.readFileSync(bridgePath, 'utf8');
+
+  const fetched = [];
+  const listeners = new Map();
+  let portRef = null;
+  const fakeWindow = {
+    __BEOWNIR_PREVIEW_CONFIG__: { port: 3300, path: '/__web/index.html', token: 'tok-mod' },
+    addEventListener(type, fn) { (listeners.get(type) || listeners.set(type, new Set()).get(type)).add(fn); },
+    removeEventListener(type, fn) { listeners.get(type)?.delete(fn); },
+    history: { pushState() {}, replaceState() {} },
+    location: { href: 'http://localhost:3300/__web/index.html', pathname: '/__web/index.html', search: '', hash: '' },
+    document: { readyState: 'complete', addEventListener() {}, querySelectorAll: () => [] },
+    XMLHttpRequest: function() {},
+    WebSocket: function() {},
+  };
+
+  const modules = new Map([
+    ['/__web/entry.jsx', [
+      "import realDep, { x as from } from './dep.js';",
+      "import './side.js';",
+      "export * from './reexport.js';",
+      'const componentName2 = "App";',
+      'const err1 = "Render error from \\"" + componentName2 + "\\" component";',
+      "const err2 = 'Try import \"' + componentName2 + '\" directly';",
+      'const err3 = "import(\'./fake-string.js\')";',
+      '// import fake from "./fake-line-comment.js"',
+      '/* export * from "./fake-block-comment.js"; import("./fake-comment-dyn.js"); */',
+      'const re1 = /\\bfrom\\s+["\']([^"\'\\n]+)["\']/g;',
+      'const re2 = /import\\s*\\(/g;',
+      'const tpl = `prefix from "./fake-tpl.js" import("./fake-tpl-dyn.js") ${async () => import("/__web/dyn.js")}`;',
+      'const holder = { import(v) { return v; }, from: "./fake-obj.js" };',
+      'const direct = holder.import("./fake-method.js");',
+      'const opt = holder?.import("./fake-opt.js");',
+      'export default { realDep, err1, err2, err3, re1, re2, tpl, direct, opt, from };',
+    ].join('\n')],
+    ['/__web/dep.js', 'export const x = 1; export default "DEP";'],
+    ['/__web/side.js', 'export const side = true;'],
+    ['/__web/reexport.js', 'export const reexported = 42;'],
+    ['/__web/dyn.js', 'export const dyn = "OK";'],
+  ]);
+
+  const fakePort = {
+    start() {},
+    postMessage(msg) {
+      if (msg.type === 'request') {
+        fetched.push(msg.path);
+        const bodyText = modules.get(msg.path);
+        queueMicrotask(() => {
+          portRef.onmessage({
+            data: {
+              id: msg.id,
+              status: bodyText !== undefined ? 200 : 404,
+              headers: { 'content-type': 'text/javascript' },
+              body: new TextEncoder().encode(bodyText !== undefined ? bodyText : 'File not found: ' + msg.path),
+            },
+          });
+        });
+      }
+    },
+    onmessage: null,
+  };
+  portRef = fakePort;
+
+  const importedUrls = [];
+  fakeWindow.__BEOWNIR_PREVIEW_CONFIG__.importDataUrl = async specifier => {
+    importedUrls.push(specifier);
+    const b64 = specifier.slice('data:text/javascript;base64,'.length);
+    return { default: Buffer.from(b64, 'base64').toString('utf8') };
+  };
+  const context = {
+    window: fakeWindow,
+    parent: fakeWindow,
+    document: fakeWindow.document,
+    location: fakeWindow.location,
+    history: fakeWindow.history,
+    console: { log() {}, info() {}, warn() {}, error() {}, debug() {} },
+    URL,
+    Blob,
+    Request,
+    Response,
+    Headers,
+    DOMException,
+    EventTarget,
+    Event: typeof Event !== 'undefined' ? Event : class Event { constructor(t) { this.type = t; } },
+    MessageEvent: typeof MessageEvent !== 'undefined' ? MessageEvent : class MessageEvent { constructor(t, o) { this.type = t; Object.assign(this, o); } },
+    Uint8Array,
+    ArrayBuffer,
+    TextEncoder,
+    TextDecoder,
+    btoa: str => Buffer.from(str, 'binary').toString('base64'),
+    setTimeout,
+    clearTimeout,
+    Promise,
+  };
+  vm.runInNewContext(source, context, { filename: 'preview-bridge.js' });
+  for (const fn of listeners.get('message') || []) {
+    fn({ source: fakeWindow, data: { type: 'beownir-preview', token: 'tok-mod' }, ports: [fakePort] });
+  }
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  const mod = await fakeWindow.__beownirDynamicImport('/__web/entry.jsx');
+  const rewritten = mod.default;
+  assert.deepEqual(fetched.sort(), ['/__web/dep.js', '/__web/entry.jsx', '/__web/reexport.js', '/__web/side.js']);
+  assert.ok(rewritten.includes('err1 = "Render error from \\"" + componentName2 + "\\" component"'), 'string concatenation stays untouched');
+  assert.ok(rewritten.includes("err2 = 'Try import \"' + componentName2 + '\" directly'"), 'single-quoted string stays untouched');
+  assert.ok(rewritten.includes('err3 = "import(\'./fake-string.js\')"'), 'dynamic import inside string stays untouched');
+  assert.ok(rewritten.includes('globalThis.__beownirDynamicImport("/__web/dyn.js")'), 'template interpolation dynamic import is rewritten');
+  assert.ok(rewritten.includes('const holder = { import(v) { return v; }'), 'method definition import(v) stays untouched');
+  assert.ok(rewritten.includes('holder.import("./fake-method.js")'), 'member call .import() stays untouched');
+  assert.ok(rewritten.includes('holder?.import("./fake-opt.js")'), 'optional chaining ?.import() stays untouched');
+  assert.equal(importedUrls.length, 1);
+  // Syntax-check the rewritten ES module via Node's parser (--check .mjs).
+  const os = await import('node:os');
+  const { execFileSync } = await import('node:child_process');
+  const tmpMjs = path.join(os.tmpdir(), 'beownir-rewritten-' + process.pid + '.mjs');
+  fs.writeFileSync(tmpMjs, rewritten);
+  try { execFileSync(process.execPath, ['--check', tmpMjs], { stdio: 'pipe' }); }
+  finally { fs.rmSync(tmpMjs, { force: true }); }
+});

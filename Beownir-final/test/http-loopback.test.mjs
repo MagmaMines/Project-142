@@ -290,3 +290,147 @@ test('assignSocket()/detachSocket() let an injector take over the connection', a
     ]);
   } finally { server.close(); }
 });
+
+test('ClientRequest emits socket before end, supports appendHeader, and pipes already-ended IncomingMessage after async delay', async () => {
+  const backend = await listen((req, res) => {
+    res.appendHeader('x-multi', 'one');
+    res.appendHeader('x-multi', 'two');
+    res.end('ok:' + req.headers['x-forwarded-for']);
+  });
+  const gateway = await listen((req, res) => {
+    // Async middleware yields before httpxy-style proxy wires req.pipe(proxyReq) inside 'socket'.
+    setTimeout(() => {
+      const proxyReq = http.request({ port: backend.port, method: req.method, path: req.url }, upstreamRes => {
+        res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+        upstreamRes.pipe(res);
+      });
+      proxyReq.appendHeader('x-forwarded-for', '10.0.0.1');
+      proxyReq.appendHeader('x-forwarded-for', '10.0.0.2');
+      proxyReq.once('socket', () => { req.pipe(proxyReq); });
+    }, 20);
+  });
+  try {
+    const response = await request({ port: gateway.port, path: '/async-proxy' });
+    assert.equal(response.status, 200);
+    assert.equal(response.body, 'ok:10.0.0.1, 10.0.0.2');
+    assert.deepEqual(JSON.parse(JSON.stringify(response.headers['x-multi'])), ['one', 'two']);
+  } finally { gateway.close(); backend.close(); }
+});
+
+test('net Unix domain sockets support listen, stat/chmod, connect IPC, close, and ENOENT', async () => {
+  const result = await rt.evaluate(`(async () => {
+    const fs = CORE.fs;
+    const net = CORE.net;
+    const sockPath = '/tmp/beownir-ipc-test.sock';
+    fs.mkdirSync('/tmp', { recursive: true });
+    let addr = null, isSock = false, existsBefore = false, existsAfter = true;
+    const server = net.createServer(conn => {
+      conn.on('data', chunk => conn.end('echo:' + chunk.toString('utf8')));
+    });
+    await new Promise(resolve => server.listen(sockPath, resolve));
+    addr = server.address();
+    existsBefore = fs.existsSync(sockPath);
+    isSock = fs.statSync(sockPath).isSocket();
+    fs.chmodSync(sockPath, 0o600);
+    const modeAfter = fs.statSync(sockPath).mode & 0o777;
+    const reply = await new Promise((resolve, reject) => {
+      const chunks = [];
+      const client = net.connect(sockPath, () => client.write('ping'));
+      client.on('data', chunk => chunks.push(chunk));
+      client.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      client.on('error', reject);
+    });
+    await new Promise(resolve => server.close(resolve));
+    existsAfter = fs.existsSync(sockPath);
+    const enoentCode = await new Promise(resolve => {
+      const client = net.connect(sockPath);
+      client.on('error', err => resolve(err.code));
+    });
+    return { addr, existsBefore, isSock, modeAfter, reply, existsAfter, enoentCode };
+  })()`);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    addr: '/tmp/beownir-ipc-test.sock',
+    existsBefore: true,
+    isSock: true,
+    modeAfter: 0o600,
+    reply: 'echo:ping',
+    existsAfter: false,
+    enoentCode: 'ENOENT',
+  });
+});
+
+test('worker_threads Worker forwards workerData and threadId', async () => {
+  const result = await rt.evaluate(`(async () => {
+    const fs = CORE.fs;
+    fs.writeFileSync('/project/worker-data-probe.mjs', "import { parentPort, workerData, threadId } from 'node:worker_threads';\\nparentPort.postMessage({ workerData, threadId });\\n");
+    const { Worker } = CORE.worker_threads;
+    return await new Promise((resolve, reject) => {
+      const w = new Worker('/project/worker-data-probe.mjs', { workerData: { tag: 'nuxt-ipc', port: 30000 } });
+      w.on('message', msg => resolve(msg));
+      w.on('error', reject);
+    });
+  })()`);
+  assert.equal(result.workerData.tag, 'nuxt-ipc');
+  assert.equal(result.workerData.port, 30000);
+  assert.ok(result.threadId > 0);
+});
+
+test('server.listen(cb), listen(null, cb) and multiple listen(0) calls assign distinct ports', async () => {
+  const s1 = http.createServer((req, res) => res.end('one'));
+  const s2 = http.createServer((req, res) => res.end('two'));
+  const s3 = http.createServer((req, res) => res.end('three'));
+  try {
+    await new Promise(resolve => s1.listen(resolve));
+    await new Promise(resolve => s2.listen(null, resolve));
+    await new Promise(resolve => s3.listen(0, resolve));
+    assert.notEqual(s1.port, s2.port);
+    assert.notEqual(s2.port, s3.port);
+    assert.notEqual(s1.port, s3.port);
+    assert.equal((await request({ port: s1.port })).body, 'one');
+    assert.equal((await request({ port: s2.port })).body, 'two');
+    assert.equal((await request({ port: s3.port })).body, 'three');
+  } finally {
+    s1.close();
+    s2.close();
+    s3.close();
+  }
+});
+
+test('SSE text/event-stream responses flush without hanging virtual HTTP and PID 1 servers with fs.watchFile settle', async () => {
+  const closedClients = [];
+  const server = await listen((req, res) => {
+    if (req.url === '/__reload') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write(': connected\n\n');
+      req.on('close', () => closedClients.push('closed'));
+      return;
+    }
+    res.end('ok');
+  });
+  try {
+    const sse = await request({ port: server.port, path: '/__reload' });
+    assert.equal(sse.status, 200);
+    assert.match(String(sse.headers['content-type']), /^text\/event-stream/);
+    assert.ok(sse.body.includes(': connected'));
+    assert.ok(sse.body.includes('retry:'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(closedClients, ['closed']);
+  } finally {
+    server.close();
+  }
+
+  const settle = await rt.evaluate(`(async () => {
+    FS['/project/watched-srv.js'] = { c: "const http = require('node:http'), fs = require('node:fs'); fs.writeFileSync('/project/watched-target.txt', 'v1'); const s = http.createServer((q, r) => r.end('hi')); s.listen(3199); fs.watchFile('/project/watched-target.txt', { interval: 200 }, () => {});", m: Date.now() };
+    const started = Date.now();
+    const code = await runNode(['/project/watched-srv.js']);
+    const elapsed = Date.now() - started;
+    const listening = SERVERS.has(3199);
+    SERVERS.get(3199)?.close();
+    fsWatchFile.delete('/project/watched-target.txt');
+    return { code, elapsed, listening };
+  })()`);
+  assert.equal(settle.code, 0);
+  assert.equal(settle.listening, true);
+  assert.ok(settle.elapsed < 1000, 'server + watchFile settled in ' + settle.elapsed + 'ms');
+});
+

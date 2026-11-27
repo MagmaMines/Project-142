@@ -20,10 +20,9 @@ function liveReloadSource() {
   return app.slice(start, end);
 }
 
-function createHarness({ mode = 'limited', stored = null } = {}) {
-  const calls = { toast: [], terminal: [], preview: [], native: [] };
+function createHarness({ stored = null } = {}) {
+  const calls = { toast: [], terminal: [], preview: [] };
   const storage = new Map(stored === null ? [] : [['beownir-live-reload', stored]]);
-  let native = mode === 'native';
   let requestId = 0;
   const elements = new Map();
   const element = id => {
@@ -35,13 +34,11 @@ function createHarness({ mode = 'limited', stored = null } = {}) {
     let previewLoaded = false, ready = true, busy = false;
     const state = { projectId: 'p1' };
     const $ = selector => { const id = selector.replace(/^#/, ''); return providedElements.has(id) ? providedElements.get(id) : null; };
-    const nativeMode = () => nativeModeValue;
     const toast = message => messages.toast.push(message);
     const terminalOutput = message => messages.terminal.push(message);
     const cleanTerminal = value => String(value);
     const id = () => 'req-' + (++requestCounter);
     const loadPreview = options => { messages.preview.push(options); return Promise.resolve(); };
-    const loadNativePreview = () => { messages.native.push(Date.now()); return Promise.resolve(); };
     const window = { addEventListener() {}, removeEventListener() {} };
     const document = {};
     ${source}
@@ -53,10 +50,10 @@ function createHarness({ mode = 'limited', stored = null } = {}) {
       isPreviewLoaded: () => previewLoaded
     };
   `;
-  const factory = new Function('providedElements', 'nativeModeValue', 'messages', 'requestCounter', 'localStorage', body);
+  const factory = new Function('providedElements', 'messages', 'requestCounter', 'localStorage', body);
   const known = new Set(['liveReload', 'liveReloadState']);
   const store = { has: id => known.has(id), get: id => element(id) };
-  const api = factory(store, native, calls, requestId, {
+  const api = factory(store, calls, requestId, {
     getItem: key => (storage.has(key) ? storage.get(key) : null),
     setItem: (key, value) => storage.set(key, String(value))
   });
@@ -65,29 +62,25 @@ function createHarness({ mode = 'limited', stored = null } = {}) {
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-test('live reload defaults to on for the limited engine and off for native servers', () => {
-  const limited = createHarness({ mode: 'limited' });
-  limited.api.initLiveReload();
-  assert.equal(limited.api.liveReload.enabled, true);
-  assert.equal(limited.element('liveReload').attributes['aria-pressed'], 'true');
-  assert.equal(limited.element('liveReloadState').textContent, 'Live');
+test('live reload defaults to on and honors stored preference', () => {
+  const web = createHarness();
+  web.api.initLiveReload();
+  assert.equal(web.api.liveReload.enabled, true);
+  assert.equal(web.element('liveReload').attributes['aria-pressed'], 'true');
+  assert.equal(web.element('liveReloadState').textContent, 'Live');
 
-  const native = createHarness({ mode: 'native' });
-  native.api.initLiveReload();
-  assert.equal(native.api.liveReload.enabled, false);
-  assert.equal(native.element('liveReloadState').textContent, 'Manual');
-
-  const remembered = createHarness({ mode: 'native', stored: '1' });
-  remembered.api.initLiveReload();
-  assert.equal(remembered.api.liveReload.enabled, true, 'a stored preference wins over the default');
-
-  const disabled = createHarness({ mode: 'limited', stored: '0' });
+  const disabled = createHarness({ stored: '0' });
   disabled.api.initLiveReload();
   assert.equal(disabled.api.liveReload.enabled, false);
+  assert.equal(disabled.element('liveReloadState').textContent, 'Manual');
+
+  const remembered = createHarness({ stored: '1' });
+  remembered.api.initLiveReload();
+  assert.equal(remembered.api.liveReload.enabled, true);
 });
 
 test('toggling live reload persists the choice and reports it', () => {
-  const harness = createHarness({ mode: 'limited' });
+  const harness = createHarness();
   harness.api.initLiveReload();
   harness.api.toggleLiveReload();
   assert.equal(harness.api.liveReload.enabled, false);
@@ -146,17 +139,6 @@ test('a refresh in flight queues one follow-up instead of stacking', { timeout: 
   await first;
   await wait(300);
   assert.equal(harness.calls.preview.length, 2, 'one running refresh plus one queued follow-up');
-});
-
-test('native servers refresh through the native preview path', { timeout: 10000 }, async () => {
-  const harness = createHarness({ mode: 'native' });
-  harness.api.initLiveReload();
-  harness.api.toggleLiveReload();
-  harness.api.setPreviewLoaded(true);
-  harness.api.noteFileChange('/project/src/a.js');
-  await wait(1700);
-  assert.equal(harness.calls.native.length, 1);
-  assert.equal(harness.calls.preview.length, 0);
 });
 
 test('capturePreviewState resolves null without a live preview frame', async () => {

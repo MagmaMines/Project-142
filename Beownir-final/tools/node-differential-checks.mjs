@@ -388,4 +388,169 @@ export const checks = [
     const thrower = fn => { try { fn(); return 'no-throw'; } catch (error) { return [error.code, /too large/.test(error.message)]; } };
     return [thrower(() => crypto.publicEncrypt(publicKey, Buffer.alloc(300))), thrower(() => crypto.createPrivateKey('-----BEGIN PRIVATE KEY-----\\nAAAA\\n-----END PRIVATE KEY-----'))];
   })()`],
+  ['crypto-hashes-extended', `(() => {
+    const crypto = require('crypto');
+    const data = Buffer.from('differential-digest');
+    return ['sha224', 'sha512-224', 'sha512-256', 'ripemd160'].map(alg => [
+      crypto.createHash(alg).update(data).digest('hex'),
+      crypto.createHmac(alg, 'k').update(data).digest('hex'),
+    ]);
+  })()`],
+  ['stream-writable-cork-writev', `(async () => {
+    const { Writable } = require('stream');
+    const seen = [];
+    const w = new Writable({
+      writev(items, cb) { seen.push(items.map(i => i.chunk.toString('utf8'))); cb(); },
+      write(chunk, _e, cb) { seen.push([chunk.toString('utf8')]); cb(); },
+    });
+    w.cork();
+    w.cork();
+    w.write('1');
+    w.write('2');
+    w.uncork();
+    const mid = [seen.length, w.writableCorked];
+    w.uncork();
+    const after = [seen.length, w.writableCorked];
+    w.cork();
+    w.write('3');
+    await new Promise(resolve => w.end(resolve));
+    return [mid, after, seen];
+  })()`],
+  ['rsa-pss-sign-verify', `(() => {
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const priv = crypto.createPrivateKey(fs.readFileSync('key.pem', 'utf8'));
+    const pub = crypto.createPublicKey(fs.readFileSync('key.pub.pem', 'utf8'));
+    const data = Buffer.from('beownir-pss-diff');
+    const opts = { padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST };
+    const sig = crypto.sign('sha256', data, { key: priv, ...opts });
+    const sig512 = crypto.sign('sha512', data, { key: priv, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 16 });
+    return [
+      sig.length,
+      crypto.verify('sha256', data, { key: pub, ...opts }, sig),
+      crypto.verify('sha256', Buffer.from('wrong'), { key: pub, ...opts }, sig),
+      crypto.verify('sha512', data, { key: pub, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 16 }, sig512),
+    ];
+  })()`],
+  ['ecdsa-ecdh-keypair-roundtrip', `(() => {
+    const crypto = require('crypto');
+    const alice = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const bob = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const payload = Buffer.from('ecdsa-diff');
+    const sigDer = crypto.sign('sha256', payload, alice.privateKey);
+    const sigP1363 = crypto.sign('sha256', payload, { key: alice.privateKey, dsaEncoding: 'ieee-p1363' });
+    const s1 = crypto.diffieHellman({ privateKey: alice.privateKey, publicKey: bob.publicKey });
+    const s2 = crypto.diffieHellman({ privateKey: bob.privateKey, publicKey: alice.publicKey });
+    const rt = crypto.createPrivateKey(alice.privateKey.export({ format: 'pem', type: 'sec1' }));
+    return [
+      alice.privateKey.asymmetricKeyType,
+      alice.privateKey.asymmetricKeyDetails.namedCurve,
+      crypto.verify('sha256', payload, alice.publicKey, sigDer),
+      crypto.verify('sha256', payload, { key: alice.publicKey, dsaEncoding: 'ieee-p1363' }, sigP1363),
+      crypto.verify('sha256', Buffer.from('bad'), alice.publicKey, sigDer),
+      sigP1363.length,
+      s1.equals(s2),
+      s1.length,
+      alice.privateKey.equals(rt),
+    ];
+  })()`],
+  ['ed25519-sign-verify-jwk', `(() => {
+    const crypto = require('crypto');
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const msg = Buffer.from('ed25519-diff-msg');
+    const sig = crypto.sign(null, msg, privateKey);
+    const rtPriv = crypto.createPrivateKey({ key: privateKey.export({ format: 'jwk' }), format: 'jwk' });
+    const rtPub = crypto.createPublicKey({ key: publicKey.export({ format: 'jwk' }), format: 'jwk' });
+    return [
+      privateKey.asymmetricKeyType,
+      privateKey.asymmetricKeyDetails,
+      sig.length,
+      crypto.verify(null, msg, publicKey, sig),
+      crypto.verify(null, msg, rtPub, sig),
+      crypto.verify(null, Buffer.from('tamper'), rtPub, sig),
+      privateKey.equals(rtPriv),
+      publicKey.equals(rtPub),
+    ];
+  })()`],
+  ['x25519-diffie-hellman', `(() => {
+    const crypto = require('crypto');
+    const alice = crypto.generateKeyPairSync('x25519');
+    const bob = crypto.generateKeyPairSync('x25519');
+    const s1 = crypto.diffieHellman({ privateKey: alice.privateKey, publicKey: bob.publicKey });
+    const s2 = crypto.diffieHellman({ privateKey: bob.privateKey, publicKey: alice.publicKey });
+    const jwk = alice.privateKey.export({ format: 'jwk' });
+    return [
+      alice.privateKey.asymmetricKeyType,
+      alice.privateKey.asymmetricKeyDetails,
+      jwk.kty,
+      jwk.crv,
+      s1.length,
+      s1.equals(s2),
+    ];
+  })()`],
+  ['fs-readdir-recursive-types', `(() => {
+    const fs = require('fs'), base = process.cwd();
+    fs.mkdirSync(base + '/rec-types/sub/deep', { recursive: true });
+    fs.writeFileSync(base + '/rec-types/root.txt', 'r');
+    fs.writeFileSync(base + '/rec-types/sub/mid.txt', 'm');
+    fs.writeFileSync(base + '/rec-types/sub/deep/leaf.txt', 'l');
+    fs.symlinkSync('root.txt', base + '/rec-types/link.txt');
+    fs.symlinkSync('sub', base + '/rec-types/dir-link');
+    fs.symlinkSync('missing.txt', base + '/rec-types/dead-link');
+    const ents = fs.readdirSync(base + '/rec-types', { recursive: true, withFileTypes: true })
+      .map(d => [d.name, d.parentPath.slice(base.length), d.path.slice(base.length), d.isFile(), d.isDirectory(), d.isSymbolicLink()])
+      .sort((a, b) => (a[1] + '/' + a[0]).localeCompare(b[1] + '/' + b[0]));
+    const dir = fs.opendirSync(base + '/rec-types');
+    const opened = [];
+    for (let e = dir.readSync(); e; e = dir.readSync()) {
+      opened.push([e.name, e.parentPath.slice(base.length), e.path.slice(base.length), e.isFile(), e.isDirectory(), e.isSymbolicLink()]);
+    }
+    dir.closeSync();
+    opened.sort((a, b) => a[0].localeCompare(b[0]));
+    return [ents, opened];
+  })()`],
+  ['fs-symlink-dangling-and-dir', `(() => {
+    const fs = require('fs'), base = process.cwd();
+    fs.mkdirSync(base + '/symbox/targetdir', { recursive: true });
+    fs.writeFileSync(base + '/symbox/target.txt', 'sym-payload');
+    fs.symlinkSync('target.txt', base + '/symbox/file-link');
+    fs.symlinkSync('targetdir', base + '/symbox/dir-link');
+    fs.symlinkSync('nonexistent', base + '/symbox/dead-link');
+    let deadStatErr = null;
+    try { fs.statSync(base + '/symbox/dead-link'); } catch (e) { deadStatErr = e.code; }
+    return [
+      fs.lstatSync(base + '/symbox/dead-link').isSymbolicLink(),
+      fs.lstatSync(base + '/symbox/dead-link').isFile(),
+      fs.lstatSync(base + '/symbox/dir-link').isSymbolicLink(),
+      fs.lstatSync(base + '/symbox/dir-link').isDirectory(),
+      fs.statSync(base + '/symbox/dir-link').isDirectory(),
+      fs.existsSync(base + '/symbox/dead-link'),
+      fs.readlinkSync(base + '/symbox/dead-link'),
+      fs.realpathSync(base + '/symbox/file-link').slice(base.length),
+      deadStatErr,
+    ];
+  })()`],
+  ['crypto-sha3-shake-blake2', `(() => {
+    const crypto = require('crypto');
+    const data = Buffer.from('differential-sha3-blake2-'.repeat(10));
+    const key = Buffer.alloc(170, 0x33);
+    const out = {};
+    for (const alg of ['sha3-224', 'sha3-256', 'sha3-384', 'sha3-512', 'shake128', 'shake256', 'blake2b512', 'blake2s256']) {
+      out[alg] = [
+        crypto.createHash(alg).update(data).digest('hex'),
+        crypto.hash(alg, data),
+        alg.startsWith('shake') ? null : crypto.createHmac(alg, key).update(data).digest('hex'),
+        crypto.getHashes().includes(alg),
+      ];
+    }
+    out.shake128_32 = crypto.createHash('shake128', { outputLength: 32 }).update(data).digest('hex');
+    out.shake256_64 = crypto.createHash('shake256', { outputLength: 64 }).update(data).digest('hex');
+    return out;
+  })()`],
+  ['vm-context-isolation', `(() => {
+    const vm = require('vm');
+    const c = vm.createContext({ x: 5 });
+    const v = vm.runInContext('y = x * 3; v = y + 1; v', c);
+    return [v, c.y, c.v, typeof globalThis.y];
+  })()`],
 ];

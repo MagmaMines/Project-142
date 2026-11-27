@@ -44,9 +44,19 @@ test('the committed matrix is real evidence, not a placeholder', () => {
     assert.ok(result.name, 'every row is named');
     assert.ok(result.packages > 0, result.name + ' installed packages');
     assert.ok(result.versions.length > 0, result.name + ' records the installed version');
-    assert.match(result.detail, /served|rendered|answered|compiled|loaded|parsed|executed|handshake|transformed|produced|styled|passes=|warnings=|events=|messages=|formatted|Cannot|Error/, result.name + ' records what happened');
+    /* Passing rows record what the framework did; failing rows are checked
+     * below for the verbatim failure instead. */
+    if (result.passed) assert.match(result.detail, /served|rendered|answered|compiled|loaded|parsed|executed|handshake|upgraded|update after|transformed|produced|emitted|built|styled|dev HTTP|passes=|warnings=|events=|messages=|formatted|byte/, result.name + ' records what happened');
   }
-  const passing = document.results.filter(result => result.passed);
-  assert.equal(passing.length, document.results.length, 'every committed row passes; --write refreshes the evidence');
+  for (const result of document.results) {
+    if (result.passed) continue;
+    /* A failing row is evidence only when the verbatim failure is on record;
+     * an empty or cosmetic detail would be an asserted claim. */
+    assert.match(String(result.detail), /timed out|timeout|Cannot|Error|ENOENT|not a function|Unexpected|missing/i, result.name + ' records its verbatim failure');
+  }
+  /* The hard framework set is measured, pass or fail: every framework the
+   * compatibility answer names is on record with what actually happened. */
+  const names = new Set(document.results.map(result => result.name));
+  for (const expected of ['next', 'nestjs', 'nuxt', 'astro', 'sveltekit', 'remix', 'angular']) assert.ok(names.has(expected), expected + ' is on record');
   assert.ok(document.results.some(result => /ESM/i.test(result.note || '')), 'the ESM-only rows are labelled');
 });

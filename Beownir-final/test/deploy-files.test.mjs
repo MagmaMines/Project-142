@@ -37,8 +37,8 @@ test('the published page passes its own manifest verification', () => {
   assert.deepEqual(problems, []);
   assert.ok(manifest, 'the published page carries a build manifest');
   assert.equal(manifest.format, 'beownir-standalone/1');
-  assert.ok(manifest.sources.length > 10, 'sources are listed');
-  assert.ok(manifest.assets.length > 0, 'native assets are listed');
+  assert.ok(manifest.sources.length >= 6, 'sources are listed');
+  assert.deepEqual(manifest.assets, [], 'no WASIX asset packs are listed');
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   assert.equal(manifest.version, pkg.version, 'manifest version matches package.json');
   // The page's own <title> is what the deploy checker compares, so it has to
@@ -84,26 +84,4 @@ test('the manifest excludes the document itself', () => {
   const relative = path.relative(root, path.join(deployDir, 'index.html')).split(path.sep).join('/');
   assert.equal(manifest.sources.some(entry => entry.file === relative), false, 'the document is not listed as its own source');
   assert.ok(manifest.document.sha256, 'the document digest is recorded separately');
-});
-
-test('the three-origin configure step keeps the artifact verifiable', async () => {
-  const { execFileSync } = await import('node:child_process');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beownir-configure-'));
-  try {
-    fs.mkdirSync(path.join(dir, 'deploy'));
-    fs.mkdirSync(path.join(dir, 'site'));
-    fs.copyFileSync(path.join(root, 'o', 'deploy', 'configure.mjs'), path.join(dir, 'deploy', 'configure.mjs'));
-    fs.copyFileSync(path.join(deployDir, 'index.html'), path.join(dir, 'site', 'index.html'));
-    fs.copyFileSync(path.join(deployDir, '_headers'), path.join(dir, 'site', '_headers'));
-    fs.copyFileSync(configFile, path.join(dir, 'netlify.toml'));
-    execFileSync(process.execPath, ['deploy/configure.mjs', '--runtime', 'https://runtime.example.com', '--preview', 'https://preview.example.com'], { cwd: dir, stdio: 'pipe' });
-
-    const patched = fs.readFileSync(path.join(dir, 'site', 'index.html'), 'utf8');
-    assert.match(patched, /runtime=https:\/\/runtime\.example\.com;preview=https:\/\/preview\.example\.com/);
-    assert.deepEqual(verifyArtifact(patched).problems, [], 'the patched page still verifies against its own manifest');
-    const headers = fs.readFileSync(path.join(dir, 'site', '_headers'), 'utf8');
-    assert.match(headers, /cross-origin-isolated=\(self "https:\/\/runtime\.example\.com" "https:\/\/preview\.example\.com"\)/);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
 });

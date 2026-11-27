@@ -28,10 +28,3 @@ export function pakoModule() {
   vm.runInNewContext(source, sandbox, { filename: 'pakoSource' });
   return sandbox.pako || sandbox.exports;
 }
-
-export function nativeAssetPack() {
-  const html = readSite();
-  const match = /<script id="beownir-native-assets" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
-  if (!match) throw new Error('Missing native asset pack');
-  return JSON.parse(match[1]);
-}

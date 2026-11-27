@@ -135,7 +135,7 @@ module.exports.positionalAndSize = function () {
     r.renumber = api.fd_renumber(fd, 9);
     r.oldFdGone = api.fd_close(fd);
     r.newFdWorks = api.fd_close(9);
-    r.reserved = api.sock_accept(0, 0);
+    r.notSock = api.sock_accept(0, 0);
     return 0;
   } } });
   return JSON.stringify(r);

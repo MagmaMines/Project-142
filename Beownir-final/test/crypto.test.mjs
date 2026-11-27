@@ -267,3 +267,94 @@ test('getCipherInfo matches the OpenSSL metadata for the ciphers we implement', 
   assert.equal(CRYPTO.getCipherInfo(427).name, 'aes-256-cbc');
   assert.equal(CRYPTO.getCipherInfo('not-a-cipher'), undefined);
 });
+
+/* scrypt and ECDH used to throw "not available in the browser runtime". Both are
+ * now implemented in-house and compared here against the host's OpenSSL, which
+ * is the only oracle that matters: a KDF or a key agreement that is merely
+ * self-consistent is worse than one that refuses to run. */
+
+const scryptVectors = [
+  { label: 'RFC 7914 empty password/salt, N=16 r=1 p=1', password: '', salt: '', keylen: 64, N: 16, r: 1, p: 1 },
+  { label: 'RFC 7914 pleaseletmein, N=1024 r=8 p=16', password: 'pleaseletmein', salt: 'SodiumChloride', keylen: 64, N: 1024, r: 8, p: 16 },
+  { label: 'password/salty, N=16384 r=8 p=1', password: 'password', salt: 'salty', keylen: 32, N: 16384, r: 8, p: 1 },
+  { label: 'tiny N with r>1 and p>1', password: 'pw', salt: 'salt', keylen: 48, N: 2, r: 3, p: 2 },
+];
+
+test('scrypt matches OpenSSL byte for byte, including the RFC 7914 vectors', () => {
+  for (const vector of scryptVectors) {
+    const options = { N: vector.N, r: vector.r, p: vector.p };
+    const expected = hex(nodeCrypto.scryptSync(vector.password, vector.salt, vector.keylen, options));
+    assert.equal(hex(CRYPTO.scryptSync(vector.password, vector.salt, vector.keylen, options)), expected, vector.label);
+  }
+  // Node's defaults are N=16384, r=8, p=1; a bare call must agree too.
+  assert.equal(hex(CRYPTO.scryptSync('a', 'b', 32)), hex(nodeCrypto.scryptSync('a', 'b', 32)));
+});
+
+test('scrypt callback form resolves off the current tick with the same key', async () => {
+  let syncReturn = true;
+  const key = await new Promise((resolve, reject) => {
+    CRYPTO.scrypt('password', 'salty', 32, { N: 16, r: 1, p: 1 }, (error, value) => {
+      assert.equal(syncReturn, false, 'the callback must not run synchronously');
+      if (error) reject(error); else resolve(value);
+    });
+    syncReturn = false;
+  });
+  assert.equal(hex(key), hex(nodeCrypto.scryptSync('password', 'salty', 32, { N: 16, r: 1, p: 1 })));
+});
+
+test('scrypt rejects bad parameters and runaway memory the way Node does', () => {
+  const code = error => error.code;
+  assert.throws(() => CRYPTO.scryptSync('a', 'b', 32, { N: 1000 }), error => code(error) === 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS', 'N must be a power of two');
+  assert.throws(() => CRYPTO.scryptSync('a', 'b', 32, { N: 2 ** 20, r: 8, p: 1 }), error => code(error) === 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS', 'the default 32 MiB cap applies');
+  assert.throws(() => CRYPTO.scryptSync('a', 'b', 32, { N: 4, r: 0 }), error => code(error) === 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS');
+  // The same numbers Node accepts must be accepted here, cap included.
+  assert.doesNotThrow(() => CRYPTO.scryptSync('a', 'b', 16, { N: 2 ** 20, r: 8, p: 1, maxmem: 2 ** 31 }));
+});
+
+for (const curve of ['prime256v1', 'secp384r1', 'secp521r1']) {
+  test('crypto.createECDH(' + curve + ') public keys and shared secrets match OpenSSL', () => {
+    const scalar = Buffer.from('1234567890abcdef1234567890abcdef', 'hex');
+    const ours = CRYPTO.createECDH(curve);
+    const reference = nodeCrypto.createECDH(curve);
+    ours.setPrivateKey(scalar);
+    reference.setPrivateKey(scalar);
+    assert.equal(hex(ours.getPublicKey()), hex(reference.getPublicKey()), 'uncompressed public key');
+    assert.equal(hex(ours.getPublicKey(undefined, 'compressed')), hex(reference.getPublicKey(undefined, 'compressed')), 'compressed public key');
+    const peer = nodeCrypto.createECDH(curve);
+    peer.generateKeys();
+    assert.equal(hex(ours.computeSecret(peer.getPublicKey())), hex(reference.computeSecret(peer.getPublicKey())), 'shared secret');
+    assert.equal(hex(ours.computeSecret(peer.getPublicKey(undefined, 'compressed'))), hex(reference.computeSecret(peer.getPublicKey(undefined, 'compressed'))), 'shared secret from a compressed peer key');
+  });
+}
+
+test('ECDH two-party agreement is symmetric and the private key survives a round trip', () => {
+  for (const curve of ['prime256v1', 'secp384r1']) {
+    const first = CRYPTO.createECDH(curve), second = CRYPTO.createECDH(curve);
+    first.generateKeys();
+    second.generateKeys();
+    assert.equal(hex(first.computeSecret(second.getPublicKey())), hex(second.computeSecret(first.getPublicKey())), curve);
+    const restored = CRYPTO.createECDH(curve);
+    restored.setPrivateKey(first.getPrivateKey());
+    assert.equal(restored.getPublicKey().length, first.getPublicKey().length);
+    assert.equal(hex(restored.getPublicKey()), hex(first.getPublicKey()), curve + ' private key round trip');
+  }
+});
+
+test('ECDH rejects unknown curves and invalid keys with the Node error codes', () => {
+  assert.throws(() => CRYPTO.createECDH('ed25519'), error => error.code === 'ERR_CRYPTO_INVALID_CURVE');
+  const ecdh = CRYPTO.createECDH('prime256v1');
+  assert.throws(() => ecdh.computeSecret(Buffer.alloc(65, 4)), error => error.code === 'ERR_CRYPTO_INVALID_STATE', 'no private key yet');
+  ecdh.generateKeys();
+  assert.throws(() => ecdh.computeSecret(Buffer.alloc(65, 9)), error => error.code === 'ERR_CRYPTO_INVALID_KEYTYPE', 'not a curve point');
+  assert.throws(() => ecdh.setPrivateKey(Buffer.alloc(32)), error => error.code === 'ERR_CRYPTO_INVALID_KEYTYPE', 'zero scalar');
+  assert.throws(() => ecdh.getPublicKey(undefined, 'weird'), error => error.code === 'ERR_INVALID_ARG_VALUE');
+});
+
+test('ECDH.convertKey re-serialises peer points the way Node does', () => {
+  const peer = nodeCrypto.createECDH('prime256v1');
+  peer.generateKeys();
+  const compressed = peer.getPublicKey(undefined, 'compressed');
+  assert.equal(hex(CRYPTO.ECDH.convertKey(compressed, 'prime256v1')), hex(nodeCrypto.ECDH.convertKey(compressed, 'prime256v1')), 'compressed to uncompressed');
+  assert.equal(hex(CRYPTO.ECDH.convertKey(peer.getPublicKey(), 'prime256v1', undefined, undefined, 'compressed')), hex(nodeCrypto.ECDH.convertKey(peer.getPublicKey(), 'prime256v1', undefined, undefined, 'compressed')), 'uncompressed to compressed');
+  assert.ok(CRYPTO.createECDH('prime256v1') instanceof CRYPTO.ECDH, 'createECDH returns an ECDH');
+});

@@ -38,7 +38,7 @@ const internals = {
     minimatch() { throw new Error('path.matchesGlob needs minimatch, which is not part of the browser runtime'); },
   },
 };
-const resolveInternal = id => { if (!Object.hasOwn(internals, id)) throw new Error('path needs internal module ' + id); return internals[id]; };
+const resolveInternal = id => { if (!Object.prototype.hasOwnProperty.call(internals, id)) throw new Error('path needs internal module ' + id); return internals[id]; };
 
 // lib/path.js calls require() for its internals; this is that resolver.
 function require(id) { return resolveInternal(id); }

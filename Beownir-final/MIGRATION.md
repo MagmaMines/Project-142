@@ -27,12 +27,11 @@ Before, the runtime and host existed only as `<script>` blobs inside
 Now:
 
 ```
-o/runtime/worker-runtime.js   -> <script id="runtimeSource">      (embedded)
-o/runtime/frame-kernel.js    -> <script id="runtimeFrameSource">  (embedded)
-o/runtime/preview-bridge.js  -> <script id="previewBridgeSource">  (embedded)
-o/host/beownir-host.mjs      -> <script id="beownirHostSource">    (embedded)
-o/runtime/stream-kit.js      -> install kit (embedded)
-o/site/coi-sw.js             -> <script id="coiServiceWorkerSource"> (source only)
+o/runtime/worker-runtime.js   -> <script id="runtimeSource">         (embedded)
+o/runtime/frame-kernel.js    -> <script id="runtimeFrameSource">     (embedded)
+o/runtime/preview-bridge.js  -> <script id="previewBridgeSource">    (embedded)
+o/runtime/stream-kit.js      -> install kit                          (embedded)
+o/site/coi-sw.js             -> <script id="coiServiceWorkerSource"> (embedded)
 ```
 
 Workflow:
@@ -89,7 +88,5 @@ runner.
    re-run `node tools/sync-embedded.mjs` instead of resolving the blob by hand.
 2. `npm run verify` must pass. It now includes `build-standalone --check`, so a
    stale artifact fails the gate rather than shipping silently.
-3. If you added a native asset under `o/native/`, run
-   `node tools/native-assets.mjs --embed` and `node tools/build-standalone.mjs`,
-   then regenerate the reports with `npm run reports` so the documented numbers
+3. Regenerate the reports with `npm run reports` so the documented numbers
    match the artifact you ship.

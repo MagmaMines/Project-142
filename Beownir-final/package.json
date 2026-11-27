@@ -2,7 +2,7 @@
   "name": "beownir",
   "version": "3.0.0-rc.6",
   "private": true,
-  "description": "Single-file browser IDE with a Node-compatible worker runtime, streamed npm installs and a network-only host",
+  "description": "Single-file browser IDE with a Node-compatible Web Worker runtime and concurrent npm registry installer",
   "license": "UNLICENSED",
   "engines": {
     "node": ">=18.17"
@@ -11,10 +11,8 @@
     "test": "node --test \"test/*.test.mjs\"",
     "check": "node tools/check.mjs",
     "sync": "node tools/sync-embedded.mjs",
-    "verify": "node tools/native-assets.mjs --check && node tools/sync-embedded.mjs --check && node tools/gen-rollup-compat.mjs --check && node tools/gen-compat-shims.mjs --check && node tools/gen-node-path.mjs --check && node tools/gen-node-querystring.mjs --check && node tools/gen-wasi.mjs --check && node tools/deploy-files.mjs && node tools/check.mjs && node tools/build-standalone.mjs --check && node tools/compat-report.mjs --fail-under 0.985 && node --test \"test/*.test.mjs\"",
-    "host": "node o/host/beownir-host.mjs o/site/index.html",
+    "verify": "node tools/sync-embedded.mjs --check && node tools/gen-rollup-compat.mjs --check && node tools/gen-compat-shims.mjs --check && node tools/gen-node-path.mjs --check && node tools/gen-node-querystring.mjs --check && node tools/gen-wasi.mjs --check && node tools/gen-brotli.mjs --check && node tools/deploy-files.mjs && node tools/check.mjs && node tools/build-standalone.mjs --check && node tools/compat-report.mjs --fail-under 0.985 && node --test \"test/*.test.mjs\"",
     "serve:static": "node tools/serve-static.mjs",
-    "configure": "node o/deploy/configure.mjs",
     "compat": "node tools/compat-report.mjs",
     "compat:write": "node tools/compat-report.mjs --write",
     "differential": "node tools/node-differential.mjs",
@@ -24,12 +22,40 @@
     "build:standalone": "node tools/build-standalone.mjs",
     "standalone:check": "node tools/build-standalone.mjs --check",
     "standalone:smoke": "node tools/standalone-smoke.mjs beownir-standalone.html",
+    "embed:build": "node tools/build-embed.mjs",
+    "embed:check": "node tools/build-embed.mjs --check",
+    "embed:e2e": "node test/embed/embed-e2e.cjs",
+    "e2e:browser": "node test/browser/vite-hmr-e2e.cjs",
+    "e2e:threads": "node test/browser/worker-threads-e2e.cjs",
+    "release:candidate": "node tools/package-release.mjs",
     "reports": "node tools/reports.mjs",
     "reports:fast": "node tools/reports.mjs --fast",
-    "deploy:headers": "node tools/deploy-files.mjs",
-    "deploy:check": "node o/deploy/check.mjs"
+    "deploy:headers": "node tools/deploy-files.mjs"
   },
   "files": [
     "o"
-  ]
+  ],
+  "exports": {
+    ".": {
+      "types": "./o/embed/beownir-kernel.d.ts",
+      "default": "./o/embed/kernel.mjs"
+    },
+    "./kernel": {
+      "types": "./o/embed/beownir-kernel.d.ts",
+      "default": "./o/embed/beownir-kernel.js"
+    },
+    "./vite": {
+      "types": "./o/embed/vite.d.ts",
+      "default": "./o/embed/vite.mjs"
+    },
+    "./next": {
+      "types": "./o/embed/next.d.ts",
+      "default": "./o/embed/next.mjs"
+    },
+    "./server": {
+      "types": "./o/embed/server.d.ts",
+      "default": "./o/embed/server.mjs"
+    },
+    "./package.json": "./package.json"
+  }
 }

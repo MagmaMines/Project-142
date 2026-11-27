@@ -398,7 +398,7 @@ test('wasi runs a preview1 module against the virtual filesystem', async () => {
   assert.equal(result.close, 0);
   assert.equal(result.closedAgain, 8, 'EBADF after close');
   assert.equal(result.escape, 76, 'ENOTCAPABLE outside the preopen');
-  assert.equal(result.socket, 52, 'ENOSYS: the host does not implement sockets');
+  assert.equal(result.socket, 57, 'ENOTSOCK on non-socket stdin fd 0');
   assert.equal(result.random, true);
   assert.equal(result.clock, true);
 });

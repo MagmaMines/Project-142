@@ -105,21 +105,18 @@ test('hashing and compression still work with no WebCrypto and no CompressionStr
   const zlib = sync(`(() => {
     const zlib = require('zlib');
     const gz = zlib.gzipSync(Buffer.from('compress me'));
+    const br = zlib.brotliCompressSync(Buffer.from('brotli me'));
+    let badBrCode = null;
+    try { zlib.brotliDecompressSync(Buffer.from('not-valid-brotli')); }
+    catch (err) { badBrCode = err && err.code; }
     return {
       gzip: zlib.gunzipSync(gz).toString(),
       deflate: zlib.inflateSync(zlib.deflateSync(Buffer.from('deflate me'))).toString(),
-      brotli: (() => { try { return zlib.brotliDecompressSync(zlib.brotliCompressSync(Buffer.from('brotli me'))).toString(); } catch { return null; } })(),
+      brotli: zlib.brotliDecompressSync(br).toString(),
+      badBrCode,
     };
   })()`);
-  // brotli needs the platform's CompressionStream('brotli'); Chrome and Firefox
-  // only ship gzip/deflate, so the honest answer is a named error, not silence.
-  assert.deepEqual({ ...zlib, brotli: 'compress me' }, { gzip: 'compress me', deflate: 'deflate me', brotli: 'compress me' });
-  const brotli = sync(`(() => {
-    const zlib = require('zlib');
-    try { zlib.brotliCompressSync(Buffer.from('x')); return 'no throw'; }
-    catch (error) { return /not provided by the embedded pako implementation/.test(error.message); }
-  })()`);
-  assert.equal(brotli, true, 'brotli says why it cannot run');
+  assert.deepEqual(zlib, { gzip: 'compress me', deflate: 'deflate me', brotli: 'brotli me', badBrCode: 'Z_DATA_ERROR' });
 });
 
 test('fetch reports the missing network instead of throwing a TypeError', async () => {
@@ -167,7 +164,7 @@ test('WebAssembly and WASI work in a worker without SharedArrayBuffer', async ()
   assert.deepEqual(result, { module: true, imports: 'function' });
 });
 
-test('worker_threads advertises its real limits instead of pretending', async () => {
+test('worker_threads is virtualized on the single main thread', async () => {
   const { sync } = await degraded();
   const result = sync(`(() => {
     const threads = require('worker_threads');
@@ -181,9 +178,11 @@ test('worker_threads advertises its real limits instead of pretending', async ()
   assert.equal(result.parentPort, null);
   assert.equal(result.port, 'function');
   assert.equal(result.channel, 'function');
-  // The single-file runtime runs one main thread: spawning is refused by name
-  // rather than silently running code on the caller's thread.
-  assert.match(result.worker, /Nested Node worker_threads are unsupported/);
+  // Workers are virtualized in-process: constructing one runs its module on
+  // the one main thread and routes messages through a virtual port, which is
+  // what tools spawning small workers need. There is no second thread, and
+  // the isMainThread/parentPort answers above keep saying so.
+  assert.equal(result.worker, 'no throw');
   assert.equal(result.channelName, 'function');
 });
 
