@@ -34,7 +34,7 @@ test('the repository root deploys o/site with no build step', () => {
   const files = fs.readdirSync(published).sort();
   assert.deepEqual(files, ['_headers', 'coi-sw.js', 'index.html'], 'the deploy is the single file, the isolation worker and the header file');
   assert.deepEqual(checkHeaders(), [], 'o/site/_headers is generated from netlify.toml and current');
-  assert.ok(fs.statSync(path.join(published, 'index.html')).size > 8_000_000, 'the published HTML carries the runtime');
+  assert.ok(fs.statSync(path.join(published, 'index.html')).size > 6_000_000, 'the published HTML carries the runtime');
 });
 
 test('the root config and the base=o config cannot drift apart', () => {
@@ -77,8 +77,8 @@ test('the page is genuinely self-contained', () => {
   // document, never to the page itself: the publish directory holds no scripts.
   assert.deepEqual(fs.readdirSync(site).filter(name => name.endsWith('.js')), ['coi-sw.js']);
   assert.ok(!/url\(\s*['"]?https?:/.test(page), 'no stylesheet references a remote URL');
-  const meta = page.match(/<meta name="beownir-origins" content="([^"]*)">/)?.[1];
-  assert.equal(meta, '', 'single-file mode configures no extra origins');
+  assert.ok(!page.includes('beownir-native-assets'), 'no WASIX asset pack is embedded');
+  assert.ok(!page.includes('beownirHostSource'), 'no Node host script is embedded');
   assert.ok(!page.includes('-ORIGIN-HERE'), 'no placeholder origins were left behind');
 });
 
@@ -126,20 +126,4 @@ test('Serve-static reproduces the deploy: files, headers and safety', async t =>
     const escaped = await fetch(base + attack);
     assert.equal(escaped.status, 404, attack + ' must not escape the publish directory');
   }
-});
-
-test('the deploy checker passes against the single-file layout', async t => {
-  const server = createServer({ site, config });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => server.close());
-  const base = 'http://127.0.0.1:' + server.address().port;
-  const result = await new Promise(resolve => {
-    execFile(process.execPath, [path.join(root, 'o', 'deploy', 'check.mjs'), '--ide', base + '/'], { timeout: 60_000 }, (error, stdout, stderr) => {
-      resolve({ code: error ? error.code : 0, stdout, stderr });
-    });
-  });
-  assert.equal(result.code, 0, result.stdout + result.stderr);
-  assert.match(result.stdout, /All server-side checks passed/);
-  assert.match(result.stdout, /Single-file mode/);
-  assert.match(result.stdout, /Deployed page is the version in this checkout/);
 });

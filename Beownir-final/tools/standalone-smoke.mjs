@@ -201,7 +201,7 @@ export async function smokeArtifact(file) {
   let parsed = 0;
   try {
     for (const script of scripts) {
-      const isCode = script.type === 'text/javascript' || script.type === 'module' || ['runtimeSource', 'runtimeFrameSource', 'previewBridgeSource', 'beownirHostSource', 'coiServiceWorkerSource'].includes(script.id);
+      const isCode = script.type === 'text/javascript' || script.type === 'module' || ['runtimeSource', 'runtimeFrameSource', 'previewBridgeSource', 'coiServiceWorkerSource'].includes(script.id);
       if (!isCode || !script.body.trim()) continue;
       // The host source is an ES module (it imports node:net and friends), so it
       // needs a module parse; `node --check` on a temp file uses the same parser
@@ -223,27 +223,13 @@ export async function smokeArtifact(file) {
   timings.parseMs = performance.now() - parseStarted;
   lines.push('scripts     ' + parsed + ' blocks parse (' + timings.parseMs.toFixed(1) + ' ms)');
 
-  // 3. native assets decode and match their digests
-  const packMatch = /<script id="beownir-native-assets" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
-  if (!packMatch) problems.push('native asset pack is missing');
+  // 3. external embedded esbuild wasm check (pure browser bundle)
+  const wasmMatch = /<script id="esbuildWasm"[^>]*>([\s\S]*?)<\/script>/.exec(html);
+  if (!wasmMatch) problems.push('esbuildWasm block is missing');
   else {
-    const pack = JSON.parse(packMatch[1]);
-    const names = Object.keys(pack).sort();
-    let unpacked = 0, wasmBytes = 0;
-    for (const name of names) {
-      const entry = pack[name];
-      let raw;
-      try { raw = zlib.gunzipSync(Buffer.from(entry.base64, 'base64'), { maxOutputLength: 64 * 1024 * 1024 }); }
-      catch (error) { problems.push('asset does not gunzip: ' + name); continue; }
-      if (sha256(raw) !== entry.sha256) problems.push('asset digest mismatch: ' + name);
-      unpacked += raw.length;
-      if (name.endsWith('.wasm')) {
-        wasmBytes += raw.length;
-        // magic: 0x00 61 73 6d
-        if (!(raw[0] === 0x00 && raw[1] === 0x61 && raw[2] === 0x73 && raw[3] === 0x6d)) problems.push('asset is not a WebAssembly module: ' + name);
-      }
-    }
-    lines.push('assets      ' + names.length + ' decoded (' + (unpacked / 1048576).toFixed(2) + ' MiB, ' + (wasmBytes / 1048576).toFixed(2) + ' MiB wasm)');
+    const rawWasm = zlib.gunzipSync(Buffer.from(wasmMatch[1].trim(), 'base64'), { maxOutputLength: 64 * 1024 * 1024 });
+    if (!(rawWasm[0] === 0x00 && rawWasm[1] === 0x61 && rawWasm[2] === 0x73 && rawWasm[3] === 0x6d)) problems.push('esbuildWasm is not a valid WebAssembly module');
+    lines.push('wasm        esbuild.wasm decoded (' + (rawWasm.length / 1048576).toFixed(2) + ' MiB)');
   }
 
   // 4. the artifact does not demand a separate mandatory file
@@ -255,8 +241,7 @@ export async function smokeArtifact(file) {
   for (const match of markup.matchAll(/<(?:script|link|img|iframe)\b[^>]*\b(?:src|href)="([^"#:]+)"/g)) external.add(match[1]);
   for (const match of html.matchAll(/new Worker\(\s*['"]([^'"]+)['"]/g)) external.add(match[1]);
   const mandatory = [...external].filter(reference => !isExternal(reference))
-    .filter(reference => !['coi-sw.js'].includes(reference))
-    .filter(reference => !reference.startsWith('/native-kernel.mjs') && !reference.startsWith('/node_modules/@wasmer/'));
+    .filter(reference => !['coi-sw.js'].includes(reference));
   if (mandatory.length) problems.push('artifact requires external files: ' + mandatory.join(', '));
   lines.push('external    ' + (external.size ? [...external].sort().join(', ') : 'none (workers boot from embedded sources)'));
 

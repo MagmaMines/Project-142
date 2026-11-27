@@ -28,13 +28,12 @@ fs.writeFileSync(path.join(outDir, 'CANDIDATE-STATUS.txt'), [
   `Artifact SHA-256: ${digest}`,
   `Manifest format: ${manifest.format}`,
   `Embedded sources: ${manifest.sources.length}`,
-  `Embedded native assets: ${manifest.assets.length}`,
   '',
   'INTERNAL CANDIDATE ONLY — NOT CLEARED FOR COMMERCIAL DISTRIBUTION.',
   `Package metadata declares private=${Boolean(pkg.private)} and license=${pkg.license || 'UNSET'}.`,
-  'Before public/commercial release, the product owner must choose and supply applicable product licensing, confirm third-party redistribution rights and notices, and complete the documented native Node/WASIX acceptance gates.',
+  'Before public/commercial release, the product owner must choose and supply applicable product licensing, confirm third-party redistribution rights and notices, and complete browser compatibility sign-off.',
   'This package proves artifact integrity only; it is not a security certification or a claim of full Node.js compatibility.'
 ].join('\n') + '\n');
 console.log(`verified candidate bundle: ${outDir}`);
 console.log(`version ${pkg.version}; sha256 ${digest}`);
-console.log('commercial release: BLOCKED until owner/legal and native compatibility gates are satisfied');
+console.log('commercial release: BLOCKED until owner/legal and release gates are satisfied');

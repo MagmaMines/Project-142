@@ -33,7 +33,7 @@ const ELEMENT = () => {
   return node;
 };
 
-function load({ isolated = true, sab = true, jspi = true, opfs = true, shell = 'active', host = false, stored = null, hostname = 'example.test', swController = false } = {}) {
+function load({ isolated = true, sab = true, opfs = true, shell = 'active', stored = null, hostname = 'example.test', swController = false } = {}) {
   const calls = { dialogs: [], buttons: [], stored: stored ? { ...stored } : {}, templates: 0, help: [] };
   const sandbox = {
     console,
@@ -59,9 +59,7 @@ function load({ isolated = true, sab = true, jspi = true, opfs = true, shell = '
       serviceWorker: swController ? { controller: {} } : {},
     },
     location: { hostname },
-    WebAssembly: jspi ? { Suspending: function Suspending() {} } : {},
     SharedArrayBuffer: sab ? function SharedArrayBuffer() {} : undefined,
-    nativeMode: () => host,
   };
   /* The shipped probe reads these off `window`, so the stub has to expose them
    * there too — in a browser window *is* globalThis. */
@@ -80,20 +78,20 @@ const byName = rows => Object.fromEntries(rows.map(row => [row.name, row]));
 
 test('static-host Install and Build actions use the Web mode runtime', () => {
   const setup = page.slice(page.indexOf('  function npmDialog(){'), page.indexOf('  // Explicit built-in-template lifecycle.'));
-  assert.match(setup, /nativeMode\(\)\s*\?\s*'pnpm install --ignore-scripts'\s*:\s*'npm install'/);
-  assert.match(setup, /nativeMode\(\)\s*\?\s*'pnpm build'\s*:\s*'npm run build'/);
+  assert.match(setup, /execute\('npm install'\)/);
+  assert.match(setup, /execute\('npm run build'\)/);
   assert.match(setup, /\[\['Install declared dependencies','npm install'\],\['Build project script','npm run build'\]\]/);
-  assert.match(setup, /Web mode includes an npm, pnpm, yarn, and bun-compatible registry installer/);
+  assert.match(setup, /Web mode includes a concurrent npm, pnpm, yarn, and bun-compatible registry installer/);
   assert.match(setup, /Web mode does not compile native C\/C\+\+ addons/);
 });
 
-test('an isolated Chromium unlocks the native capabilities', () => {
+test('an isolated browser unlocks all Web-mode capabilities', () => {
   const { sandbox } = load();
   const rows = byName(sandbox.probeCapabilities());
-  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'Native browser-WASM profile', 'OPFS execution mounts', 'Offline shell (service worker)', 'Virtual loopback TCP & UDP sockets', 'Virtual loopback TLS & HTTP/2', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto', 'Outbound HTTPS relay (registry & configured domains)']) {
+  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'OPFS browser storage', 'Offline shell (service worker)', 'Virtual loopback TCP & UDP sockets', 'Virtual loopback TLS & HTTP/2', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto', 'Outbound HTTPS relay (registry & configured domains)']) {
     assert.equal(rows[name].ok, true, name + ' is reported as available');
   }
-  assert.equal(rows['Open a preview in another tab (host bridge)'].ok, false, 'no host or controlling service worker is active in this scenario');
+  assert.equal(rows['Open a preview in another tab (service worker)'].ok, false, 'no controlling service worker is active in this scenario');
   assert.equal(rows['External raw sockets & unfiltered network'].ok, false, 'external non-HTTP raw sockets remain unsupported');
   assert.equal(rows['Unmapped native addons & OS binaries'].ok, false, 'unmapped native binaries remain unsupported');
   assert.equal(rows['TLS, raw TCP/UDP, unmapped native addons'], undefined, 'TCP/UDP is not misreported as unavailable');
@@ -101,22 +99,21 @@ test('an isolated Chromium unlocks the native capabilities', () => {
 
 test('an active service worker unlocks cross-tab preview on both localhost and served origins', () => {
   const local = byName(load({ hostname: '127.0.0.1', swController: true }).sandbox.probeCapabilities());
-  assert.equal(local['Open a preview in another tab (host bridge)'].ok, true);
-  assert.match(local['Open a preview in another tab (host bridge)'].detail, /__beownir_preview__/);
+  assert.equal(local['Open a preview in another tab (service worker)'].ok, true);
+  assert.match(local['Open a preview in another tab (service worker)'].detail, /__beownir_preview__/);
   assert.match(local['Framework dev servers (Vite, Next.js, Nuxt)'].detail, /HMR/);
 
   const hosted = byName(load({ hostname: 'ide.example.test', swController: true }).sandbox.probeCapabilities());
-  assert.equal(hosted['Open a preview in another tab (host bridge)'].ok, true);
-  assert.match(hosted['Open a preview in another tab (host bridge)'].detail, /__beownir_preview__/);
+  assert.equal(hosted['Open a preview in another tab (service worker)'].ok, true);
+  assert.match(hosted['Open a preview in another tab (service worker)'].detail, /__beownir_preview__/);
 });
 
 test('a plain static host reports exactly what is missing and why', () => {
-  const { sandbox } = load({ isolated: false, sab: false, jspi: false, shell: null, host: false });
+  const { sandbox } = load({ isolated: false, sab: false, shell: null });
   const rows = byName(sandbox.probeCapabilities());
   assert.equal(rows['Cross-origin isolation'].ok, false);
   assert.match(rows['Cross-origin isolation'].detail, /COOP\/COEP/, 'the fix is named');
   assert.equal(rows['SharedArrayBuffer'].ok, false);
-  assert.equal(rows['Native browser-WASM profile'].ok, false);
   assert.match(rows['Offline shell (service worker)'].detail, /file:\/\//, 'the file:// case is explained');
   // What does not depend on the environment keeps working.
   for (const name of ['Editor, terminal, virtual filesystem', 'npm & pnpm installs', 'Servers and the preview panel', 'Virtual loopback TCP & UDP sockets', 'Virtual loopback TLS & HTTP/2', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto', 'Outbound HTTPS relay (registry & configured domains)']) {
@@ -126,13 +123,13 @@ test('a plain static host reports exactly what is missing and why', () => {
   assert.equal(rows['Unmapped native addons & OS binaries'].ok, false, 'unmapped native binaries are never claimed');
 });
 
-test('OPFS and the host bridge are reported independently', () => {
-  const { sandbox } = load({ opfs: false, host: true, shell: 'failed' });
+test('OPFS and the service worker tab bridge are reported independently', () => {
+  const { sandbox } = load({ opfs: false, shell: 'failed', swController: false });
   const rows = byName(sandbox.probeCapabilities());
-  assert.equal(rows['OPFS execution mounts'].ok, false);
-  assert.match(rows['OPFS execution mounts'].detail, /IndexedDB/);
-  assert.equal(rows['Open a preview in another tab (host bridge)'].ok, true);
-  assert.match(rows['Offline shell (service worker)'].detail, /beownir-host\.mjs/);
+  assert.equal(rows['OPFS browser storage'].ok, false);
+  assert.match(rows['OPFS browser storage'].detail, /IndexedDB/);
+  assert.equal(rows['Open a preview in another tab (service worker)'].ok, false);
+  assert.match(rows['Offline shell (service worker)'].detail, /failed/);
 });
 
 test('worker stop never auto-restarts new workers and SW open-in-tab button stays wired', () => {

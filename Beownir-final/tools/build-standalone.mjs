@@ -52,8 +52,8 @@ export const REQUIRED_FILES = [
   ['o/runtime/stream-kit.js', 'the streaming install kit (sha512, tar, gzip)'],
   ['o/runtime/frame-kernel.js', 'the virtual OS kernel'],
   ['o/runtime/preview-bridge.js', 'the preview bridge'],
-  ['o/host/beownir-host.mjs', 'the network-only host source'],
-  ...SOURCES.filter(source => source.file.startsWith('o/native')).map(source => [source.file, 'native runtime asset']),
+  ['o/embed/kernel.mjs', 'the headless embed runtime source'],
+  ['o/embed/beownir-kernel.js', 'the headless embed single-file bundle'],
 ];
 
 /** Anchors the artifact must contain (script ids the app looks up by id). */
@@ -61,8 +61,6 @@ export const REQUIRED_ANCHORS = [
   'runtimeSource',
   'runtimeFrameSource',
   'previewBridgeSource',
-  'beownirHostSource',
-  'beownir-native-assets',
   'coiServiceWorkerSource',
   'pakoSource',
   'esbuildWasm',
@@ -72,13 +70,10 @@ export const REQUIRED_ANCHORS = [
 ];
 
 /* External references that are *allowed* because the browser genuinely needs a
- * same-origin file for them, or because the native profile lives behind the
- * host. Everything else has to be embedded. Keep this list in sync with
- * SINGLEFILE_BUILD_REPORT.md — the report prints it verbatim. */
+ * same-origin file for them. Everything else has to be embedded. Keep this list
+ * in sync with SINGLEFILE_BUILD_REPORT.md — the report prints it verbatim. */
 export const ALLOWED_EXTERNAL = [
-  { reference: 'coi-sw.js', why: 'service workers can only be registered from a same-origin script URL; the app degrades to non-isolated mode when it is absent' },
-  { reference: '/native-kernel.mjs', why: 'served by the host from the embedded native asset pack for the isolated browser-WASM profile' },
-  { reference: '/node_modules/@wasmer/sdk/', why: 'same: host-served from the embedded pack' },
+  { reference: 'coi-sw.js', why: 'service workers can only be registered from a same-origin script URL; the app degrades cleanly when it is absent' },
 ];
 
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -101,58 +96,13 @@ export function collectSources() {
     if (!bytes.length) problems.push('empty ' + label + ': ' + relative);
     files.push({ file: relative, label, sha256: sha256(bytes), bytes: bytes.length });
   }
-  // Every runtime asset in the embedded pack must also exist in o/native/.
-  const nativeFiles = [];
-  const walk = dir => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else nativeFiles.push(full);
-    }
-  };
-  if (fs.existsSync(path.join(root, 'o', 'native'))) walk(path.join(root, 'o', 'native'));
-  files.push(...nativeFiles.map(full => {
-    const bytes = fs.readFileSync(full);
-    return {
-      file: path.relative(root, full).split(path.sep).join('/'),
-      label: 'native asset',
-      sha256: sha256(bytes),
-      bytes: bytes.length,
-    };
-  }));
   files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
-  return { files, problems, nativeFiles: nativeFiles.length };
+  return { files, problems, nativeFiles: 0 };
 }
 
-/** Verifies the embedded pack: base64 -> gunzip -> sha256, per entry. */
-export function verifyAssetPack(html) {
-  const open = html.indexOf('<script id="beownir-native-assets" type="application/json">');
-  if (open < 0) return { problems: ['the native asset pack block is missing'], assets: [] };
-  const start = html.indexOf('>', open) + 1;
-  const end = html.indexOf(MANIFEST_CLOSE, start);
-  let pack;
-  try {
-    pack = JSON.parse(html.slice(start, end));
-  } catch (error) {
-    return { problems: ['the native asset pack is not valid JSON: ' + error.message], assets: [] };
-  }
-  const problems = [];
-  const assets = [];
-  for (const name of Object.keys(pack).sort()) {
-    const entry = pack[name];
-    let bytes;
-    try {
-      bytes = zlib.gunzipSync(Buffer.from(entry.base64, 'base64'), { maxOutputLength: 64 * 1024 * 1024 });
-    } catch (error) {
-      problems.push('asset does not gunzip: ' + name + ' (' + error.message + ')');
-      continue;
-    }
-    const digest = sha256(bytes);
-    if (digest !== entry.sha256) problems.push('asset digest mismatch: ' + name);
-    if (!bytes.length) problems.push('asset is empty: ' + name);
-    assets.push({ path: name, type: entry.type, sha256: digest, bytes: bytes.length, compressedBytes: Buffer.from(entry.base64, 'base64').length });
-  }
-  return { problems, assets };
+/** Retained as a no-op descriptor for manifests with zero external native packs. */
+export function verifyAssetPack() {
+  return { problems: [], assets: [] };
 }
 
 /** Things a single-file distribution must not depend on. */
@@ -304,10 +254,12 @@ export function verifyArtifact(html) {
   for (const id of manifest.anchors) if (!html.includes('<script id="' + id + '"')) problems.push('declared anchor is missing: ' + id);
   // Source digests in the manifest must match the files on disk when they are
   // present, which is the source-to-distribution consistency check.
+  const sourceFileSet = new Set(REQUIRED_FILES.map(([f]) => f));
   for (const entry of manifest.sources) {
     const absolute = path.join(root, entry.file);
     if (!fs.existsSync(absolute)) { problems.push('source listed in the manifest is gone: ' + entry.file); continue; }
     if (sha256(fs.readFileSync(absolute)) !== entry.sha256) problems.push('source changed since the artifact was built: ' + entry.file);
+    void sourceFileSet;
   }
   return { problems, manifest };
 }

@@ -12643,10 +12643,11 @@ self.onunhandledrejection = (ev)=>{ errOut('\x1b[31mUnhandledPromiseRejection: '
 });
 /* @beownir-kit-end */
 /* Registry-only, integrity-checked, streamed package installation.
- * Tarballs are downloaded in chunks, hashed while streaming (SHA-512), gunzipped
- * incrementally and written to the virtual filesystem file by file so that a
- * large package never has to exist in memory as one buffer.
- * No lifecycle scripts, no native tools. */
+ * Dependency trees resolve breadth-first concurrently, tarballs extract in parallel
+ * across a zero-copy SharedArrayBuffer Blob-worker pool (or concurrent streams for
+ * large/range-probed archives), every download is SRI hash-verified, incremental
+ * trees & LRU caches eliminate redundant work, and native bindings resolve or
+ * swap cleanly to ecosystem JS/WASM equivalents. No lifecycle scripts, no native tools. */
 const REG = 'https://registry.npmjs.org';
 const INSTALL_BUDGET = Object.freeze({
   tarballBytes: 64 * 1024 * 1024,        // compressed bytes for one package
@@ -12661,11 +12662,30 @@ const INSTALL_BUDGET = Object.freeze({
   attempts: 3,
   segments: 4,                            // byte ranges fetched in parallel ("packets")
   segmentBytes: 4 * 1024 * 1024,          // bytes per range request
-  concurrency: 3                          // ranges in flight at once
+  concurrency: 3,                         // ranges in flight at once per large package
+  resolveConcurrency: 12,                 // concurrent packument lookups during BFS
+  installConcurrency: 6,                  // concurrent tarball downloads in non-SAB fallback
+  sabBatchSize: 24,                       // packages dispatched per SAB kernel batch
+  sabMaxUnpackedBytes: 16 * 1024 * 1024,  // larger packages use segmented range streaming
+  extractCacheMaxBytes: 48 * 1024 * 1024, // verified decompressed file cache cap
+  packumentCacheTtlMs: 15 * 60 * 1000     // Cache API packument TTL (15 min)
 });
 const NPM_COMPAT_VERSION = '10.9.2';
+const NPM_PACKUMENT_CACHE = 'beownir-npm-v1';
+const RUNTIME_OS = ['browser', 'wasi'];
+const RUNTIME_CPU = ['wasm32'];
+const NEST_DEPTH_LIMIT = 5;
+const NESTED_CAP = 200;
+const NATIVE_PKG_SUBSTITUTIONS = Object.freeze({
+  '@swc/core': { alt: '@swc/wasm', range: 'latest' },
+  '@parcel/watcher': { alt: '@parcel/watcher-wasm', range: 'latest' },
+  'bcrypt': { alt: 'bcryptjs', range: '^3.0.0' },
+  'node-sass': { alt: 'sass', range: '^1.80.0' }
+});
 const metaCache = new Map();
-let installCount = 0, installBytes = 0, installRangeFallbacks = 0, reservedRoots = new Set();
+const pkgExtractCache = new Map();
+let pkgExtractCacheBytes = 0;
+let installCount = 0, installBytes = 0, installReused = 0, installRangeFallbacks = 0, reservedRoots = new Set();
 
 function installKit(){
   const kit = self.BeownirInstallKit;
@@ -12683,7 +12703,34 @@ function registryUrl(value){
 function budgetMessage(kind, detail){
   return 'This install needs more browser memory than the compatibility engine allows (' + detail + '). ' +
     'The graph is installed in packets, but the whole tree must still fit in the worker: ' + kind + '. ' +
-    'Remove unused dependencies, install a smaller subset, or use the hosted browser-WASM runtime for full frameworks.';
+    'Remove unused dependencies, install a smaller subset, or free cache storage.';
+}
+function hasCacheApi() {
+  return typeof caches !== 'undefined' && caches && typeof caches.open === 'function' && typeof Request === 'function' && typeof Response === 'function' && REG.startsWith('https://');
+}
+async function readPackumentFromCache(url) {
+  if (!hasCacheApi()) return null;
+  try {
+    const cache = await caches.open(NPM_PACKUMENT_CACHE);
+    const match = await cache.match(new Request(url));
+    if (!match) return null;
+    const stamp = Number(match.headers.get('x-beownir-ts') || 0);
+    if (!stamp || Date.now() - stamp > INSTALL_BUDGET.packumentCacheTtlMs) return null;
+    return await match.json();
+  } catch {
+    return null;
+  }
+}
+async function writePackumentToCache(url, text) {
+  if (!hasCacheApi() || typeof text !== 'string' || text.length > 8 * 1024 * 1024) return;
+  try {
+    const cache = await caches.open(NPM_PACKUMENT_CACHE);
+    const res = new Response(text, {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'x-beownir-ts': String(Date.now()) }
+    });
+    await cache.put(new Request(url), res);
+  } catch { /* Cache quota or opaque restrictions must never break installs. */ }
 }
 async function registryBytes(url, max = INSTALL_BUDGET.tarballBytes, extraHeaders, attempts = 1) {
   const u = registryUrl(url);
@@ -12722,11 +12769,24 @@ async function registryBytes(url, max = INSTALL_BUDGET.tarballBytes, extraHeader
 async function fetchMeta(name) {
   if (!validPackageName(name)) throw new Error('Invalid package name: ' + name);
   if (!metaCache.has(name)) {
-    const job = registryBytes(REG + '/' + encodeURIComponent(name), INSTALL_BUDGET.metadataBytes, { Accept: 'application/vnd.npm.install-v1+json' }, INSTALL_BUDGET.attempts || 3)
-      .then(b => JSON.parse(td.decode(b)));
-    metaCache.set(name, job); job.catch(() => metaCache.delete(name));
+    const url = REG + '/' + encodeURIComponent(name);
+    const job = (async () => {
+      const cached = await readPackumentFromCache(url);
+      if (cached && cached.versions) return cached;
+      const bytes = await registryBytes(url, INSTALL_BUDGET.metadataBytes, { Accept: 'application/vnd.npm.install-v1+json' }, INSTALL_BUDGET.attempts || 3);
+      const text = td.decode(bytes);
+      const parsed = JSON.parse(text);
+      void writePackumentToCache(url, text);
+      return parsed;
+    })();
+    metaCache.set(name, job);
+    job.catch(() => metaCache.delete(name));
   }
   return metaCache.get(name);
+}
+async function tryFetchMeta(name) {
+  try { return await fetchMeta(name); }
+  catch (err) { if (/HTTP 404/.test(String(err && err.message || ''))) return null; throw err; }
 }
 function pickVersion(meta, range = 'latest') {
   if (meta['dist-tags'] && Object.prototype.hasOwnProperty.call(meta['dist-tags'], range)) return meta['dist-tags'][range];
@@ -12734,6 +12794,92 @@ function pickVersion(meta, range = 'latest') {
   const version = BeownirSemver.maxSatisfying(Object.keys(meta.versions || {}), range);
   if (!version) throw new Error('No published version of ' + meta.name + ' satisfies ' + range);
   return version;
+}
+function platformAccepts(list, values) {
+  if (!Array.isArray(list) || list.length === 0) return true;
+  const wanted = Array.isArray(values) ? values : [values];
+  const blocked = [];
+  const allowed = [];
+  for (let i = 0; i < list.length; i++) {
+    const item = String(list[i]);
+    if (item.startsWith('!')) blocked.push(item.slice(1));
+    else allowed.push(item);
+  }
+  if (wanted.some(v => blocked.includes(v))) return false;
+  return allowed.length === 0 || wanted.some(v => allowed.includes(v));
+}
+function requiredPeers(meta) {
+  const peerMeta = meta && meta.peerDependenciesMeta ? meta.peerDependenciesMeta : {};
+  const peers = {};
+  for (const [k, v] of Object.entries((meta && meta.peerDependencies) || {})) {
+    if (!(peerMeta[k] && peerMeta[k].optional)) peers[k] = v;
+  }
+  return peers;
+}
+function splitPackageSpec(spec) {
+  const s = String(spec || '').trim();
+  const at = s.lastIndexOf('@');
+  if (at > 0) return { name: s.slice(0, at), range: s.slice(at + 1) || 'latest' };
+  return { name: s, range: 'latest' };
+}
+function parseNpmAliasSpec(rawRange) {
+  const text = String(rawRange || '').trim();
+  if (!text.startsWith('npm:')) return null;
+  const target = text.slice(4);
+  const parsed = splitPackageSpec(target);
+  if (!validPackageName(parsed.name)) throw new Error('Invalid npm: alias target: ' + text);
+  return parsed;
+}
+function flattenOverrideMap(pkg) {
+  const map = Object.create(null);
+  const ingest = (obj, prefix) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === '.' && prefix) { if (typeof v === 'string') map[prefix] = v; continue; }
+      const fullKey = prefix ? prefix + '>' + k : k;
+      if (typeof v === 'string') {
+        map[k] = map[k] || v;
+        if (prefix) map[fullKey] = v;
+      } else if (v && typeof v === 'object') {
+        if (typeof v['.'] === 'string') map[k] = v['.'];
+        ingest(v, fullKey);
+      }
+    }
+  };
+  ingest(pkg && pkg.resolutions, '');
+  ingest(pkg && pkg.pnpm && pkg.pnpm.overrides, '');
+  ingest(pkg && pkg.overrides, '');
+  return map;
+}
+function lookupOverrideRange(overrides, pkgName, parentName) {
+  if (!overrides) return null;
+  if (parentName && Object.prototype.hasOwnProperty.call(overrides, parentName + '>' + pkgName)) return overrides[parentName + '>' + pkgName];
+  if (Object.prototype.hasOwnProperty.call(overrides, '**/' + pkgName)) return overrides['**/' + pkgName];
+  if (Object.prototype.hasOwnProperty.call(overrides, pkgName)) return overrides[pkgName];
+  return null;
+}
+function findWorkspaceDir(pkg, name) {
+  const patterns = Array.isArray(pkg && pkg.workspaces) ? pkg.workspaces
+    : (pkg && pkg.workspaces && Array.isArray(pkg.workspaces.packages) ? pkg.workspaces.packages : []);
+  if (!patterns.length) return null;
+  const candidates = new Set();
+  for (const pat of patterns) {
+    const clean = String(pat || '').replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!clean) continue;
+    if (clean.endsWith('/*')) {
+      const parent = normalize('/project/' + clean.slice(0, -2));
+      if (FS[parent] && FS[parent].d) {
+        for (const child of readdirSync(parent)) candidates.add(normalize(parent + '/' + child));
+      }
+    } else if (!clean.includes('*')) {
+      candidates.add(normalize('/project/' + clean));
+    }
+  }
+  for (const dir of candidates) {
+    const rec = packageRecord(dir);
+    if (rec && rec.name === name) return dir;
+  }
+  return null;
 }
 async function verifyNpmIntegrity(bytes, sri) {
   if (!sri) throw new Error('Package has no integrity hash. Refusing an unverified download.');
@@ -12780,10 +12926,10 @@ function untar(buf) {
         i += length;
       }
     } else if (type === 'L') pendingName = td.decode(data).replace(/\0.*$/s, '');
+    else if (type === 'K') { /* GNU long link target ignored */ }
     else {
       name = archivePath(pax.path || pendingName || name); pendingName = null; pax = {};
       if (type === '0' || type === '\0') { files.push({ name, data }); if (files.length > INSTALL_BUDGET.filesPerPackage) throw new Error('Too many files in package.'); }
-      // Links, devices, directories and executable permissions are never materialized.
     }
     offset += 512 + Math.ceil(size / 512) * 512;
   }
@@ -12803,9 +12949,7 @@ function ancestorPackage(name, range, fromRoot) {
   }
   return null;
 }
-/* One open file at a time: tarballs are sequential, so a single accumulator keeps
- * memory flat while large packages are written in packets. */
-function createPackageSink(base, progress) {
+function createPackageSink(base, progress, collectList) {
   let current = null;
   return {
     onEntry(entry) {
@@ -12832,66 +12976,576 @@ function createPackageSink(base, progress) {
       mkdirp(dirname(sink.path));
       if (sink.text) {
         sink.textChunks.push(sink.decoder ? sink.decoder.decode() : '');
-        writeFileSync(sink.path, sink.textChunks.join(''));
-      } else writeFileSync(sink.path, Buffer.concat(sink.binaryChunks, sink.bytes));
+        const textVal = sink.textChunks.join('');
+        writeFileSync(sink.path, textVal);
+        if (collectList) collectList.push({ rel: sink.rel, content: textVal, size: sink.bytes });
+      } else {
+        const binVal = Buffer.concat(sink.binaryChunks, sink.bytes);
+        writeFileSync(sink.path, binVal);
+        if (collectList) collectList.push({ rel: sink.rel, content: binVal, size: binVal.length });
+      }
       if (progress) progress(entry.size);
     },
     onDirectory(name) { const rel = name.split('/').slice(1).join('/'); if (rel) mkdirp(normalize(base + '/' + rel)); }
   };
 }
+function rememberExtractedPackage(cacheKey, collected, expandedBytes) {
+  if (!cacheKey || !Array.isArray(collected) || !collected.length || expandedBytes > 4 * 1024 * 1024) return;
+  if (pkgExtractCache.has(cacheKey)) {
+    const prev = pkgExtractCache.get(cacheKey);
+    pkgExtractCacheBytes = Math.max(0, pkgExtractCacheBytes - prev.bytes);
+    pkgExtractCache.delete(cacheKey);
+  }
+  while (pkgExtractCache.size && pkgExtractCacheBytes + expandedBytes > INSTALL_BUDGET.extractCacheMaxBytes) {
+    const oldestKey = pkgExtractCache.keys().next().value;
+    const oldest = pkgExtractCache.get(oldestKey);
+    pkgExtractCache.delete(oldestKey);
+    pkgExtractCacheBytes = Math.max(0, pkgExtractCacheBytes - oldest.bytes);
+  }
+  if (expandedBytes <= INSTALL_BUDGET.extractCacheMaxBytes) {
+    pkgExtractCache.set(cacheKey, { files: collected, bytes: expandedBytes });
+    pkgExtractCacheBytes += expandedBytes;
+  }
+}
+function writeFromExtractCache(base, cacheKey, onFile) {
+  if (!pkgExtractCache.has(cacheKey)) return null;
+  const cached = pkgExtractCache.get(cacheKey);
+  pkgExtractCache.delete(cacheKey);
+  pkgExtractCache.set(cacheKey, cached);
+  mkdirp(base);
+  for (let i = 0; i < cached.files.length; i++) {
+    const entry = cached.files[i];
+    const targetPath = normalize(base + '/' + entry.rel);
+    if (!targetPath.startsWith(base + '/')) throw new Error('Package path escapes its directory.');
+    mkdirp(dirname(targetPath));
+    writeFileSync(targetPath, typeof entry.content === 'string' ? entry.content : Buffer.from(entry.content));
+    if (onFile) onFile(entry.size);
+  }
+  installBytes += cached.bytes;
+  return cached.bytes;
+}
+function writeBnpkToVfs(base, packBuffer, cacheKey, onFile) {
+  const bytes = new Uint8Array(packBuffer);
+  if (bytes.length < 8 || bytes[0] !== 0x42 || bytes[1] !== 0x4E || bytes[2] !== 0x50 || bytes[3] !== 0x4B) {
+    throw new Error('Corrupt internal package payload.');
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint32(4, true);
+  let pos = 8;
+  let totalUnpacked = 0;
+  const shouldCache = Boolean(cacheKey);
+  const collected = shouldCache ? [] : null;
+  mkdirp(base);
+  for (let i = 0; i < count; i++) {
+    const relLen = view.getUint32(pos, true);
+    const isText = bytes[pos + 4] === 1;
+    const dataLen = view.getUint32(pos + 5, true);
+    pos += 9;
+    const rel = td.decode(bytes.subarray(pos, pos + relLen));
+    pos += relLen;
+    archivePath(rel);
+    const targetPath = normalize(base + '/' + rel);
+    if (!targetPath.startsWith(base + '/')) throw new Error('Package path escapes its directory.');
+    const rawSlice = bytes.subarray(pos, pos + dataLen);
+    pos += dataLen;
+    totalUnpacked += dataLen;
+    mkdirp(dirname(targetPath));
+    const val = isText ? td.decode(rawSlice) : Buffer.from(rawSlice);
+    writeFileSync(targetPath, val);
+    if (collected && totalUnpacked <= 4 * 1024 * 1024) collected.push({ rel, content: val, size: dataLen });
+    if (onFile) onFile(dataLen);
+  }
+  installBytes += totalUnpacked;
+  if (collected && totalUnpacked <= 4 * 1024 * 1024) rememberExtractedPackage(cacheKey, collected, totalUnpacked);
+  return totalUnpacked;
+}
+function computeIntegrity(dist) {
+  if (!dist || typeof dist.tarball !== 'string') throw new Error('Package metadata has no tarball URL.');
+  const integrity = dist.integrity || (dist.shasum ? 'sha1-' + Buffer.from(dist.shasum, 'hex').toString('base64') : null);
+  if (!integrity) throw new Error('Package has no integrity hash. Refusing an unverified download.');
+  return integrity;
+}
 async function extractPackage(base, dist, options = {}) {
   const __prof = typeof profilerBegin === 'function' ? profilerBegin('npm.extract', 'packages', { package: base.split('/node_modules/').pop() || base }) : null;
   try {
-  if (!dist || typeof dist.tarball !== 'string') throw new Error('Package metadata has no tarball URL.');
-  const kit = installKit(), integrity = dist.integrity || (dist.shasum ? 'sha1-' + Buffer.from(dist.shasum, 'hex').toString('base64') : null);
-  if (!integrity) throw new Error('Package has no integrity hash. Refusing an unverified download.');
-  // Older sha1-only packages are small enough to verify with WebCrypto in one pass.
-  if (!/^sha512-/.test(String(integrity).trim())) {
-    const bytes = await registryBytes(dist.tarball, 24 * 1024 * 1024);
-    if (!await verifyNpmIntegrity(bytes, integrity)) throw new Error('Integrity verification failed: ' + dist.tarball);
-    const files = untar(gunzipLimited(bytes));
-    mkdirp(base);
-    for (const file of files) {
-      const rel = file.name.split('/').slice(1).join('/');
-      if (!rel) continue;
-      archivePath(rel);
-      const path = normalize(base + '/' + rel);
-      if (!path.startsWith(base + '/')) throw new Error('Package path escapes its directory.');
-      mkdirp(dirname(path));
-      writeFileSync(path, TEXT_FILE.test(rel) ? td.decode(file.data) : Buffer.from(file.data));
+    const integrity = computeIntegrity(dist);
+    const cacheKey = integrity + '\0' + dist.tarball;
+    if (!options.skipCache && writeFromExtractCache(base, cacheKey, options.onFile) !== null) {
+      return integrity;
     }
-    return integrity;
-  }
-  let sink = createPackageSink(base, options.onFile);
-  const unpacked = Number(dist.unpackedSize);
-  const singleStream = Number.isFinite(unpacked) && unpacked > 0 && unpacked <= 8 * 1024 * 1024;
-  const result = await kit.streamPackage({
-    tarball: dist.tarball,
-    integrity,
-    origin: REG,
-    pako: pakoApi(),
-    fetch: (url, init) => fetch(url, init),
-    maxTarballBytes: INSTALL_BUDGET.tarballBytes,
-    maxExpandedBytes: INSTALL_BUDGET.packageBytes,
-    maxEntryBytes: INSTALL_BUDGET.entryBytes,
-    maxEntries: INSTALL_BUDGET.filesPerPackage,
-    idleTimeoutMs: INSTALL_BUDGET.idleTimeoutMs,
-    attempts: INSTALL_BUDGET.attempts,
-    segments: singleStream ? 1 : INSTALL_BUDGET.segments,
-    segmentBytes: INSTALL_BUDGET.segmentBytes,
-    concurrency: INSTALL_BUDGET.concurrency,
-    onRangeFallback: () => { installRangeFallbacks++; },
-    onReset: () => { if (typeof rmrf === 'function') rmrf(base); sink = createPackageSink(base, options.onFile); },
-    onEntry: entry => sink.onEntry(entry),
-    onEntryData: (entry, chunk) => sink.onEntryData(entry, chunk),
-    onEntryEnd: entry => sink.onEntryEnd(entry),
-    onDirectory: name => sink.onDirectory(name),
-    onProgress: options.onProgress
-  });
-  installBytes += result.expandedBytes;
-  return result.integrity;
+    if (!/^sha512-/.test(String(integrity).trim())) {
+      const bytes = await registryBytes(dist.tarball, 24 * 1024 * 1024, null, INSTALL_BUDGET.attempts);
+      if (!await verifyNpmIntegrity(bytes, integrity)) throw new Error('Integrity verification failed: ' + dist.tarball);
+      const unzipped = gunzipLimited(bytes);
+      const files = untar(unzipped);
+      mkdirp(base);
+      let expanded = 0;
+      const collected = [];
+      for (const file of files) {
+        const rel = file.name.split('/').slice(1).join('/');
+        if (!rel) continue;
+        archivePath(rel);
+        const path = normalize(base + '/' + rel);
+        if (!path.startsWith(base + '/')) throw new Error('Package path escapes its directory.');
+        mkdirp(dirname(path));
+        const val = TEXT_FILE.test(rel) ? td.decode(file.data) : Buffer.from(file.data);
+        writeFileSync(path, val);
+        expanded += file.data.length;
+        if (expanded <= 4 * 1024 * 1024) collected.push({ rel, content: val, size: file.data.length });
+      }
+      installBytes += expanded;
+      rememberExtractedPackage(cacheKey, collected, expanded);
+      return integrity;
+    }
+    const kit = installKit();
+    const unpacked = Number(dist.unpackedSize);
+    const singleStream = Number.isFinite(unpacked) && unpacked > 0 && unpacked <= 8 * 1024 * 1024;
+    const collected = [];
+    let sink = createPackageSink(base, options.onFile, collected);
+    const result = await kit.streamPackage({
+      tarball: dist.tarball,
+      integrity,
+      origin: REG,
+      pako: pakoApi(),
+      fetch: (url, init) => fetch(url, init),
+      maxTarballBytes: INSTALL_BUDGET.tarballBytes,
+      maxExpandedBytes: INSTALL_BUDGET.packageBytes,
+      maxEntryBytes: INSTALL_BUDGET.entryBytes,
+      maxEntries: INSTALL_BUDGET.filesPerPackage,
+      idleTimeoutMs: INSTALL_BUDGET.idleTimeoutMs,
+      attempts: INSTALL_BUDGET.attempts,
+      segments: singleStream ? 1 : INSTALL_BUDGET.segments,
+      segmentBytes: INSTALL_BUDGET.segmentBytes,
+      concurrency: INSTALL_BUDGET.concurrency,
+      onRangeFallback: () => { installRangeFallbacks++; },
+      onReset: () => { if (typeof rmrf === 'function') rmrf(base); collected.length = 0; sink = createPackageSink(base, options.onFile, collected); },
+      onEntry: entry => sink.onEntry(entry),
+      onEntryData: (entry, chunk) => sink.onEntryData(entry, chunk),
+      onEntryEnd: entry => sink.onEntryEnd(entry),
+      onDirectory: name => sink.onDirectory(name),
+      onProgress: options.onProgress
+    });
+    installBytes += result.expandedBytes;
+    if (result.expandedBytes <= 4 * 1024 * 1024) rememberExtractedPackage(cacheKey, collected, result.expandedBytes);
+    return result.integrity;
   } finally {
     if (__prof && typeof profilerEnd === 'function') profilerEnd(__prof);
+  }
+}
+function linkPackageBins(base, pkgMeta) {
+  if (!pkgMeta || !pkgMeta.bin) return;
+  const marker = '/node_modules/';
+  const markerIdx = base.lastIndexOf(marker);
+  if (markerIdx < 0) return;
+  const pkgName = pkgMeta.name || base.slice(markerIdx + marker.length);
+  const shortName = pkgName.startsWith('@') ? pkgName.split('/')[1] : pkgName;
+  const entries = typeof pkgMeta.bin === 'string' ? [[shortName, pkgMeta.bin]] : Object.entries(pkgMeta.bin || {});
+  if (!entries.length) return;
+  const binDir = base.slice(0, markerIdx) + '/node_modules/.bin';
+  for (const [binName, rawRel] of entries) {
+    if (typeof binName !== 'string' || typeof rawRel !== 'string') continue;
+    const cleanName = binName.split('/').pop();
+    if (!cleanName || cleanName === '.' || cleanName === '..' || /[\\\x00-\x1f]/.test(cleanName)) continue;
+    const targetFile = normalize(base + '/' + rawRel);
+    if (!targetFile.startsWith(base + '/') || !FS[targetFile] || FS[targetFile].d) continue;
+    mkdirp(binDir);
+    const binPath = binDir + '/' + cleanName;
+    if (typeof FSMOD === 'object' && FSMOD && typeof FSMOD.symlinkSync === 'function') {
+      const relLink = '../' + pkgName + targetFile.slice(base.length);
+      try { FSMOD.symlinkSync(relLink, binPath); continue; } catch {}
+    }
+    writeFileSync(binPath, '#!/bin/sh\nexec node "' + targetFile + '" "$@"\n');
+    if (FS[binPath]) FS[binPath].mode = 0o755;
+  }
+}
+function writeSubstitutionBridge(origName, altName, altVersion) {
+  const bridgeDir = '/project/node_modules/' + origName;
+  mkdirp(bridgeDir);
+  writeFileSync(bridgeDir + '/package.json', JSON.stringify({
+    name: origName,
+    version: altVersion || '0.0.0-wasm-compat',
+    main: './index.js',
+    beownirWasmFallbackFor: altName
+  }, null, 2) + '\n');
+  writeFileSync(bridgeDir + '/index.js', 'module.exports = require(' + JSON.stringify(altName) + ');\n');
+}
+function copyLocalPackageDir(srcDir, destBase) {
+  if (!FS[srcDir] || !FS[srcDir].d) throw new Error('Local package directory does not exist: ' + srcDir);
+  mkdirp(destBase);
+  const walk = cur => {
+    for (const entryName of readdirSync(cur)) {
+      if (entryName === 'node_modules' || entryName === '.git') continue;
+      const srcPath = cur + '/' + entryName;
+      const rel = srcPath.slice(srcDir.length + 1);
+      const destPath = normalize(destBase + '/' + rel);
+      const item = FS[srcPath];
+      if (!item) continue;
+      if (item.d) { mkdirp(destPath); walk(srcPath); }
+      else writeFileSync(destPath, typeof item.c === 'string' ? item.c : Buffer.from(item.c));
+    }
+  };
+  walk(srcDir);
+}
+function nestDepthOf(dir) {
+  const matches = dir.match(/node_modules/g);
+  return matches ? matches.length - 1 : 0;
+}
+async function resolveInstallPlan(roots, rootPkg, { noWasmFallback = false } = {}) {
+  const overrides = flattenOverrideMap(rootPkg);
+  const hoisted = new Map();
+  const nested = new Map();
+  const localNodes = [];
+  const substitutions = [];
+  const subTried = new Map();
+  const queue = [];
+  const softQueue = [];
+  const resolveCache = new Map();
+
+  for (const r of roots) {
+    queue.push({ name: r.name, range: r.range, from: '<root>', nestedDir: null, dev: !!r.dev, depth: 0, soft: false });
+  }
+
+  const resolveSubstitution = async name => {
+    if (noWasmFallback || !Object.prototype.hasOwnProperty.call(NATIVE_PKG_SUBSTITUTIONS, name)) return null;
+    if (subTried.has(name)) return subTried.get(name);
+    const rule = NATIVE_PKG_SUBSTITUTIONS[name];
+    const altMeta = await tryFetchMeta(rule.alt);
+    const chosen = altMeta ? { orig: name, alt: rule.alt, meta: altMeta, range: rule.range } : null;
+    subTried.set(name, chosen);
+    return chosen;
+  };
+
+  const resolveSingle = async job => {
+    const key = (job.from || '') + '\0' + job.name + '\0' + job.range;
+    if (!resolveCache.has(key)) {
+      resolveCache.set(key, (async () => {
+        const overridden = lookupOverrideRange(overrides, job.name, job.from === '<root>' ? '' : job.from);
+        const effRange = overridden || job.range || 'latest';
+        if (String(effRange).startsWith('workspace:')) {
+          const wsDir = findWorkspaceDir(rootPkg, job.name);
+          if (!wsDir) return { kind: 'skip' };
+          return { kind: 'local', dir: wsDir, installName: job.name, dev: job.dev };
+        }
+        if (String(effRange).startsWith('file:') || String(effRange).startsWith('link:')) {
+          const targetRel = String(effRange).replace(/^(?:file|link):/, '');
+          const localDir = normalize('/project/' + targetRel);
+          if (!localDir.startsWith('/project/') || !FS[localDir] || !FS[localDir].d) {
+            throw new Error('Local package path missing or escapes /project: ' + effRange);
+          }
+          return { kind: 'local', dir: localDir, installName: job.name, dev: job.dev };
+        }
+        const aliasSpec = parseNpmAliasSpec(effRange);
+        let installName = job.name;
+        let realName = aliasSpec ? aliasSpec.name : job.name;
+        let realRange = aliasSpec ? aliasSpec.range : effRange;
+        let substitutedFrom = null;
+        if (!aliasSpec) {
+          const sub = await resolveSubstitution(job.name);
+          if (sub) {
+            installName = sub.alt;
+            realName = sub.alt;
+            realRange = sub.range;
+            substitutedFrom = job.name;
+          }
+        }
+        if (!validPackageName(realName)) throw new Error('Invalid package name: ' + realName);
+        const meta = await fetchMeta(realName);
+        const version = pickVersion(meta, realRange);
+        const rec = meta.versions[version];
+        if (!rec || !rec.dist) throw new Error('Package version metadata incomplete: ' + realName + '@' + version);
+        return { kind: 'registry', installName, realName, version, rec, substitutedFrom };
+      })());
+    }
+    return resolveCache.get(key);
+  };
+
+  let active = 0;
+  let hardActive = 0;
+  let fatalError = null;
+  let done = false;
+
+  await new Promise((resolveDone, rejectDone) => {
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (fatalError) rejectDone(fatalError);
+      else resolveDone();
+    };
+    const pump = () => {
+      if (done) return;
+      if (fatalError) {
+        if (active === 0) finish();
+        return;
+      }
+      while (active < INSTALL_BUDGET.resolveConcurrency && (queue.length || (hardActive === 0 && softQueue.length))) {
+        const job = queue.length ? queue.shift() : softQueue.shift();
+        if (job.depth > INSTALL_BUDGET.graphDepth) {
+          if (!job.soft) { fatalError = new Error('Dependency graph is deeper than ' + INSTALL_BUDGET.graphDepth + ' levels.'); break; }
+          continue;
+        }
+        active++;
+        if (!job.soft) hardActive++;
+        resolveSingle(job).then(res => {
+          active--;
+          if (!job.soft) hardActive--;
+          if (fatalError || res.kind === 'skip') { pump(); return; }
+          if (res.kind === 'local') {
+            if (!localNodes.some(n => n.installName === res.installName)) {
+              localNodes.push({ installName: res.installName, dir: res.dir, base: '/project/node_modules/' + res.installName, dev: job.dev });
+              const localPkg = packageRecord(res.dir);
+              if (localPkg) {
+                for (const [dep, depRange] of Object.entries(localPkg.dependencies || {})) {
+                  queue.push({ name: dep, range: depRange, from: res.installName, nestedDir: null, dev: job.dev, depth: job.depth + 1, soft: false });
+                }
+              }
+            }
+            pump();
+            return;
+          }
+          const rec = res.rec;
+          if (job.soft && (!platformAccepts(rec.os, RUNTIME_OS) || !platformAccepts(rec.cpu, RUNTIME_CPU))) {
+            pump();
+            return;
+          }
+          if (res.substitutedFrom && !substitutions.some(s => s.orig === res.substitutedFrom)) {
+            substitutions.push({ orig: res.substitutedFrom, alt: res.installName, version: res.version });
+          }
+          const installName = res.installName;
+          const totalSoFar = hoisted.size + nested.size;
+          if (hoisted.has(installName)) {
+            const top = hoisted.get(installName);
+            const matchRange = res.substitutedFrom ? '*' : (parseNpmAliasSpec(job.range)?.range || job.range);
+            const satisfied = top.realName === res.realName && (matchRange === 'latest' || matchRange === '*' || !BeownirSemver.validRange(matchRange) || BeownirSemver.satisfies(top.version, matchRange));
+            if (!satisfied && job.from !== '<root>' && top.version !== res.version) {
+              const baseRel = job.nestedDir
+                ? job.nestedDir + '/node_modules/' + installName
+                : 'node_modules/' + job.from + '/node_modules/' + installName;
+              if (!nested.has(baseRel) && nested.size < NESTED_CAP && nestDepthOf(baseRel) <= NEST_DEPTH_LIMIT) {
+                if (totalSoFar >= INSTALL_BUDGET.packagesPerInstall) {
+                  fatalError = new Error('Dependency graph exceeds ' + INSTALL_BUDGET.packagesPerInstall + ' packages.');
+                  pump(); return;
+                }
+                nested.set(baseRel, {
+                  installRel: baseRel,
+                  base: '/project/' + baseRel,
+                  name: installName,
+                  realName: res.realName,
+                  version: res.version,
+                  dist: rec.dist,
+                  integrity: computeIntegrity(rec.dist),
+                  dev: job.dev,
+                  dependencies: rec.dependencies || {},
+                  bin: rec.bin || null
+                });
+                for (const [dep, depRange] of Object.entries(rec.dependencies || {})) {
+                  if (Object.prototype.hasOwnProperty.call(rec.optionalDependencies || {}, dep)) continue;
+                  queue.push({ name: dep, range: depRange, from: installName, nestedDir: baseRel, dev: job.dev, depth: job.depth + 1, soft: false });
+                }
+              }
+            }
+            pump();
+            return;
+          }
+          if (totalSoFar >= INSTALL_BUDGET.packagesPerInstall) {
+            fatalError = new Error('Dependency graph exceeds ' + INSTALL_BUDGET.packagesPerInstall + ' packages.');
+            pump(); return;
+          }
+          const installRel = 'node_modules/' + installName;
+          hoisted.set(installName, {
+            installRel,
+            base: '/project/' + installRel,
+            name: installName,
+            realName: res.realName,
+            version: res.version,
+            dist: rec.dist,
+            integrity: computeIntegrity(rec.dist),
+            dev: job.dev,
+            dependencies: rec.dependencies || {},
+            bin: rec.bin || null
+          });
+          for (const [dep, depRange] of Object.entries(rec.dependencies || {})) {
+            if (Object.prototype.hasOwnProperty.call(rec.optionalDependencies || {}, dep)) continue;
+            queue.push({ name: dep, range: depRange, from: installName, nestedDir: null, dev: job.dev, depth: job.depth + 1, soft: false });
+          }
+          for (const [dep, depRange] of Object.entries({ ...(rec.optionalDependencies || {}), ...requiredPeers(rec) })) {
+            if (!hoisted.has(dep)) softQueue.push({ name: dep, range: depRange, from: installName, nestedDir: null, dev: job.dev, depth: job.depth + 1, soft: true });
+          }
+          if (!noWasmFallback && installName === 'next' && !hoisted.has('@next/swc-wasm-nodejs')) {
+            const verParts = String(res.version || '').split('.');
+            const swcRange = verParts.length >= 2 ? '^' + verParts[0] + '.' + verParts[1] + '.0' : 'latest';
+            softQueue.push({ name: '@next/swc-wasm-nodejs', range: swcRange, from: 'next', nestedDir: null, dev: job.dev, depth: job.depth + 1, soft: true });
+          }
+          pump();
+        }).catch(err => {
+          active--;
+          if (!job.soft) hardActive--;
+          if (!job.soft && !fatalError) fatalError = err;
+          pump();
+        });
+      }
+      if (active === 0 && (fatalError || (queue.length === 0 && softQueue.length === 0))) finish();
+    };
+    pump();
+  });
+
+  const nodes = [...hoisted.values(), ...nested.values()];
+  return { nodes, localNodes, substitutions };
+}
+async function executeParallelPackageInstalls(jobs, { verifyVersion = true } = {}) {
+  const planMap = new Map();
+  for (const job of jobs) planMap.set(job.base, job);
+
+  const reused = [];
+  const toInstall = [];
+  const targetDirs = new Set(jobs.map(j => j.base));
+  const prefix = '/project/node_modules/';
+
+  // Remove stale or mismatched installed directories incrementally.
+  const staleBases = [];
+  for (const fsPath of Object.keys(FS)) {
+    if (!fsPath.startsWith(prefix) || !fsPath.endsWith('/.beownir-package.json')) continue;
+    const base = fsPath.slice(0, -'/.beownir-package.json'.length);
+    const wanted = planMap.get(base);
+    if (!wanted) { staleBases.push(base); continue; }
+    try {
+      const receipt = JSON.parse(readFileSync(fsPath, 'utf8'));
+      const rec = packageRecord(base);
+      if (!rec || rec.version !== wanted.version || receipt.integrity !== wanted.integrity || (rec.name !== (wanted.realName || wanted.name))) {
+        staleBases.push(base);
+      } else {
+        reused.push(wanted);
+      }
+    } catch {
+      staleBases.push(base);
+    }
+  }
+  for (let i = 0; i < staleBases.length; i++) {
+    if (typeof rmrf === 'function') rmrf(staleBases[i]);
+  }
+  if (typeof rmrf === 'function') rmrf('/project/node_modules/.bin');
+
+  const reusedSet = new Set(reused.map(r => r.base));
+  for (const job of jobs) {
+    if (reusedSet.has(job.base)) continue;
+    toInstall.push(job);
+  }
+  installReused = reused.length;
+
+  const finalizeNode = (job, integrity) => {
+    const actual = packageRecord(job.base);
+    const expectedName = job.realName || job.name;
+    if (verifyVersion && (actual?.name !== expectedName || actual?.version !== job.version)) {
+      throw new Error('Package metadata mismatch: ' + job.name + '@' + job.version);
+    }
+    if (!verifyVersion && actual?.version !== job.version) {
+      throw new Error('Locked package version mismatch: ' + job.installRel);
+    }
+    writeFileSync(job.base + '/.beownir-package.json', JSON.stringify({ resolved: job.dist.tarball, integrity, dev: !!job.dev }));
+    linkPackageBins(job.base, actual || { name: expectedName, bin: job.bin });
+    installCount++;
+    if (installBytes > INSTALL_BUDGET.totalBytes) {
+      throw new Error(budgetMessage('the dependency graph is larger than ' + Math.round(INSTALL_BUDGET.totalBytes / 1024 / 1024) + ' MiB unpacked', (installBytes / 1024 / 1024).toFixed(0) + ' MiB written'));
+    }
+    post({ type: 'pkgdone', name: job.name, version: job.version });
+  };
+
+  for (let i = 0; i < reused.length; i++) {
+    const job = reused[i];
+    const rec = packageRecord(job.base);
+    linkPackageBins(job.base, rec);
+    installCount++;
+  }
+
+  // First try in-memory LRU cache hits instantly.
+  const needDownload = [];
+  for (const job of toInstall) {
+    const integrity = computeIntegrity(job.dist);
+    const cacheKey = integrity + '\0' + job.dist.tarball;
+    if (writeFromExtractCache(job.base, cacheKey) !== null) {
+      out('  \x1b[90m⚡\x1b[0m ' + job.name + '@' + job.version + ' (cached)\n');
+      finalizeNode(job, integrity);
+    } else {
+      needDownload.push(job);
+    }
+  }
+
+  const batchEligible = [];
+  const streamEligible = [];
+  const canUseSabPool = typeof kernelCall === 'function' && REG.startsWith('https://');
+  for (const job of needDownload) {
+    const unpacked = Number(job.dist.unpackedSize);
+    const tarballUrl = String(job.dist.tarball || '');
+    if (canUseSabPool && tarballUrl.startsWith(REG + '/') && (!Number.isFinite(unpacked) || unpacked <= INSTALL_BUDGET.sabMaxUnpackedBytes)) {
+      batchEligible.push(job);
+    } else {
+      streamEligible.push(job);
+    }
+  }
+
+  if (batchEligible.length >= 2) {
+    for (let startIdx = 0; startIdx < batchEligible.length; startIdx += INSTALL_BUDGET.sabBatchSize) {
+      const chunk = batchEligible.slice(startIdx, startIdx + INSTALL_BUDGET.sabBatchSize);
+      for (const job of chunk) out('  \x1b[90m↓\x1b[0m ' + job.name + '@' + job.version + '\n');
+      let batchResult;
+      try {
+        batchResult = await kernelCall('npm-extract-batch', {
+          origin: REG,
+          jobs: chunk.map((job, idx) => ({
+            idx,
+            tarball: job.dist.tarball,
+            integrity: computeIntegrity(job.dist),
+            maxTarballBytes: INSTALL_BUDGET.tarballBytes,
+            maxExpandedBytes: INSTALL_BUDGET.packageBytes,
+            maxEntryBytes: INSTALL_BUDGET.entryBytes,
+            maxEntries: INSTALL_BUDGET.filesPerPackage,
+            attempts: INSTALL_BUDGET.attempts,
+            idleTimeoutMs: INSTALL_BUDGET.idleTimeoutMs
+          }))
+        });
+      } catch (err) {
+        if (err && (err.code === 'ENOSYS' || /unavailable|Worker/i.test(String(err.message || '')))) {
+          streamEligible.push(...batchEligible.slice(startIdx));
+          break;
+        }
+        throw err;
+      }
+      const returned = (batchResult && batchResult.results) || [];
+      for (let r = 0; r < returned.length; r++) {
+        const item = returned[r];
+        const job = chunk[item.idx];
+        const integrity = computeIntegrity(job.dist);
+        const cacheKey = integrity + '\0' + job.dist.tarball;
+        writeBnpkToVfs(job.base, item.packBuffer, cacheKey);
+        finalizeNode(job, integrity);
+        post({ type: 'pkgprogress', name: job.name, version: job.version, received: item.bytes, total: item.bytes });
+      }
+    }
+  } else if (batchEligible.length === 1) {
+    streamEligible.push(batchEligible[0]);
+  }
+
+  if (streamEligible.length) {
+    let cursor = 0;
+    const workerCount = Math.min(INSTALL_BUDGET.installConcurrency, streamEligible.length);
+    const worker = async () => {
+      while (cursor < streamEligible.length) {
+        const job = streamEligible[cursor++];
+        out('  \x1b[90m↓\x1b[0m ' + job.name + '@' + job.version + '\n');
+        if (typeof rmrf === 'function') rmrf(job.base);
+        let lastPost = 0;
+        const integrity = await extractPackage(job.base, job.dist, {
+          skipCache: true,
+          onProgress: (received, total) => {
+            const now = performance.now();
+            if (now - lastPost < 250 && (!total || received < total)) return;
+            lastPost = now;
+            post({ type: 'pkgprogress', name: job.name, version: job.version, received, total: total || 0 });
+          }
+        });
+        finalizeNode(job, integrity);
+      }
+    };
+    await Promise.all(Array.from({ length: workerCount }, worker));
   }
 }
 function collectLock(pkg) {
@@ -12917,19 +13571,19 @@ async function installPkg(name, range, root, dev = false, depth = 0) {
   if (packageRecord(base)?.version === version) return version;
   installCount++;
   out('  \x1b[90m↓\x1b[0m ' + name + '@' + version + '\n');
-  rmrf(base);
-  let lastPost = 0, lastBytes = 0;
+  if (typeof rmrf === 'function') rmrf(base);
+  let lastPost = 0;
   const integrity = await extractPackage(base, rec.dist, {
     onProgress: (received, total) => {
       const now = performance.now();
-      // Unknown total (segmented browser downloads): throttle by time only.
       if (now - lastPost < 250 && (!total || received < total)) return;
-      lastPost = now; lastBytes = received;
+      lastPost = now;
       post({ type: 'pkgprogress', name, version, received, total: total || 0 });
     }
   });
   const actual = packageRecord(base); if (actual?.name !== name || actual?.version !== version) throw new Error('Package metadata mismatch: ' + name + '@' + version);
   writeFileSync(base + '/.beownir-package.json', JSON.stringify({ resolved: rec.dist.tarball, integrity, dev }));
+  linkPackageBins(base, actual);
   if (installBytes > INSTALL_BUDGET.totalBytes) throw new Error(budgetMessage('the dependency graph is larger than ' + Math.round(INSTALL_BUDGET.totalBytes / 1024 / 1024) + ' MiB unpacked', (installBytes / 1024 / 1024).toFixed(0) + ' MiB written'));
   for (const [dependency, spec] of Object.entries(rec.dependencies || {})) {
     if (Object.prototype.hasOwnProperty.call(rec.optionalDependencies || {}, dependency)) continue;
@@ -12951,39 +13605,69 @@ async function installTransaction(task) {
   }
   finally { holdSync--; syncBack(); }
 }
-const IGNORED_INSTALL_FLAGS = new Set(['-D', '--save-dev', '-d', '--dev', '--save', '--save-exact', '-E', '--exact', '--ignore-scripts', '--ignore-engines', '--non-interactive', '--no-lockfile', '--no-save', '--no-audit', '--no-fund', '--no-package-lock', '--legacy-peer-deps', '--force', '--prefer-offline', '--omit=dev', '--production', '--progress=false', '--frozen-lockfile', '--no-frozen-lockfile', '--prefer-frozen-lockfile', '--shamefully-hoist', '--offline', '--silent', '-s', '--reporter=silent']);
-async function npmInstall(args) {
+const IGNORED_INSTALL_FLAGS = new Set(['-D', '--save-dev', '-d', '--dev', '--save', '--save-exact', '-E', '--exact', '--ignore-scripts', '--ignore-engines', '--non-interactive', '--no-lockfile', '--no-save', '--no-audit', '--no-fund', '--no-package-lock', '--legacy-peer-deps', '--force', '--prefer-offline', '--omit=dev', '--production', '--progress=false', '--frozen-lockfile', '--no-frozen-lockfile', '--prefer-frozen-lockfile', '--shamefully-hoist', '--offline', '--silent', '-s', '--reporter=silent', '--no-wasm-fallback']);
+async function npmInstall(args = []) {
   const __prof = typeof profilerBegin === 'function' ? profilerBegin('npm.install', 'packages', { args: args.slice(0, 6).join(' ') }) : null;
   try {
-  return await installTransaction(async () => {
-    const path = '/project/package.json';
-    const pkg = FS[path] ? JSON.parse(readFileSync(path, 'utf8')) : { name: 'app', version: '1.0.0', scripts: {}, dependencies: {} };
-    const dev = args.includes('-D') || args.includes('--save-dev') || args.includes('-d') || args.includes('--dev');
-    const exact = args.includes('--save-exact') || args.includes('-E') || args.includes('--exact');
-    for (const flag of args.filter(x => x.startsWith('-'))) if (!IGNORED_INSTALL_FLAGS.has(flag)) throw new Error('Unsupported install flag: ' + flag);
-    const explicit = args.filter(x => !x.startsWith('-'));
-    for (const spec of explicit) {
-      const at = spec.lastIndexOf('@'), name = at > 0 ? spec.slice(0, at) : spec, range = at > 0 ? spec.slice(at + 1) : 'latest';
-      if (!validPackageName(name)) throw new Error('Invalid package name: ' + name);
-      const meta = await fetchMeta(name), version = pickVersion(meta, range), field = dev ? 'devDependencies' : 'dependencies';
-      pkg[field] ||= {}; pkg[field][name] = exact ? version : (range === 'latest' || range === '*' ? '^' + version : range);
-      const other = dev ? 'dependencies' : 'devDependencies'; if (pkg[other]) delete pkg[other][name];
-    }
-    const declared = Object.entries({ ...pkg.dependencies, ...pkg.devDependencies });
-    reservedRoots = new Set(declared.map(([name]) => name)); installCount = 0; installBytes = 0; installRangeFallbacks = 0;
-    const start = performance.now();
-    out('\x1b[36mRegistry install\x1b[0m · streamed packets · SHA-512 verified · install hooks disabled\n');
-    // Rebuild the graph transactionally. Updating a hoisted package must not break another
-    // package that still requires the old version. Browser HTTP caching reuses tarballs.
-    rmrf('/project/node_modules');
-    for (const [name, range] of declared) await installPkg(name, range, '/project', Object.prototype.hasOwnProperty.call(pkg.devDependencies || {}, name));
-    writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
-    writeFileSync('/project/package-lock.json', JSON.stringify(collectLock(pkg), null, 2) + '\n');
-    out('\x1b[32m✓\x1b[0m ' + installCount + ' package(s), ' + (installBytes / 1024 / 1024).toFixed(1) + ' MiB unpacked, in ' + ((performance.now() - start) / 1000).toFixed(1) + 's.'
-      + (installRangeFallbacks ? ' ' + installRangeFallbacks + ' tarball(s) fell back to a single stream because the registry ignored byte ranges.' : ' Downloaded as parallel byte ranges (packets).')
-      + ' Optional/peer dependencies are not auto-installed. Use npm ci to restore exact locked versions.\n');
-    post({ type: 'pkgprogress', done: true, packages: installCount, bytes: installBytes });
-  }).then(() => { scheduleDependencyCheckpoint(); });
+    return await installTransaction(async () => {
+      const path = '/project/package.json';
+      const pkg = FS[path] ? JSON.parse(readFileSync(path, 'utf8')) : { name: 'app', version: '1.0.0', scripts: {}, dependencies: {} };
+      const dev = args.includes('-D') || args.includes('--save-dev') || args.includes('-d') || args.includes('--dev');
+      const exact = args.includes('--save-exact') || args.includes('-E') || args.includes('--exact');
+      const omitDev = args.includes('--omit=dev') || args.includes('--production');
+      const noWasmFallback = args.includes('--no-wasm-fallback');
+      for (const flag of args.filter(x => x.startsWith('-'))) if (!IGNORED_INSTALL_FLAGS.has(flag)) throw new Error('Unsupported install flag: ' + flag);
+      const explicit = args.filter(x => !x.startsWith('-'));
+      for (const spec of explicit) {
+        const parsed = splitPackageSpec(spec);
+        const name = parsed.name, range = parsed.range;
+        if (!validPackageName(name)) throw new Error('Invalid package name: ' + name);
+        const aliasSpec = parseNpmAliasSpec(range);
+        if (aliasSpec) {
+          const meta = await fetchMeta(aliasSpec.name), version = pickVersion(meta, aliasSpec.range), field = dev ? 'devDependencies' : 'dependencies';
+          pkg[field] ||= {}; pkg[field][name] = exact ? 'npm:' + aliasSpec.name + '@' + version : range;
+        } else {
+          const subRule = !noWasmFallback && Object.prototype.hasOwnProperty.call(NATIVE_PKG_SUBSTITUTIONS, name) ? NATIVE_PKG_SUBSTITUTIONS[name] : null;
+          let meta = await tryFetchMeta(name);
+          if (!meta && !subRule) meta = await fetchMeta(name);
+          if (meta) {
+            const version = pickVersion(meta, range), field = dev ? 'devDependencies' : 'dependencies';
+            pkg[field] ||= {}; pkg[field][name] = exact ? version : (range === 'latest' || range === '*' ? '^' + version : range);
+          } else {
+            const altMeta = await fetchMeta(subRule.alt);
+            const altVersion = pickVersion(altMeta, subRule.range), field = dev ? 'devDependencies' : 'dependencies';
+            pkg[field] ||= {}; pkg[field][name] = '^' + altVersion;
+          }
+        }
+        const other = dev ? 'dependencies' : 'devDependencies'; if (pkg[other]) delete pkg[other][name];
+      }
+      const roots = [];
+      for (const [name, range] of Object.entries(pkg.dependencies || {})) roots.push({ name, range, dev: false });
+      if (!omitDev) for (const [name, range] of Object.entries(pkg.devDependencies || {})) roots.push({ name, range, dev: true });
+      reservedRoots = new Set(roots.map(r => r.name));
+      installCount = 0; installBytes = 0; installReused = 0; installRangeFallbacks = 0;
+      const start = performance.now();
+      out('\x1b[36mRegistry install\x1b[0m · parallel BFS & workers · SHA-512 verified · install hooks disabled\n');
+      const plan = await resolveInstallPlan(roots, pkg, { noWasmFallback });
+      await executeParallelPackageInstalls(plan.nodes, { verifyVersion: true });
+      for (const loc of plan.localNodes) {
+        if (typeof rmrf === 'function') rmrf(loc.base);
+        copyLocalPackageDir(loc.dir, loc.base);
+        const rec = packageRecord(loc.base);
+        if (rec) linkPackageBins(loc.base, rec);
+        installCount++;
+      }
+      for (const sub of plan.substitutions) {
+        writeSubstitutionBridge(sub.orig, sub.alt, sub.version);
+        out('  \x1b[36m↳\x1b[0m Substituted browser-compatible ' + sub.alt + '@' + sub.version + ' for native package ' + sub.orig + '\n');
+      }
+      writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+      writeFileSync('/project/package-lock.json', JSON.stringify(collectLock(pkg), null, 2) + '\n');
+      const reuseMsg = installReused ? ' (' + installReused + ' reused unchanged)' : '';
+      const modeMsg = installRangeFallbacks ? ' ' + installRangeFallbacks + ' tarball(s) fell back to a single stream because the registry ignored byte ranges.' : ' Parallel verified downloads complete.';
+      out('\x1b[32m✓\x1b[0m ' + installCount + ' package(s)' + reuseMsg + ', ' + (installBytes / 1024 / 1024).toFixed(1) + ' MiB unpacked, in ' + ((performance.now() - start) / 1000).toFixed(1) + 's.' + modeMsg + '\n');
+      post({ type: 'pkgprogress', done: true, packages: installCount, bytes: installBytes });
+    }).then(() => { scheduleDependencyCheckpoint(); });
   } finally {
     if (__prof && typeof profilerEnd === 'function') profilerEnd(__prof, { packages: installCount, bytes: installBytes });
   }
@@ -13007,16 +13691,33 @@ async function npmCi(args = []) {
       const a = pkg[field] || {}, b = lock.packages[''][field] || {};
       if (Object.keys(a).length !== Object.keys(b).length || Object.keys(a).some(k => a[k] !== b[k])) throw new Error('package.json and package-lock.json disagree. Run npm install.');
     }
-    const entries = Object.entries(lock.packages).filter(([p, r]) => p && !r.optional && !(args.includes('--omit=dev') && r.dev));
+    const entries = Object.entries(lock.packages).filter(([p, r]) => p && !r.optional && !((args.includes('--omit=dev') || args.includes('--production')) && r.dev));
     if (entries.length > INSTALL_BUDGET.packagesPerInstall) throw new Error('Lockfile exceeds the ' + INSTALL_BUDGET.packagesPerInstall + ' package limit.');
     for (const [path, rec] of entries) { validateLockPath(path); if (rec.link || !rec.version || !rec.resolved || !rec.integrity) throw new Error('Unsupported or unverifiable locked package: ' + path); }
-    rmrf('/project/node_modules');
-    installBytes = 0;
-    for (const [path, rec] of entries) {
-      out('  ↓ ' + path + '@' + rec.version + '\n');
-      const integrity = await extractPackage('/project/' + path, { tarball: rec.resolved, integrity: rec.integrity });
-      if (packageRecord('/project/' + path)?.version !== rec.version) throw new Error('Locked package version mismatch: ' + path);
-      writeFileSync('/project/' + path + '/.beownir-package.json', JSON.stringify({ resolved: rec.resolved, integrity, dev: !!rec.dev }));
+    if (typeof rmrf === 'function') rmrf('/project/node_modules');
+    installCount = 0; installBytes = 0; installReused = 0; installRangeFallbacks = 0;
+    const jobs = entries.map(([lockPath, rec]) => {
+      const tailIdx = lockPath.lastIndexOf('node_modules/');
+      const name = tailIdx >= 0 ? lockPath.slice(tailIdx + 'node_modules/'.length) : lockPath;
+      return {
+        installRel: lockPath,
+        base: '/project/' + lockPath,
+        name,
+        realName: name,
+        version: rec.version,
+        dist: { tarball: rec.resolved, integrity: rec.integrity },
+        integrity: rec.integrity,
+        dev: !!rec.dev,
+        bin: null
+      };
+    });
+    await executeParallelPackageInstalls(jobs, { verifyVersion: false });
+    const declaredAll = { ...pkg.dependencies, ...pkg.devDependencies };
+    for (const [orig, rule] of Object.entries(NATIVE_PKG_SUBSTITUTIONS)) {
+      if (Object.prototype.hasOwnProperty.call(declaredAll, orig) && !FS['/project/node_modules/' + orig] && FS['/project/node_modules/' + rule.alt]) {
+        const altRec = packageRecord('/project/node_modules/' + rule.alt);
+        writeSubstitutionBridge(orig, rule.alt, altRec?.version);
+      }
     }
     out('\x1b[32m✓\x1b[0m Restored ' + entries.length + ' locked packages (' + (installBytes / 1024 / 1024).toFixed(1) + ' MiB). Lifecycle scripts disabled.\n');
   }).then(() => { scheduleDependencyCheckpoint(); });
@@ -13614,6 +14315,35 @@ async function executeStage(line, stderrRedirect) {
   }
 }
 
+function resolveLocalBin(rawArg, command) {
+  const candidates = [];
+  if (typeof rawArg === 'string' && rawArg.includes('/')) {
+    candidates.push(resolve(expandPath(rawArg)));
+  } else if (command && !String(command).includes('/') && !/[\\\x00-\x1f]/.test(command)) {
+    let dir = CWD || '/project';
+    while (dir && dir.startsWith('/project')) {
+      candidates.push(normalize(dir + '/node_modules/.bin/' + command));
+      if (dir === '/project') break;
+      dir = dirname(dir);
+    }
+    if (!CWD || !CWD.startsWith('/project')) candidates.push(normalize('/project/node_modules/.bin/' + command));
+  }
+  for (let i = 0; i < candidates.length; i++) {
+    const binPath = candidates[i];
+    const entry = FS[binPath];
+    if (!entry || entry.d || entry.dangling) continue;
+    let target = binPath;
+    if (typeof entry.link === 'string') {
+      target = normalize(dirname(binPath) + '/' + entry.link);
+    } else if (typeof entry.c === 'string') {
+      const m = /^#!\/bin\/sh\s*\nexec\s+node\s+"([^"]+)"/.exec(entry.c);
+      if (m && m[1]) target = normalize(m[1]);
+    }
+    if (FS[target] && !FS[target].d) return { binPath, target };
+  }
+  return null;
+}
+
 async function executeCommand(input) {
   const argv = typeof input === 'string' ? splitArgs(input) : input;
   if (!argv.length || !argv[0]) return 0;
@@ -14075,6 +14805,8 @@ async function executeCommand(input) {
       const known = ['node', 'npm', 'pnpm', 'yarn', 'bun', 'bunx', 'npx', 'esbuild'];
       if (!args[0]) throw new Error('Usage: ' + USAGE.which);
       if (known.includes(args[0])) { out('/usr/bin/' + args[0] + ' (virtual)\n'); return 0; }
+      const localBin = resolveLocalBin(args[0], String(args[0]).split('/').pop());
+      if (localBin) { out(localBin.binPath + '\n'); return 0; }
       errOut(args[0] + ': not found\n');
       return 1;
     }
@@ -14173,6 +14905,8 @@ async function executeCommand(input) {
       return code;
     }
     default: {
+      const localBin = resolveLocalBin(argv[0], command);
+      if (localBin) return runNode([localBin.target, ...args]);
       const candidates = Object.keys(USAGE).concat(['help', 'clear', 'history', 'true', 'false', 'node', 'npm']);
       const suggestion = candidates.find(name => name.startsWith(command.slice(0, 2)));
       throw new Error('Unknown command: ' + command + (suggestion && suggestion !== command ? '. Did you mean ' + suggestion + '?' : '') + '. Type help for the command list.');
@@ -14658,6 +15392,8 @@ async function runNpx(args) {
     if (rest.includes('build') || rest.includes('--watch')) throw new Error('The preview adapter is not Vite itself and does not implement Vite build/HMR/plugins. Install Vite to use its real CLI, or use npx esbuild for a build.');
     devServer(tool, rest); return 0;
   }
+  const directBin = resolveLocalBin(tool, requestedName);
+  if (directBin) return runNode([directBin.target, ...rest]);
   if (!validPackageName(tool)) throw new Error('Usage: npx <installed-package> [args]. No implicit remote execution.');
   let pkg = packageRecord('/project/node_modules/' + tool);
   /* `npx svelte-kit`, `npx nest`: the requested name is a bin that belongs to
@@ -14682,17 +15418,19 @@ async function runNpx(args) {
   if (!path.startsWith('/project/node_modules/' + tool + '/')) throw new Error('Invalid package CLI path.');
   return runNode([path, ...rest]);
 }
-const NPM_HELP = `Beownir registry client — a subset, not the native npm program
-  npm install [name@range] [-D] [--save-exact]
+const NPM_HELP = `Beownir registry client — a browser-native subset, not the native npm binary
+  npm install [name@range] [-D] [--save-exact] [--no-wasm-fallback]
   npm ci [--omit=dev]         restore an integrity-checked v2/v3 lockfile
-  npm run <script>           run an explicit project script (pre/post supported)
+  npm run <script>           run a package.json script (auto-resolves node_modules/.bin)
   npm start | dev | build | test
   npm uninstall <name> | ls | view <name> | init
   npx esbuild <entry> --bundle --outfile=dist/app.js
   npx vite build [options]   installed Vite 6 API + WASM Rollup/esbuild (bounded CLI subset)
   npx serve [--port 5173]     lightweight virtual preview adapter
-Registry only. Install lifecycle scripts, optional/automatic peer dependencies,
-git/file/URL aliases, native executables, and native .node addons are unsupported.
+  npx <bin> [args]           run any installed node_modules/.bin CLI directly
+Supports npm:, workspace:, file:, and link: protocols plus package overrides/resolutions,
+concurrent dependency resolution, hoisted node_modules, and JS/WASM native fallbacks.
+Install lifecycle scripts (postinstall), git URLs, and raw native .node binaries are unsupported.
 `;
 
 let esbuildApiPromise = null;
@@ -14804,14 +15542,14 @@ child_process.spawn/exec/execFile/fork use separate Workers (8 processes max).
 Async fs calls share the broker; sync fs reads use per-process snapshots.
 Use await process.virtualOS.flush()/refresh() for explicit file barriers.
 Network is limited to the npm registry; CORS and browser limits still apply.
-npm install streams every tarball as parallel byte ranges ("packets") with
-resume and per-package retries, so large packages such as next install without
-a single-response size limit. node_modules never enters the source workspace;
-it is restored from a compressed dependency checkpoint after a reload.
+npm install resolves the dependency tree in parallel with hoisted node_modules,
+metadata/tarball caching and multi-worker extraction (falling back to packeted
+range streaming for large packages). node_modules stays out of source saves and
+is restored from compressed dependency checkpoints after a reload.
 The lightweight serve adapter uses live reload (no HMR) and preserves scroll,
 form values and focus. Installed Vite 6 has a bounded Node-API path for builds
 and virtual dev/HMR tests; arbitrary CLI options and plugins are not supported.
-worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); spawnSync/execFileSync run via SharedArrayBuffer + Atomics.wait when isolated. Virtual loopback TCP/UDP/TLS/HTTP/HTTP2/WebSockets (net, dgram, tls, https, http2, WASI sockets) run inside the runtime; no native OS binaries, raw external non-HTTP sockets, unmapped native addons, or full Next.js/Nuxt CLIs without three-origin WASIX hosting.
+worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); spawnSync/execFileSync run via SharedArrayBuffer + Atomics.wait when isolated. Virtual loopback TCP/UDP/TLS/HTTP/HTTP2/WebSockets (net, dgram, tls, https, http2, WASI sockets) run 100% inside the browser; native OS binaries, unfiltered raw external sockets, and unmapped native .node addons without JS/WASM fallbacks are not supported.
 `;
 post({type:'boot'});
 

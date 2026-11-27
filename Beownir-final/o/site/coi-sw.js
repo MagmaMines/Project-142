@@ -2,7 +2,7 @@
  *
  * One worker per scope, so this file does both jobs:
  *   1. injects COOP/COEP/CORP so the page becomes cross-origin isolated on any
- *      static host (needed for SharedArrayBuffer, JSPI and the WASIX profile);
+ *      static host (unlocking SharedArrayBuffer, Atomics, worker_threads, and parallel tarball extraction);
  *   2. caches the single-file shell so the IDE still boots with no network.
  *
  * It deliberately does not touch the npm registry: package downloads are the

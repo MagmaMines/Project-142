@@ -5,21 +5,18 @@
  *   node tools/check.mjs [--skip-assets]
  *
  * Checks:
- *   1. the embedded host + install kit match their source files
+ *   1. the embedded runtime, frame kernel, preview bridge, install kit, and SW match their source files
  *   2. every <script> block parses (node --check) and closes properly
  *   3. every `$('#id')` lookup points at an element that exists
  *   4. every DOM id is unique
- *   5. the native runtime asset pack is valid: base64 -> gzip -> sha256
- *   6. the shipped bundle uses no language feature newer than the browser floor
- *   7. the document keeps its required single-file anchors
- *   8. the headless embed bundle (o/embed/beownir-kernel.js) is current and
+ *   5. the shipped bundle uses no language feature newer than the browser floor
+ *   6. the document keeps its required single-file anchors
+ *   7. the headless embed bundle (o/embed/beownir-kernel.js) is current and
  *      its client code respects the same browser floor
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import zlib from 'node:zlib';
-import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { staleSources, SOURCES } from './sync-embedded.mjs';
@@ -33,7 +30,7 @@ const fail = message => failures.push(message);
 const html = fs.readFileSync(appPath, 'utf8');
 
 /* 1. embedded sources: the worker runtime, frame kernel, preview bridge, kit
- *    and host are real files under o/ and the HTML must carry them verbatim. */
+ *    and coi-sw live under o/ and the HTML must carry them verbatim. */
 const stale = staleSources(html, {});
 if (stale.length) for (const problem of stale) fail(problem + ': run `node tools/sync-embedded.mjs`');
 else notes.push('embedded sources match their files (' + SOURCES.filter(source => source.id).length + ' blocks)');
@@ -56,7 +53,7 @@ let parsed = 0;
 for (const [index, script] of scripts.entries()) {
   const type = typeOf(script.attrs);
   if (type !== 'text/javascript' && type !== 'module' && type !== 'text/plain' && !type.startsWith('application/')) continue;
-  const isCode = type === 'text/javascript' || type === 'module' || (type === 'text/plain' && /id="(?:runtimeSource|beownirHostSource)"/.test(script.attrs));
+  const isCode = type === 'text/javascript' || type === 'module' || (type === 'text/plain' && /id="(?:runtimeSource|runtimeFrameSource|previewBridgeSource|coiServiceWorkerSource)"/.test(script.attrs));
   if (!isCode) continue;
   const file = path.join(dir, 'block-' + index + (type === 'module' ? '.mjs' : '.js'));
   fs.writeFileSync(file, script.body);
@@ -81,41 +78,7 @@ const missing = lookups.filter(id => !elementIds.has(id));
 if (missing.length) fail('$() lookups without an element: ' + missing.join(', '));
 else notes.push(lookups.length + ' element lookups resolve');
 
-/* 5. native asset pack */
-if (!process.argv.includes('--skip-assets')) {
-  const pack = /<script id="beownir-native-assets" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
-  if (!pack) fail('native asset pack is missing');
-  else {
-    let json;
-    try { json = JSON.parse(pack[1]); } catch (error) { fail('native asset pack is not valid JSON: ' + error.message); }
-    if (json) {
-      let total = 0, assets = 0;
-      for (const [name, entry] of Object.entries(json)) {
-        if (!name.startsWith('/') || name.includes('..')) { fail('bad asset path ' + name); continue; }
-        if (typeof entry.base64 !== 'string' || typeof entry.sha256 !== 'string') { fail('asset ' + name + ' has no base64/sha256'); continue; }
-        let bytes;
-        try { bytes = zlib.gunzipSync(Buffer.from(entry.base64, 'base64'), { maxOutputLength: 16 * 1024 * 1024 }); }
-        catch (error) { fail('asset ' + name + ' does not decompress: ' + error.message); continue; }
-        const digest = crypto.createHash('sha256').update(bytes).digest('hex');
-        if (digest !== entry.sha256) fail('asset ' + name + ' hash mismatch');
-        total += bytes.length; assets++;
-      }
-      notes.push(assets + ' native assets verified (' + (total / 1048576).toFixed(1) + ' MiB)');
-    }
-  }
-}
-
-/* 6. the browser-WASM runtime sources match the embedded pack */
-try {
-  const { diffAssets } = await import('./native-assets.mjs');
-  const problems = diffAssets(html);
-  if (problems.length) for (const problem of problems) fail(problem + ' (run node tools/native-assets.mjs --extract or --embed)');
-  else notes.push('native runtime sources match o/native/');
-} catch (error) {
-  fail('native asset check failed: ' + error.message);
-}
-
-/* 7. browser floor.
+/* 5. browser floor.
  * The app is shipped as one modern-JS document with no transpile step, so a
  * language or platform feature newer than the stated floor can only fail in
  * someone else's browser. Everything below is *unguarded* use of a feature:
@@ -179,13 +142,13 @@ if (floorOffences.length) {
 } else {
   notes.push('browser floor: Chrome ' + FLOOR.chrome + '+ / Firefox ' + FLOOR.firefox + '+ / Safari ' + FLOOR.safari + '+ language features only');
 }
-/* 8. single-file anchors */
-for (const anchor of ['<!--BEOWNIR_HOST_CONFIG-->', '<meta name="beownir-origins"', 'id="runtimeSource"', 'id="runtimeFrameSource"', 'id="previewBridgeSource"', 'id="pakoSource"']) {
+/* 6. single-file anchors */
+for (const anchor of ['id="runtimeSource"', 'id="runtimeFrameSource"', 'id="previewBridgeSource"', 'id="coiServiceWorkerSource"', 'id="pakoSource"']) {
   if (!html.includes(anchor)) fail('missing anchor: ' + anchor);
 }
 notes.push((html.length / 1024 / 1024).toFixed(2) + ' MiB single file');
 
-/* 9. headless embed bundle. Third-party pages load o/embed/beownir-kernel.js
+/* 7. headless embed bundle. Third-party pages load o/embed/beownir-kernel.js
  *    instead of the IDE, so it is a shipped surface: it must exist, match the
  *    app's embedded sources byte for byte (a stale copy would silently give a
  *    host an older runtime), and respect the same browser floor. */
@@ -200,18 +163,6 @@ try {
   else notes.push('embed client respects the browser floor');
 } catch (error) {
   fail('embed check failed: ' + error.message);
-}
-
-try {
-  const nativeBrowserDir = path.join(root, 'o', 'native');
-  const nativeMjsFiles = fs.readdirSync(nativeBrowserDir)
-    .filter(name => name.endsWith('.mjs'))
-    .map(name => fs.readFileSync(path.join(nativeBrowserDir, name), 'utf8'));
-  const nativeFloor = floorIn(nativeMjsFiles);
-  if (nativeFloor.length) fail('the native browser workers use features newer than the browser floor: ' + nativeFloor.join('; '));
-  else notes.push('native browser workers respect the browser floor (' + nativeMjsFiles.length + ' files)');
-} catch (error) {
-  fail('native browser floor check failed: ' + error.message);
 }
 
 for (const note of notes) console.log('  ok  ' + note);

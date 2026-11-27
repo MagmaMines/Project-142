@@ -1,20 +1,18 @@
 # Beownir
 
 A single-file browser IDE: editor, terminal, virtual filesystem, a Node-compatible
-worker runtime, streamed npm-compatible package installer, and virtual-HTTP live
-preview. The static-host mode follows the same broad browser-first pattern as
-NodePod: JavaScript executes in browser workers against a virtual filesystem and
-network adapters, not as an OS Node process. `beownir-standalone.html` opens a
-working, explicitly limited development environment without a project server;
-the separate WASIX profile is optional and has additional runtime-package and
-host requirements.
+worker runtime, concurrent npm-compatible package installer, and virtual-HTTP
+live preview. JavaScript executes 100% inside isolated browser Web Workers
+against a virtual filesystem and network adapters, with zero backend project
+execution or three-origin host required. `beownir-standalone.html` opens a
+complete working development environment directly in your browser.
 
 **First run** shows a "what works in this browser" card whose every line is
-probed live (cross-origin isolation, SharedArrayBuffer, JSPI, OPFS, service
-worker, host bridge) — the same list backs the "This device" tab in Help, so a
+probed live (cross-origin isolation, SharedArrayBuffer, OPFS, service worker,
+cross-tab SW bridge) — the same list backs the "This device" tab in Help, so a
 visitor never has to guess why a capability is missing.
 
-**Start here:** [INSTALL.md](INSTALL.md) (three launch paths) ·
+**Start here:** [INSTALL.md](INSTALL.md) (launch paths) ·
 [MIGRATION.md](MIGRATION.md) (upgrading, storage compatibility) ·
 [SINGLEFILE_BUILD_REPORT.md](SINGLEFILE_BUILD_REPORT.md) ·
 [NODE_COMPATIBILITY_REPORT.md](NODE_COMPATIBILITY_REPORT.md) ·
@@ -28,47 +26,41 @@ machine that runs it. They are snapshots, not marketing.
 `npm run release:candidate` packages the verified standalone HTML with a SHA-256
 file and a candidate-status notice. It intentionally does not publish anything:
 package metadata is still private/UNLICENSED, and commercialization requires the
-owner to resolve licensing and third-party redistribution rights and complete
-the remaining native Node/WASIX acceptance gates. See
-[WASIX_PRODUCT_ROADMAP.md](WASIX_PRODUCT_ROADMAP.md).
+owner to resolve licensing and third-party redistribution rights.
 
 ```
-beownir-standalone.html      the generated, self-verifying release artifact (9.04 MiB)
-o/site/index.html            the single-file app source (editor + runtime + host)
-o/native/                    extracted sources of every embedded runtime asset
+beownir-standalone.html      the generated, self-verifying single-file release artifact
+o/site/index.html            the single-file app source (editor + runtime)
+o/runtime/worker-runtime.js  Node-compatible Web Worker runtime + concurrent npm installer
 o/runtime/stream-kit.js      streaming install kit (SHA-512, tar, gzip, byte ranges)
-o/host/beownir-host.mjs      network-only Node host (IDE / runtime / preview origins)
+o/runtime/frame-kernel.js    virtual OS kernel + SAB worker-pool package extractor
+o/embed/beownir-kernel.js    drop-in headless embed bundle
 netlify.toml                 zero-config static deploy (publish = o/site, COOP/COEP)
-o/site/coi-sw.js             service worker: isolation headers + offline shell
-o/deploy/                    configure + check scripts for a static deployment
+o/site/coi-sw.js             service worker: isolation headers + offline shell + SW preview
 o/fixtures/                  starter projects
-test/                        Node test suite (installer, kit, host, tooling)
-tools/                       single-file sync + static checks
+test/                        Node test suite (installer, runtime, shell, CLI, crypto, DNS, build, tooling)
+tools/                       single-file sync + static checks + standalone build
 ```
 
 ## Quick start
 
 ```bash
-npm test          # 327 tests: installer, host, runtime, shell, CLI, crypto, DNS, polyfills, storage, deployment, standalone build and tooling
+npm test          # tests: installer, runtime, shell, CLI, crypto, DNS, polyfills, storage, deployment, standalone build and tooling
 npm run compat    # measured Node API coverage + the first missing exports per module
-npm run check     # static checks on the single file (scripts, ids, assets)
-npm run sync      # re-inline runtime sources + the host into o/site/index.html
-node tools/native-assets.mjs --extract   # refresh o/native/ from the HTML pack
-node tools/native-assets.mjs --embed     # write o/native/ back into the HTML pack
+npm run check     # static checks on the single file (scripts, ids, browser floor)
+npm run sync      # re-inline runtime sources + SW into o/site/index.html
 npm run verify    # sync --check, static checks, artifact --check, compat floor and the whole test suite
-npm run differential # 111 behaviours compared snippet-by-snippet with the running Node
+npm run differential # behaviours compared snippet-by-snippet with the running Node
 npm run build:standalone # build beownir-standalone.html
 npm run standalone:check # fail when the committed artifact is stale or tampered
 npm run standalone:smoke # boot the artifact on its own and run real commands
 npm run reports   # regenerate the five reports from measurements
 npm run release:candidate # build an integrity-checked internal bundle under dist/beownir-candidate
 npm run deploy:headers # verify o/site/_headers matches netlify.toml (Cloudflare reads it)
-npm run deploy:check -- --ide https://your-site.example/  # check a live deploy
-npm run host      # serve the IDE on http://localhost:4173 (runtime 4174, preview 4175)
 npm run serve:static # serve the deploy artifact with the Netlify headers on :8080
 ```
 
-Requires Node 18.17+ for the test suite and the host.
+Requires Node 18.17+ for the test suite and build tooling (Node 22 LTS recommended).
 
 ## Browser support
 
@@ -84,17 +76,13 @@ shipped bundle uses an unguarded language feature newer than the floor
 `structuredClone`, `Promise.withResolvers`, `Array.fromAsync`,
 `Array.prototype.findLast`, `AbortSignal.timeout`). Platform features are not in
 that list because they are probed at boot and degrade with a visible reason
-rather than crashing: service worker, SharedArrayBuffer/JSPI, OPFS,
+rather than crashing: service worker, SharedArrayBuffer, OPFS,
 CompressionStream, IndexedDB/localStorage, WebCrypto.
 
-What is *not* a support question: the native browser-WASM profile needs
-cross-origin isolation (SharedArrayBuffer + JSPI), which Safari only exposes
-inside a dedicated worker (no JSPI on the main thread as of Safari 18), so that
-profile is Chromium-only by design. And this release has been **verified in
-Chromium only** — the degraded-engine tests simulate missing APIs in a VM, which
-is not the same as running on Gecko. Treat Firefox/Safari as "should work from
-the feature floor, unverified here" until someone runs the suite in those
-engines.
+This release has been **verified in Chromium only** — the degraded-engine tests
+simulate missing APIs in a VM, which is not the same as running on Gecko. Treat
+Firefox/Safari as "should work from the feature floor, unverified here" until
+someone runs the suite in those engines.
 
 ## Embedding the runtime in your own web IDE
 
@@ -220,15 +208,11 @@ exceeded". The fix is structural, not cosmetic:
 - checkpoints never include `.next`, `.nuxt`, `.output`, `dist`, `.cache`,
   `.npm`, `.pnpm-store`, `coverage` or npm's staging directories — all of that
   is rebuildable;
-- a storage governor (`o/native/storage-manager.mjs`) reads
-  `navigator.storage.estimate()`, keeps 10% headroom, and preflights installs
-  (512 MiB) and builds (384 MiB), refusing an impossible command up front with
-  an actionable message instead of failing halfway through;
-- a quota failure while committing a checkpoint triggers exactly one garbage
-  collection of stale per-group OPFS mounts and rebuildable caches, then a
-  single retry;
-- startup asks for `navigator.storage.persist()` and sweeps execution mounts
-  left behind by an earlier session (`workspace-0x8…`);
+- browser quota estimation reads `navigator.storage.estimate()`, computes an
+  explicit source budget and preflights large writes instead of silently
+  corrupting snapshots;
+- quota errors trigger garbage collection of rebuildable dependency
+  checkpoints and package caches, then retry once cleanly;
 - quota errors are reported once, in plain language, with the next step.
 
 The source workspace is no longer a fixed 64 MiB. It is half of whatever the
@@ -622,24 +606,6 @@ half: `require('fs')` and `require('node:fs')` are the same object,
 into gzip, an HMAC-signed token, an ESM entry with top-level `await`, a timer
 queue — are written into the virtual project and run with `node app.js`.
 
-## Host
-
-`node o/host/beownir-host.mjs o/site/index.html` starts three servers on
-consecutive ports (IDE, runtime, preview) and:
-
-- serves the single file with COOP/COEP, `Permissions-Policy`, ETag/304 and a
-  cached gzip body;
-- serves the embedded runtime assets with integrity-checked ETags;
-- relays registry-only TCP/WebSocket traffic and DNS-over-HTTP for the runtime,
-  pinned to `registry.npmjs.org`;
-- brokers preview HTTP/WebSocket traffic to the browser kernel through a
-  capability-token session;
-- exposes `/healthz` on each origin, shuts down cleanly on `SIGTERM`/`SIGINT`
-  and refuses to start on a bad `PORT` or a missing HTML file.
-
-Environment: `PORT` (base port), `BEOWNIR_BIND` (`127.0.0.1` by default; set `0.0.0.0` only to opt into network exposure), `BEOWNIR_IDE_ORIGIN`, `BEOWNIR_RUNTIME_ORIGIN`,
-`BEOWNIR_PREVIEW_ORIGIN`, `BEOWNIR_HTML`, `BEOWNIR_LOG=1` for request errors.
-
 ## Deployment
 
 ### Netlify (single file, no build step)
@@ -650,11 +616,7 @@ runtime needs.
 
 `o/site` also carries `coi-sw.js`, the preview service worker. It is fetched
 same-origin and must be served as JavaScript from the site root (the deploy
-step writes the file; do not bundle or rename it). On a deployed host the worker
-registers but the loopback gate keeps the same-origin preview off, so the page
-behaves exactly as it did before: sandboxed `srcdoc` preview through the
-rewriting loader. If the file is missing, the IDE does not attempt the worker
-path at all.
+step writes the file; do not bundle or rename it).
 
 ```toml
 [build]
@@ -670,54 +632,31 @@ Two details make or break this, and both are tested:
   they drift.
 - **COOP/COEP must arrive as headers.** `Cross-Origin-Opener-Policy:
   same-origin` plus `Cross-Origin-Embedder-Policy: require-corp` is what makes
-  the page `crossOriginIsolated`, which is what gives the runtime
-  `SharedArrayBuffer`, JSPI and the WASIX profile. A static host that cannot set
-  headers still works: the page registers `coi-sw.js`, which re-serves every
-  response with the same isolation headers. Without either, the IDE boots in the
-  limited single-threaded profile.
+  the page `crossOriginIsolated`, which unlocks `SharedArrayBuffer`,
+  multi-worker `worker_threads`, synchronous `child_process`, and parallel
+  SharedArrayBuffer package extraction. A static host that cannot set headers
+  still works: the page registers `coi-sw.js`, which re-serves responses with
+  isolation headers. Without either, the runtime cleanly falls back to
+  single-threaded Web mode.
 
 `/` and `/index.html` are sent with `Cache-Control: max-age=0, must-revalidate`,
 so a deploy is visible on the next visit instead of sitting behind a CDN copy.
 
 ### Opening the file directly
 
-`o/site/index.html` is a real single file: you can download it and open it from
-disk. A `file://` page has an opaque origin, though, so service workers are
-unavailable (no isolation headers) and some browsers refuse to start a worker
-from a `blob:` URL — which is where the runtime runs. The IDE still boots and
-reports the missing capability instead of hanging, but the full profile needs a
-static host or `npm run serve:static`.
+`o/site/index.html` (and `beownir-standalone.html`) is a real single file: you
+can download it and open it from disk. A `file://` page has an opaque origin,
+though, so service workers are unavailable (no isolation headers) and `worker_threads`
+runs in virtual fallback mode.
 
-### Verifying a deploy
-
-```bash
-node o/deploy/check.mjs --ide https://your-site.netlify.app/
-```
-
-It checks the status, the isolation headers, that the deployed title matches the
-version in this checkout, that the page is the real 8.5 MiB artifact rather than
-a placeholder, that nothing is loaded from another origin, that single-file mode
-has no extra origins configured, and that `coi-sw.js` is served with the right
-scope. It exits non-zero and names the first failure.
-
-The same check runs in CI against `npm run serve:static`, which serves `o/site`
-with exactly the headers from `netlify.toml` — the closest thing to the Netlify
-CDN you can run locally:
+### Local static verification
 
 ```bash
 npm run serve:static        # http://localhost:8080
 ```
 
-### Three origins (the Node host)
-
-The `o/host` server additionally isolates the runtime on its own origin and
-brokers preview traffic. That deployment needs three hostnames:
-
-```bash
-node o/deploy/configure.mjs --runtime https://runtime.example --preview https://preview.example
-node o/deploy/check.mjs --ide https://ide.example \
-                        --runtime https://runtime.example --preview https://preview.example
-```
+`npm run serve:static` serves `o/site` with the exact COOP/COEP/CORP headers from
+`netlify.toml`, matching Netlify and Cloudflare Pages production behaviour.
 
 ## Limits
 

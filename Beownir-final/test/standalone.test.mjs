@@ -52,21 +52,14 @@ test('every essential runtime asset is embedded, not fetched', () => {
   assert.doesNotMatch(html, /<link[^>]+href="https?:/);
 });
 
-test('the native asset pack decodes and its WASM modules are valid', () => {
+test('embedded esbuild WASM decodes and is a valid WebAssembly module', () => {
   const html = fs.readFileSync(artifactPath, 'utf8');
-  const match = /<script id="beownir-native-assets" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
-  assert.ok(match, 'the native asset pack is embedded');
-  const pack = JSON.parse(match[1]);
-  const names = Object.keys(pack);
-  assert.ok(names.length >= 40, 'native assets: ' + names.length);
-  assert.ok(names.includes('/node_modules/@wasmer/sdk/pkg/wasmer_sdk_js_bg.wasm'), 'the Wasmer SDK module is embedded');
-  for (const name of names) {
-    const raw = zlib.gunzipSync(Buffer.from(pack[name].base64, 'base64'));
-    assert.equal(sha256(raw), pack[name].sha256, 'asset digest: ' + name);
-    if (name.endsWith('.wasm')) {
-      assert.deepEqual([...raw.subarray(0, 4)], [0x00, 0x61, 0x73, 0x6d], 'wasm magic: ' + name);
-    }
-  }
+  const match = /<script id="esbuildWasm"[^>]*>([\s\S]*?)<\/script>/.exec(html);
+  assert.ok(match, 'esbuildWasm is embedded');
+  const raw = zlib.gunzipSync(Buffer.from(match[1].trim(), 'base64'));
+  assert.deepEqual([...raw.subarray(0, 4)], [0x00, 0x61, 0x73, 0x6d], 'wasm magic');
+  assert.ok(!html.includes('beownir-native-assets'), 'no WASIX asset pack is embedded');
+  assert.ok(!html.includes('beownirHostSource'), 'no Node host script is embedded');
 });
 
 test('the artifact boots, runs commands and restores a project', { timeout: 120000 }, async () => {
@@ -91,12 +84,15 @@ test('a missing essential source fails the build instead of shipping a shell', (
   }
 });
 
-test('the embedded runtime refuses to be spoofed by a stale asset pack', () => {
+test('the embedded runtime refuses to be spoofed by a stale manifest digest', () => {
   const html = fs.readFileSync(artifactPath, 'utf8');
-  const broken = html.replace(/("sha256":")([0-9a-f]{2})/, (_, prefix, first) => prefix + (first === 'ff' ? '00' : 'ff'));
+  const manifest = readManifest(html);
+  const sampleDigest = manifest.sources[0].sha256;
+  const tamperedDigest = (sampleDigest.startsWith('ff') ? '00' : 'ff') + sampleDigest.slice(2);
+  const broken = html.replace(sampleDigest, tamperedDigest);
   const report = verifyArtifact(broken);
   assert.ok(report.problems.length > 0, 'a tampered digest is reported');
-  assert.ok(report.problems.some(problem => /digest|asset/i.test(problem)), 'the report names the digest: ' + report.problems.join('; '));
+  assert.ok(report.problems.some(problem => /source|digest|manifest/i.test(problem)), 'the report names the mismatch: ' + report.problems.join('; '));
 });
 
 test('the runtime inside the artifact persists files through the init message', async () => {

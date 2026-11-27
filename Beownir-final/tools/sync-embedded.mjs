@@ -10,7 +10,7 @@
  *   o/runtime/worker-runtime.js  -> <script id="runtimeSource" type="text/plain">
  *   o/runtime/frame-kernel.js    -> <script id="runtimeFrameSource" type="text/plain">
  *   o/runtime/preview-bridge.js  -> <script id="previewBridgeSource" type="text/plain">
- *   o/host/beownir-host.mjs      -> <script id="beownirHostSource" type="text/plain">
+ *   o/site/coi-sw.js             -> <script id="coiServiceWorkerSource" type="text/plain">
  *
  * Earlier revisions kept the worker runtime only inside the HTML: a 640 KiB
  * blob that no editor could diff and no test could import by path. The files
@@ -44,7 +44,6 @@ export const SOURCES = [
   // loads ./coi-sw.js when a host serves one; the source travels inside the
   // HTML so the artifact carries it and can hand it to the host.
   { name: 'coiServiceWorkerSource', file: 'o/site/coi-sw.js', label: 'coi-sw.js', id: 'coiServiceWorkerSource', type: 'text/plain' },
-  { name: 'host', file: 'o/host/beownir-host.mjs', label: 'beownir-host.mjs', id: 'beownirHostSource', type: 'text/plain' },
 ];
 
 export function sha256(text) {

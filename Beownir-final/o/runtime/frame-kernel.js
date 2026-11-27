@@ -10,7 +10,7 @@
     if (initialized || event.source !== parent || event.data?.type !== 'beownir-runtime' || !event.ports[0] || typeof event.data.source !== 'string') return;
     initialized = true;
     const host = event.ports[0], processes = new Map(), threads = new Map(), actors = new Map(), files = Object.create(null), versions = Object.create(null), envData = new Map(), listeners = new Map(), httpRoutes = new Map(), hostFetchPending = new Map(), syncSessions = new Set();
-    let sourceURL, assets, nextPID = 2, nextThreadFallback = 1, sequence = 0, epoch = 0, stopped = false, inputPID = 1;
+    let sourceURL, npmWorkerURL, assets, nextPID = 2, nextThreadFallback = 1, sequence = 0, epoch = 0, stopped = false, inputPID = 1;
     let networkConfig = (event.data.network && typeof event.data.network === 'object') ? event.data.network
       : (event.data.limits && typeof event.data.limits.network === 'object' ? event.data.limits.network : null);
     const profilerState = {
@@ -77,8 +77,424 @@
       const data = table(); sendHost({ type: 'kernel-processes', processes: data, maxProcesses: MAX_PROCESSES, fsEpoch: epoch });
       for (const p of processes.values()) p.worker.postMessage({ type: 'kernel-table', processes: data });
     }
-    function reply(actor, id, result, failure) {
-      if (actors.has(actor.actorKey)) actor.worker.postMessage({ type: 'kernel-reply', id, result, error: failure ? recordError(failure) : undefined });
+    function reply(actor, id, result, failure, transfer) {
+      if (!actors.has(actor.actorKey)) return;
+      const payload = { type: 'kernel-reply', id, result, error: failure ? recordError(failure) : undefined };
+      if (Array.isArray(transfer) && transfer.length) actor.worker.postMessage(payload, transfer);
+      else actor.worker.postMessage(payload);
+    }
+    const npmWorkerScriptSource = () => `
+'use strict';
+let pakoMod = null;
+function loadPako(source) {
+  if (pakoMod) return pakoMod;
+  const mod = { exports: {} };
+  const fn = new Function('exports', 'module', source + '; return module.exports;');
+  const out = fn(mod.exports, mod);
+  pakoMod = (out && out.Inflate) ? out : (self.pako || mod.exports);
+  return pakoMod;
+}
+const TD = new TextDecoder();
+const TE = new TextEncoder();
+const TEXT_RE = /\\.(?:[cm]?js|json|jsx|tsx?|md|txt|map|css|html?|ya?ml|flow|svg|scss|less)$/i;
+const DOC_RE = /(?:^|\\/)(?:LICENSE|README|CHANGELOG)(?:\\.[^/]*)?$/i;
+function checkArchivePath(name) {
+  if (typeof name !== 'string' || name.length > 768 || name.startsWith('/') || /[\\\\\\x00-\\x1f:]/.test(name)) {
+    throw new Error('Unsafe archive path: ' + name);
+  }
+  const parts = name.split('/');
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === '..' || parts[i] === '.') throw new Error('Unsafe archive path: ' + name);
+  }
+  return name;
+}
+function isSafeRel(rel) {
+  if (!rel || typeof rel !== 'string' || rel.length > 768 || rel.startsWith('/') || /[\\\\\\x00-\\x1f:]/.test(rel)) return false;
+  const parts = rel.split('/');
+  for (let i = 0; i < parts.length; i++) {
+    if (!parts[i] || parts[i] === '.' || parts[i] === '..') return false;
+  }
+  return true;
+}
+const K512 = new Uint32Array([
+  0x428a2f98,0xd728ae22,0x71374491,0x23ef65cd,0xb5c0fbcf,0xec4d3b2f,0xe9b5dba5,0x8189dbbc,
+  0x3956c25b,0xf348b538,0x59f111f1,0xb605d019,0x923f82a4,0xaf194f9b,0xab1c5ed5,0xda6d8118,
+  0xd807aa98,0xa3030242,0x12835b01,0x45706fbe,0x243185be,0x4ee4b28c,0x550c7dc3,0xd5ffb4e2,
+  0x72be5d74,0xf27b896f,0x80deb1fe,0x3b1696b1,0x9bdc06a7,0x25c71235,0xc19bf174,0xcf692694,
+  0xe49b69c1,0x9ef14ad2,0xefbe4786,0x384f25e3,0x0fc19dc6,0x8b8cd5b5,0x240ca1cc,0x77ac9c65,
+  0x2de92c6f,0x592b0275,0x4a7484aa,0x6ea6e483,0x5cb0a9dc,0xbd41fbd4,0x76f988da,0x831153b5,
+  0x983e5152,0xee66dfab,0xa831c66d,0x2db43210,0xb00327c8,0x98fb213f,0xbf597fc7,0xbeef0ee4,
+  0xc6e00bf3,0x3da88fc2,0xd5a79147,0x930aa725,0x06ca6351,0xe003826f,0x14292967,0x0a0e6e70,
+  0x27b70a85,0x46d22ffc,0x2e1b2138,0x5c26c926,0x4d2c6dfc,0x5ac42aed,0x53380d13,0x9d95b3df,
+  0x650a7354,0x8baf63de,0x766a0abb,0x3c77b2a8,0x81c2c92e,0x47edaee6,0x92722c85,0x1482353b,
+  0xa2bfe8a1,0x4cf10364,0xa81a664b,0xbc423001,0xc24b8b70,0xd0f89791,0xc76c51a3,0x0654be30,
+  0xd192e819,0xd6ef5218,0xd6990624,0x5565a910,0xf40e3585,0x5771202a,0x106aa070,0x32bbd1b8,
+  0x19a4c116,0xb8d2d0c8,0x1e376c08,0x5141ab53,0x2748774c,0xdf8eeb99,0x34b0bcb5,0xe19b48a8,
+  0x391c0cb3,0xc5c95a63,0x4ed8aa4a,0xe3418acb,0x5b9cca4f,0x7763e373,0x682e6ff3,0xd6b2b8a3,
+  0x748f82ee,0x5defb2fc,0x78a5636f,0x43172f60,0x84c87814,0xa1f0ab72,0x8cc70208,0x1a6439ec,
+  0x90befffa,0x23631e28,0xa4506ceb,0xde82bde9,0xbef9a3f7,0xb2c67915,0xc67178f2,0xe372532b,
+  0xca273ece,0xea26619c,0xd186b8c7,0x21c0c207,0xeada7dd6,0xcde0eb1e,0xf57d4f7f,0xee6ed178,
+  0x06f067aa,0x72176fba,0x0a637dc5,0xa2c898a6,0x113f9804,0xbef90dae,0x1b710b35,0x131c471b,
+  0x28db77f5,0x23047d84,0x32caab7b,0x40c72493,0x3c9ebe0a,0x15c9bebc,0x431d67c4,0x9c100d4c,
+  0x4cc5d4be,0xcb3e42b6,0x597f299c,0xfc657e2a,0x5fcb6fab,0x3ad6faec,0x6c44198c,0x4a475817
+]);
+function sha512Bytes(bytes) {
+  let h0 = 0x6a09e667, h0l = 0xf3bcc908, h1 = 0xbb67ae85, h1l = 0x84caa73b;
+  let h2 = 0x3c6ef372, h2l = 0xfe94f82b, h3 = 0xa54ff53a, h3l = 0x5f1d36f1;
+  let h4 = 0x510e527f, h4l = 0xade682d1, h5 = 0x9b05688c, h5l = 0x2b3e6c1f;
+  let h6 = 0x1f83d9ab, h6l = 0xfb41bd6b, h7 = 0x5be0cd19, h7l = 0x137e2179;
+  const W = new Uint32Array(160);
+  function compress(data, offset) {
+    for (let i = 0; i < 16; i++) {
+      const at = offset + i * 8;
+      W[i * 2] = (data[at] << 24) | (data[at + 1] << 16) | (data[at + 2] << 8) | data[at + 3];
+      W[i * 2 + 1] = (data[at + 4] << 24) | (data[at + 5] << 16) | (data[at + 6] << 8) | data[at + 7];
+    }
+    for (let i = 16; i < 80; i++) {
+      const a = (i - 15) * 2, b = (i - 2) * 2;
+      const xh = W[a], xl = W[a + 1], yh = W[b], yl = W[b + 1];
+      const s0h = ((xh >>> 1) | (xl << 31)) ^ ((xh >>> 8) | (xl << 24)) ^ (xh >>> 7);
+      const s0l = ((xl >>> 1) | (xh << 31)) ^ ((xl >>> 8) | (xh << 24)) ^ ((xl >>> 7) | (xh << 25));
+      const s1h = ((yh >>> 19) | (yl << 13)) ^ ((yl >>> 29) | (yh << 3)) ^ (yh >>> 6);
+      const s1l = ((yl >>> 19) | (yh << 13)) ^ ((yh >>> 29) | (yl << 3)) ^ ((yl >>> 6) | (yh << 26));
+      const lo = (W[(i - 16) * 2 + 1] >>> 0) + (s0l >>> 0) + (W[(i - 7) * 2 + 1] >>> 0) + (s1l >>> 0);
+      const hi = (W[(i - 16) * 2] >>> 0) + (s0h >>> 0) + (W[(i - 7) * 2] >>> 0) + (s1h >>> 0) + Math.floor(lo / 0x100000000);
+      W[i * 2] = hi >>> 0; W[i * 2 + 1] = lo >>> 0;
+    }
+    let ah = h0, al = h0l, bh = h1, bl = h1l, ch = h2, cl = h2l, dh = h3, dl = h3l;
+    let eh = h4, el = h4l, fh = h5, fl = h5l, gh = h6, gl = h6l, hh = h7, hl = h7l;
+    for (let i = 0; i < 80; i++) {
+      const s1h = ((eh >>> 14) | (el << 18)) ^ ((eh >>> 18) | (el << 14)) ^ ((el >>> 9) | (eh << 23));
+      const s1l = ((el >>> 14) | (eh << 18)) ^ ((el >>> 18) | (eh << 14)) ^ ((eh >>> 9) | (el << 23));
+      const chh = (eh & fh) ^ (~eh & gh), chl = (el & fl) ^ (~el & gl);
+      const t1lo = (hl >>> 0) + (s1l >>> 0) + (chl >>> 0) + (K512[i * 2 + 1] >>> 0) + (W[i * 2 + 1] >>> 0);
+      const t1hi = (hh >>> 0) + (s1h >>> 0) + (chh >>> 0) + (K512[i * 2] >>> 0) + (W[i * 2] >>> 0) + Math.floor(t1lo / 0x100000000);
+      const t1h = t1hi >>> 0, t1l = t1lo >>> 0;
+      const s0h = ((ah >>> 28) | (al << 4)) ^ ((al >>> 2) | (ah << 30)) ^ ((al >>> 7) | (ah << 25));
+      const s0l = ((al >>> 28) | (ah << 4)) ^ ((ah >>> 2) | (al << 30)) ^ ((ah >>> 7) | (al << 25));
+      const majh = (ah & bh) ^ (ah & ch) ^ (bh & ch), majl = (al & bl) ^ (al & cl) ^ (bl & cl);
+      const t2lo = (s0l >>> 0) + (majl >>> 0);
+      const t2hi = (s0h >>> 0) + (majh >>> 0) + Math.floor(t2lo / 0x100000000);
+      const t2h = t2hi >>> 0, t2l = t2lo >>> 0;
+      hh = gh; hl = gl; gh = fh; gl = fl; fh = eh; fl = el;
+      const elo = (dl >>> 0) + (t1l >>> 0);
+      eh = (dh + t1h + Math.floor(elo / 0x100000000)) >>> 0; el = elo >>> 0;
+      dh = ch; dl = cl; ch = bh; cl = bl; bh = ah; bl = al;
+      const alo = (t1l >>> 0) + (t2l >>> 0);
+      ah = (t1h + t2h + Math.floor(alo / 0x100000000)) >>> 0; al = alo >>> 0;
+    }
+    const v0 = (h0l >>> 0) + (al >>> 0); h0 = (h0 + ah + Math.floor(v0 / 0x100000000)) >>> 0; h0l = v0 >>> 0;
+    const v1 = (h1l >>> 0) + (bl >>> 0); h1 = (h1 + bh + Math.floor(v1 / 0x100000000)) >>> 0; h1l = v1 >>> 0;
+    const v2 = (h2l >>> 0) + (cl >>> 0); h2 = (h2 + ch + Math.floor(v2 / 0x100000000)) >>> 0; h2l = v2 >>> 0;
+    const v3 = (h3l >>> 0) + (dl >>> 0); h3 = (h3 + dh + Math.floor(v3 / 0x100000000)) >>> 0; h3l = v3 >>> 0;
+    const v4 = (h4l >>> 0) + (el >>> 0); h4 = (h4 + eh + Math.floor(v4 / 0x100000000)) >>> 0; h4l = v4 >>> 0;
+    const v5 = (h5l >>> 0) + (fl >>> 0); h5 = (h5 + fh + Math.floor(v5 / 0x100000000)) >>> 0; h5l = v5 >>> 0;
+    const v6 = (h6l >>> 0) + (gl >>> 0); h6 = (h6 + gh + Math.floor(v6 / 0x100000000)) >>> 0; h6l = v6 >>> 0;
+    const v7 = (h7l >>> 0) + (hl >>> 0); h7 = (h7 + hh + Math.floor(v7 / 0x100000000)) >>> 0; h7l = v7 >>> 0;
+  }
+  let pos = 0;
+  for (; pos + 128 <= bytes.length; pos += 128) compress(bytes, pos);
+  const rem = bytes.length - pos;
+  const tail = new Uint8Array(rem < 112 ? 128 : 256);
+  tail.set(bytes.subarray(pos), 0);
+  tail[rem] = 0x80;
+  let bits = bytes.length * 8;
+  for (let i = tail.length - 1; i >= tail.length - 8 && bits > 0; i--) {
+    tail[i] = bits % 256;
+    bits = Math.floor(bits / 256);
+  }
+  for (let off = 0; off < tail.length; off += 128) compress(tail, off);
+  const out = new Uint8Array(64);
+  const words = [[h0,h0l],[h1,h1l],[h2,h2l],[h3,h3l],[h4,h4l],[h5,h5l],[h6,h6l],[h7,h7l]];
+  for (let i = 0; i < 8; i++) {
+    const hi = words[i][0], lo = words[i][1];
+    out[i*8]=hi>>>24; out[i*8+1]=(hi>>>16)&255; out[i*8+2]=(hi>>>8)&255; out[i*8+3]=hi&255;
+    out[i*8+4]=lo>>>24; out[i*8+5]=(lo>>>16)&255; out[i*8+6]=(lo>>>8)&255; out[i*8+7]=lo&255;
+  }
+  return out;
+}
+async function verifySri(bytes, sri) {
+  if (!sri) throw new Error('Package has no integrity hash. Refusing an unverified download.');
+  const algos = { sha512: 'SHA-512', sha384: 'SHA-384', sha256: 'SHA-256', sha1: 'SHA-1' };
+  const tokens = String(sri).trim().split(/\\s+/);
+  const candidates = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const clean = tokens[i].split('?')[0];
+    const sep = clean.indexOf('-');
+    if (sep > 0) {
+      const algo = clean.slice(0, sep);
+      if (algos[algo]) candidates.push([algo, clean.slice(sep + 1)]);
+    }
+  }
+  const order = ['sha512', 'sha384', 'sha256', 'sha1'];
+  let strongest = null;
+  for (let i = 0; i < order.length; i++) {
+    for (let j = 0; j < candidates.length; j++) {
+      if (candidates[j][0] === order[i]) { strongest = order[i]; break; }
+    }
+    if (strongest) break;
+  }
+  if (!strongest) throw new Error('Unsupported package integrity algorithm.');
+  let digestBytes;
+  if (typeof crypto !== 'undefined' && crypto && crypto.subtle) {
+    digestBytes = new Uint8Array(await crypto.subtle.digest(algos[strongest], bytes));
+  } else if (strongest === 'sha512') {
+    digestBytes = sha512Bytes(bytes);
+  } else {
+    throw new Error('WebCrypto digest unavailable in worker.');
+  }
+  let bin = '';
+  for (let i = 0; i < digestBytes.length; i++) bin += String.fromCharCode(digestBytes[i]);
+  const b64 = btoa(bin);
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i][0] === strongest && candidates[i][1] === b64) return true;
+  }
+  return false;
+}
+function inflateTar(pako, compressed, limit) {
+  const inflate = new pako.Inflate({ chunkSize: 65536 });
+  const chunks = [];
+  let total = 0;
+  inflate.onData = chunk => {
+    total += chunk.length;
+    if (total > limit) throw new Error('Expanded archive exceeds limit.');
+    chunks.push(new Uint8Array(chunk));
+  };
+  inflate.push(compressed, true);
+  if (inflate.err) throw new Error('Invalid gzip archive: ' + (inflate.msg || inflate.err));
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    out.set(chunks[i], pos);
+    pos += chunks[i].length;
+  }
+  return out;
+}
+function parseTarPack(tarBytes, maxEntries, maxEntryBytes) {
+  const entries = [];
+  let offset = 0, pendingName = null, pax = Object.create(null);
+  const readStr = (s, n) => TD.decode(tarBytes.subarray(s, s + n)).replace(/\\0[\\s\\S]*$/, '');
+  while (offset + 512 <= tarBytes.length) {
+    let allZero = true;
+    for (let z = 0; z < 512; z++) { if (tarBytes[offset + z] !== 0) { allZero = false; break; } }
+    if (allZero) break;
+    const expected = parseInt(readStr(offset + 148, 8).trim(), 8);
+    let checksum = 0;
+    for (let i = 0; i < 512; i++) checksum += (i >= 148 && i < 156) ? 32 : tarBytes[offset + i];
+    if (checksum !== expected) throw new Error('Invalid tar checksum.');
+    const size = parseInt(readStr(offset + 124, 12).trim(), 8) || 0;
+    const type = String.fromCharCode(tarBytes[offset + 156]);
+    if (!Number.isSafeInteger(size) || size < 0 || offset + 512 + size > tarBytes.length) throw new Error('Invalid tar entry size.');
+    let name = readStr(offset, 100);
+    const prefix = readStr(offset + 345, 155);
+    if (prefix) name = prefix + '/' + name;
+    const data = tarBytes.subarray(offset + 512, offset + 512 + size);
+    if (type === 'x' || type === 'g') {
+      let i = 0;
+      while (i < data.length) {
+        const space = data.indexOf(32, i);
+        if (space < 0) break;
+        const length = Number(TD.decode(data.subarray(i, space)));
+        if (!Number.isSafeInteger(length) || length <= 0 || i + length > data.length) throw new Error('Invalid PAX header.');
+        const record = TD.decode(data.subarray(space + 1, i + length - 1));
+        const eq = record.indexOf('=');
+        if (eq > 0) pax[record.slice(0, eq)] = record.slice(eq + 1);
+        i += length;
+      }
+    } else if (type === 'L') {
+      pendingName = TD.decode(data).replace(/\\0[\\s\\S]*$/, '');
+    } else if (type === 'K') {
+      // ignore GNU long link target header without clobbering pendingName
+    } else {
+      const fullName = checkArchivePath(pax.path || pendingName || name);
+      pendingName = null;
+      pax = Object.create(null);
+      if (type === '0' || type === '\\0') {
+        if (size > maxEntryBytes) throw new Error('Package file exceeds per-file budget.');
+        const rel = fullName.split('/').slice(1).join('/');
+        if (rel) {
+          if (!isSafeRel(rel)) throw new Error('Unsafe archive path: ' + rel);
+          const relBytes = TE.encode(rel);
+          const isText = (TEXT_RE.test(rel) || DOC_RE.test(rel)) ? 1 : 0;
+          entries.push({ relBytes, isText, data });
+          if (entries.length > maxEntries) throw new Error('Too many files in package.');
+        }
+      }
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  let totalSize = 8;
+  for (let i = 0; i < entries.length; i++) totalSize += 9 + entries[i].relBytes.length + entries[i].data.length;
+  const out = new Uint8Array(totalSize);
+  const view = new DataView(out.buffer);
+  out[0] = 0x42; out[1] = 0x4E; out[2] = 0x50; out[3] = 0x4B;
+  view.setUint32(4, entries.length, true);
+  let pos = 8;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    view.setUint32(pos, e.relBytes.length, true);
+    out[pos + 4] = e.isText;
+    view.setUint32(pos + 5, e.data.length, true);
+    pos += 9;
+    out.set(e.relBytes, pos);
+    pos += e.relBytes.length;
+    out.set(e.data, pos);
+    pos += e.data.length;
+  }
+  return { packBuffer: out.buffer, filesCount: entries.length };
+}
+async function downloadWithRetry(url, maxTarballBytes, attempts, timeoutMs) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, { credentials: 'omit', redirect: 'error', signal: controller.signal });
+      if (!r.ok) {
+        const err = new Error('Registry returned HTTP ' + r.status + ' for ' + url);
+        if (attempt < attempts && (r.status === 408 || r.status === 429 || r.status >= 500)) {
+          lastError = err;
+          await new Promise(res => setTimeout(res, Math.min(2000, 150 * attempt)));
+          continue;
+        }
+        throw err;
+      }
+      const lenHdr = Number(r.headers.get('content-length'));
+      if (lenHdr > maxTarballBytes) throw new Error('Tarball exceeds size budget.');
+      const buf = await r.arrayBuffer();
+      if (buf.byteLength > maxTarballBytes) throw new Error('Tarball exceeds size budget.');
+      return new Uint8Array(buf);
+    } catch (e) {
+      lastError = e;
+      if (attempt >= attempts || /exceeds size|HTTP 4\\d\\d/.test(String(e && e.message || ''))) throw e;
+      await new Promise(res => setTimeout(res, Math.min(2000, 150 * attempt)));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError;
+}
+self.onmessage = async ev => {
+  const msg = ev.data;
+  if (!msg || msg.type !== 'run') return;
+  const pako = loadPako(msg.pakoSource);
+  const jobs = msg.jobs || [];
+  const ctrl = msg.sab ? new Int32Array(msg.sab) : null;
+  let fallbackIdx = Number(msg.workerId) || 0;
+  const step = Number(msg.workerCount) || 1;
+  while (true) {
+    if (ctrl && Atomics.load(ctrl, 1) !== 0) break;
+    const index = ctrl ? Atomics.add(ctrl, 0, 1) : fallbackIdx;
+    if (!ctrl) fallbackIdx += step;
+    if (index >= jobs.length) break;
+    const job = jobs[index];
+    try {
+      const rawBytes = await downloadWithRetry(job.tarball, job.maxTarballBytes, job.attempts || 3, job.idleTimeoutMs || 45000);
+      const valid = await verifySri(rawBytes, job.integrity);
+      if (!valid) throw new Error('Integrity verification failed: ' + job.tarball);
+      const tarBytes = inflateTar(pako, rawBytes, job.maxExpandedBytes);
+      const packed = parseTarPack(tarBytes, job.maxEntries || 20000, job.maxEntryBytes || 64 * 1024 * 1024);
+      self.postMessage({
+        type: 'job-done',
+        idx: job.idx,
+        ok: true,
+        packBuffer: packed.packBuffer,
+        bytes: rawBytes.byteLength,
+        expandedBytes: tarBytes.byteLength,
+        filesCount: packed.filesCount
+      }, [packed.packBuffer]);
+    } catch (err) {
+      if (ctrl) Atomics.store(ctrl, 1, 1);
+      self.postMessage({ type: 'job-done', idx: job.idx, ok: false, error: String((err && err.message) || err) });
+      break;
+    }
+  }
+  self.postMessage({ type: 'worker-done' });
+};
+`;
+    function getNpmWorkerURL() {
+      if (!npmWorkerURL) npmWorkerURL = URL.createObjectURL(new Blob([npmWorkerScriptSource()], { type: 'text/javascript' }));
+      return npmWorkerURL;
+    }
+    async function npmExtractBatch(data) {
+      if (!assets || typeof assets.pako !== 'string' || !assets.pako) throw error('ENOSYS', 'Pako runtime asset is unavailable.');
+      if (!data || !Array.isArray(data.jobs) || !data.jobs.length || data.jobs.length > 2048) throw error('EINVAL', 'Invalid npm batch job list.');
+      let originUrl;
+      try { originUrl = new URL(String(data.origin || '')); } catch { throw error('EINVAL', 'Invalid npm registry origin.'); }
+      if (originUrl.protocol !== 'https:' || originUrl.username || originUrl.password) throw error('EINVAL', 'Only HTTPS registry origins are permitted.');
+      const cleanJobs = data.jobs.map(job => {
+        let u;
+        try { u = new URL(String(job?.tarball || '')); } catch { throw error('EINVAL', 'Invalid package tarball URL.'); }
+        if (u.origin !== originUrl.origin || u.username || u.password) throw error('EINVAL', 'Tarball URL origin mismatch: ' + String(job?.tarball || ''));
+        return {
+          idx: Number(job.idx),
+          tarball: u.href,
+          integrity: String(job.integrity || ''),
+          maxTarballBytes: Math.min(64 * 1024 * 1024, Number(job.maxTarballBytes) || 64 * 1024 * 1024),
+          maxExpandedBytes: Math.min(256 * 1024 * 1024, Number(job.maxExpandedBytes) || 256 * 1024 * 1024),
+          maxEntryBytes: Math.min(64 * 1024 * 1024, Number(job.maxEntryBytes) || 64 * 1024 * 1024),
+          maxEntries: Math.min(25000, Number(job.maxEntries) || 20000),
+          attempts: Math.max(1, Math.min(5, Number(job.attempts) || 3)),
+          idleTimeoutMs: Math.max(5000, Math.min(120000, Number(job.idleTimeoutMs) || 45000)),
+        };
+      });
+      const hw = (typeof navigator !== 'undefined' && Number(navigator.hardwareConcurrency)) || 4;
+      const workerCount = Math.min(cleanJobs.length, Math.max(2, Math.min(6, hw)));
+      const sab = typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(16) : null;
+      const url = getNpmWorkerURL();
+      const pool = [];
+      const results = [];
+      const transfers = [];
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let finishedWorkers = 0;
+        const cleanup = () => {
+          for (let i = 0; i < pool.length; i++) {
+            try { pool[i].terminate(); } catch {}
+          }
+          pool.length = 0;
+        };
+        const fail = err => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(err);
+        };
+        const maybeResolve = () => {
+          if (settled || finishedWorkers < workerCount) return;
+          if (results.length !== cleanJobs.length) {
+            fail(error('ERR_NPM_BATCH', 'Incomplete package extraction batch.'));
+            return;
+          }
+          settled = true;
+          cleanup();
+          resolve({ results, __transfer: transfers });
+        };
+        try {
+          for (let w = 0; w < workerCount; w++) {
+            const worker = new Worker(url);
+            pool.push(worker);
+            worker.onmessage = ev => {
+              const msg = ev.data;
+              if (!msg || settled) return;
+              if (msg.type === 'job-done') {
+                if (!msg.ok) { fail(new Error(msg.error || 'Package extraction failed.')); return; }
+                results.push({ idx: msg.idx, packBuffer: msg.packBuffer, bytes: msg.bytes, expandedBytes: msg.expandedBytes, filesCount: msg.filesCount });
+                if (msg.packBuffer instanceof ArrayBuffer) transfers.push(msg.packBuffer);
+                return;
+              }
+              if (msg.type === 'worker-done') {
+                finishedWorkers++;
+                maybeResolve();
+              }
+            };
+            worker.onerror = ev => fail(new Error(ev?.message || 'Package worker failed.'));
+            worker.postMessage({ type: 'run', workerId: w, workerCount, jobs: cleanJobs, sab, pakoSource: assets.pako });
+          }
+        } catch (err) {
+          fail(err);
+        }
+      });
     }
     function recordSyncOutput(process, stream, data) {
       const session = process.syncSession;
@@ -554,6 +970,7 @@
         }
         case 'unbind-http': if (listeners.get(Number(data.port)) === actor.actorKey) { listeners.delete(Number(data.port)); sendHost({ type: 'close', port: Number(data.port) }); publishTable(); } return true;
         case 'http': return routeHTTP({ ...data, type: 'http' });
+        case 'npm-extract-batch': return npmExtractBatch(data);
         case 'host-fetch': {
           const hasRelativeProxy = typeof networkConfig?.corsProxy === 'string' && networkConfig.corsProxy.startsWith('/');
           if (!networkConfig?.useHostProxy && !hasRelativeProxy) throw error('ENOTCAPABLE', 'Host fetch proxy relay is not enabled.');
@@ -571,7 +988,17 @@
     }
     function handleActorMessage(actor, message) {
       if (stopped || !actors.has(actor.actorKey) || !message || typeof message !== 'object') return;
-      if (message.type === 'kernel-call') { Promise.resolve().then(() => syscall(actor, message)).then(result => reply(actor, message.id, result), failure => reply(actor, message.id, null, failure)); return; }
+      if (message.type === 'kernel-call') {
+        Promise.resolve().then(() => syscall(actor, message)).then(result => {
+          let transfer;
+          if (result && typeof result === 'object' && Array.isArray(result.__transfer)) {
+            transfer = result.__transfer;
+            delete result.__transfer;
+          }
+          reply(actor, message.id, result, null, transfer);
+        }, failure => reply(actor, message.id, null, failure));
+        return;
+      }
       if (message.type === 'spawn-sync') { spawnSyncProcess(actor, message); return; }
       if (message.type === 'thread-spawn') { spawnThread(actor, message); return; }
       if (message.type === 'thread-terminate') {
@@ -668,7 +1095,7 @@
       for (const entry of threads.values()) { clearTimeout(entry.bootTimeout); entry.worker.terminate(); }
       for (const route of httpRoutes.values()) clearTimeout(route.timer);
       for (const pending of hostFetchPending.values()) { clearTimeout(pending.timer); pending.reject(error('ECONNRESET', 'Virtual OS stopped.')); }
-      processes.clear(); threads.clear(); actors.clear(); httpRoutes.clear(); hostFetchPending.clear(); listeners.clear(); if (sourceURL) URL.revokeObjectURL(sourceURL);
+      processes.clear(); threads.clear(); actors.clear(); httpRoutes.clear(); hostFetchPending.clear(); listeners.clear(); if (sourceURL) URL.revokeObjectURL(sourceURL); if (npmWorkerURL) URL.revokeObjectURL(npmWorkerURL);
       host.postMessage({ type: 'kernel-stopped' }); host.close();
     }
     try {
