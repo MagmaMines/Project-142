@@ -33,7 +33,7 @@ const ELEMENT = () => {
   return node;
 };
 
-function load({ isolated = true, sab = true, jspi = true, opfs = true, shell = 'active', host = false, stored = null } = {}) {
+function load({ isolated = true, sab = true, jspi = true, opfs = true, shell = 'active', host = false, stored = null, hostname = 'example.test', swController = false } = {}) {
   const calls = { dialogs: [], buttons: [], stored: stored ? { ...stored } : {}, templates: 0, help: [] };
   const sandbox = {
     console,
@@ -54,7 +54,11 @@ function load({ isolated = true, sab = true, jspi = true, opfs = true, shell = '
       getItem: key => (key in calls.stored ? calls.stored[key] : null),
       setItem: (key, value) => { calls.stored[key] = String(value); },
     },
-    navigator: { storage: opfs ? { getDirectory: () => {} } : {} },
+    navigator: {
+      storage: opfs ? { getDirectory: () => {} } : {},
+      serviceWorker: swController ? { controller: {} } : {},
+    },
+    location: { hostname },
     WebAssembly: jspi ? { Suspending: function Suspending() {} } : {},
     SharedArrayBuffer: sab ? function SharedArrayBuffer() {} : undefined,
     nativeMode: () => host,
@@ -86,10 +90,19 @@ test('static-host Install and Build actions use the limited browser runtime', ()
 test('an isolated Chromium unlocks the native capabilities', () => {
   const { sandbox } = load();
   const rows = byName(sandbox.probeCapabilities());
-  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'Native browser-WASM profile', 'OPFS execution mounts', 'Offline shell (service worker)']) {
+  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'Native browser-WASM profile', 'OPFS execution mounts', 'Offline shell (service worker)', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
     assert.equal(rows[name].ok, true, name + ' is reported as available');
   }
   assert.equal(rows['Open a preview in another tab (host bridge)'].ok, false, 'no host is configured in this scenario');
+  assert.equal(rows['TLS, raw TCP/UDP, unmapped native addons'].ok, false, 'raw sockets remain unsupported');
+});
+
+test('a localhost service-worker browser notes same-origin loopback preview', () => {
+  const { sandbox } = load({ hostname: '127.0.0.1', swController: true });
+  const rows = byName(sandbox.probeCapabilities());
+  assert.equal(rows['Open a preview in another tab (host bridge)'].ok, false);
+  assert.match(rows['Open a preview in another tab (host bridge)'].detail, /__beownir_preview__/);
+  assert.match(rows['Framework dev servers (Vite, Next.js, Nuxt)'].detail, /HMR/);
 });
 
 test('a plain static host reports exactly what is missing and why', () => {
@@ -101,20 +114,19 @@ test('a plain static host reports exactly what is missing and why', () => {
   assert.equal(rows['Native browser-WASM profile'].ok, false);
   assert.match(rows['Offline shell (service worker)'].detail, /file:\/\//, 'the file:// case is explained');
   // What does not depend on the environment keeps working.
-  for (const name of ['Editor, terminal, virtual filesystem', 'npm installs', 'Servers and the preview panel']) {
+  for (const name of ['Editor, terminal, virtual filesystem', 'npm installs', 'Servers and the preview panel', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
     assert.equal(rows[name].ok, true, name + ' stays available');
   }
-  for (const name of ['Framework dev servers (Vite, Next.js, Nuxt)', 'TLS, raw TCP/UDP, native addons, X.509 certificate parsing']) {
-    assert.equal(rows[name].ok, false, name + ' is never claimed');
-  }
+  assert.equal(rows['TLS, raw TCP/UDP, unmapped native addons'].ok, false, 'unsupported sockets and unmapped native binaries are never claimed');
 });
 
 test('OPFS and the host bridge are reported independently', () => {
-  const { sandbox } = load({ opfs: false, host: true });
+  const { sandbox } = load({ opfs: false, host: true, shell: 'failed' });
   const rows = byName(sandbox.probeCapabilities());
   assert.equal(rows['OPFS execution mounts'].ok, false);
   assert.match(rows['OPFS execution mounts'].detail, /IndexedDB/);
   assert.equal(rows['Open a preview in another tab (host bridge)'].ok, true);
+  assert.match(rows['Offline shell (service worker)'].detail, /beownir-host\.mjs/);
 });
 
 test('the capability list marks each row and carries its reason', () => {
