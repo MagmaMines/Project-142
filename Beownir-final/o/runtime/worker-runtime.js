@@ -13613,7 +13613,7 @@ it is restored from a compressed dependency checkpoint after a reload.
 The lightweight serve adapter uses live reload (no HMR) and preserves scroll,
 form values and focus. Installed Vite 6 has a bounded Node-API path for builds
 and virtual dev/HMR tests; arbitrary CLI options and plugins are not supported.
-worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); no native OS binaries, sync child processes, cross-process raw TCP/TLS, native addons or full Next.js/Nuxt CLIs.
+worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); spawnSync/execFileSync run via SharedArrayBuffer + Atomics.wait when isolated. Virtual loopback TCP/UDP (net, dgram, WASI sockets) and loopback HTTP/WebSockets run inside the runtime; no native OS binaries, raw external non-HTTP sockets, server TLS, unmapped native addons, or full Next.js/Nuxt CLIs without three-origin WASIX hosting.
 `;
 post({type:'boot'});
 

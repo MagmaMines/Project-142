@@ -90,11 +90,13 @@ test('static-host Install and Build actions use the Web mode runtime', () => {
 test('an isolated Chromium unlocks the native capabilities', () => {
   const { sandbox } = load();
   const rows = byName(sandbox.probeCapabilities());
-  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'Native browser-WASM profile', 'OPFS execution mounts', 'Offline shell (service worker)', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
+  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'Native browser-WASM profile', 'OPFS execution mounts', 'Offline shell (service worker)', 'Virtual loopback TCP & UDP sockets', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
     assert.equal(rows[name].ok, true, name + ' is reported as available');
   }
   assert.equal(rows['Open a preview in another tab (host bridge)'].ok, false, 'no host is configured in this scenario');
-  assert.equal(rows['TLS, raw TCP/UDP, unmapped native addons'].ok, false, 'raw sockets remain unsupported');
+  assert.equal(rows['External outbound network & server TLS'].ok, false, 'external non-HTTP sockets and server TLS remain unsupported');
+  assert.equal(rows['Unmapped native addons & OS binaries'].ok, false, 'unmapped native binaries remain unsupported');
+  assert.equal(rows['TLS, raw TCP/UDP, unmapped native addons'], undefined, 'TCP/UDP is not misreported as unavailable');
 });
 
 test('a localhost service-worker browser notes same-origin loopback preview', () => {
@@ -114,10 +116,11 @@ test('a plain static host reports exactly what is missing and why', () => {
   assert.equal(rows['Native browser-WASM profile'].ok, false);
   assert.match(rows['Offline shell (service worker)'].detail, /file:\/\//, 'the file:// case is explained');
   // What does not depend on the environment keeps working.
-  for (const name of ['Editor, terminal, virtual filesystem', 'npm installs', 'Servers and the preview panel', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
+  for (const name of ['Editor, terminal, virtual filesystem', 'npm & pnpm installs', 'Servers and the preview panel', 'Virtual loopback TCP & UDP sockets', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
     assert.equal(rows[name].ok, true, name + ' stays available');
   }
-  assert.equal(rows['TLS, raw TCP/UDP, unmapped native addons'].ok, false, 'unsupported sockets and unmapped native binaries are never claimed');
+  assert.equal(rows['External outbound network & server TLS'].ok, false, 'external raw sockets and server TLS are never claimed');
+  assert.equal(rows['Unmapped native addons & OS binaries'].ok, false, 'unmapped native binaries are never claimed');
 });
 
 test('OPFS and the host bridge are reported independently', () => {
@@ -169,3 +172,11 @@ test('the card actions open the right panels', () => {
   action('Choose a template')();
   assert.equal(calls.templates, 1);
 });
+
+test('hosting & release and guide dialogs reflect virtualized TCP/UDP and active runtime modes', () => {
+  assert.doesNotMatch(page, /Exact-artifact release gate|production-certified|deliberately blocked until every required test/);
+  assert.doesNotMatch(page, /raw TCP\/UDP\/TLS sockets/);
+  assert.match(page, /Virtual loopback TCP & UDP sockets/);
+  assert.match(page, /Framework runtime matrix/);
+});
+
