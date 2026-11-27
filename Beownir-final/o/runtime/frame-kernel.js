@@ -1,4 +1,4 @@
-/* Beownir virtual OS kernel, phase 1. Runs in an opaque-origin iframe.
+/* Beownir virtual OS kernel (browser runtime). Runs in an opaque-origin iframe.
  * Owns real browser Worker execution contexts (processes and worker_threads),
  * canonical VFS, SharedArrayBuffer control tables, IPC and virtual HTTP routes.
  * It is not a native OS kernel and deliberately does not expose privileged host APIs.
@@ -329,7 +329,7 @@
         syncSessions.add(session);
         if (!assets || typeof message.command !== 'string' || !Array.isArray(message.args) || message.args.some(a => typeof a !== 'string') || JSON.stringify(message.args).length > 16384) throw error('EINVAL', 'Invalid process arguments.');
         const command = message.command.split('/').pop();
-        if (!['node', 'nodejs', 'npm', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'spawnSync ' + message.command + ' ENOENT');
+        if (!['node', 'nodejs', 'npm', 'pnpm', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'spawnSync ' + message.command + ' ENOENT');
         if (!validPath(message.cwd) || !files[message.cwd]?.d) throw error('ENOENT', 'spawnSync ' + message.command + ' ENOENT');
         if (JSON.stringify(message.env || {}).length > 65536 || !Array.isArray(message.prepared || []) || JSON.stringify(message.prepared || []).length > 16 * 1024 * 1024) throw error('EFBIG', 'Process environment or prepared module graph exceeds limit.');
         if (message.deps instanceof ArrayBuffer) assets.deps = new Uint8Array(message.deps).slice();
@@ -465,7 +465,7 @@
         case 'spawn': {
           if (!assets || typeof data.command !== 'string' || !Array.isArray(data.args) || data.args.some(a => typeof a !== 'string') || JSON.stringify(data.args).length > 16384) throw error('EINVAL', 'Invalid process arguments.');
           const command = data.command.split('/').pop();
-          if (!['node', 'nodejs', 'npm', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'No browser executable named ' + command + '. Native OS binaries cannot be spawned.');
+          if (!['node', 'nodejs', 'npm', 'pnpm', 'npx', 'esbuild', 'sh'].includes(command)) throw error('ENOENT', 'No browser executable named ' + command + '. Native OS binaries cannot be spawned.');
           if (!validPath(data.cwd) || !files[data.cwd]?.d) throw error('ENOENT', 'Child working directory does not exist.');
           if (JSON.stringify(data.env || {}).length > 65536 || !Array.isArray(data.prepared) || JSON.stringify(data.prepared).length > 16 * 1024 * 1024) throw error('EFBIG', 'Process environment or prepared module graph exceeds limit.');
           if (data.deps instanceof ArrayBuffer) assets.deps = new Uint8Array(data.deps).slice();

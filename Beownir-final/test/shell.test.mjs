@@ -199,12 +199,31 @@ test('recursive grep skips dependency stores unless --all is given', () => withS
   assert.match(everything.stdout, /node_modules\/pkg\/index\.js/);
 }));
 
-test('node and npm report parseable versions', () => withScratch(async () => {
+test('node, npm, and pnpm report parseable versions and compatibility notices', () => withScratch(async () => {
   assert.match((await run('node --version')).stdout, /^v\d+\.\d+\.\d+\n$/);
   assert.match((await run('node -v')).stdout, /^v\d+\.\d+\.\d+\n$/);
   assert.match((await run('npm --version')).stdout, /^\d+\.\d+\.\d+\n$/);
+  assert.match((await run('pnpm --version')).stdout, /^\d+\.\d+\.\d+\n$/);
+  assert.match((await run('which pnpm')).stdout, /\/usr\/bin\/pnpm/);
   assert.match((await run('node --beownir')).stdout, /not native Node\.js/);
   assert.match((await run('npm --beownir')).stdout, /not the npm executable/);
+  assert.match((await run('pnpm --beownir')).stdout, /not the pnpm executable/);
+  assert.match((await run('pnpm --help')).stdout, /pnpm install/);
+  const origPkg = rt.CORE.fs.readFileSync('/project/package.json', 'utf8');
+  try {
+    rt.CORE.fs.writeFileSync('/project/package.json', JSON.stringify({ name: 'scratch', scripts: { test: 'node -e "console.log(19+23)"', greet: 'node -e "console.log(100+23)"' } }));
+    const ran = await run('pnpm test');
+    assert.equal(ran.code, 0);
+    assert.match(ran.stdout, /(?:^|\n)42\r?\n/);
+    const custom = await run('pnpm greet');
+    assert.equal(custom.code, 0);
+    assert.match(custom.stdout, /(?:^|\n)123\r?\n/);
+  } finally {
+    rt.CORE.fs.writeFileSync('/project/package.json', origPkg);
+  }
+  const execed = await run('pnpm exec node -e "console.log(21*2)"');
+  assert.equal(execed.code, 0);
+  assert.match(execed.stdout, /^42\b/);
 }));
 
 test('du reports files as well as directories', () => withScratch(async () => {

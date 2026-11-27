@@ -11884,7 +11884,7 @@ async function installTransaction(task) {
   }
   finally { holdSync--; syncBack(); }
 }
-const IGNORED_INSTALL_FLAGS = new Set(['-D', '--save-dev', '--save', '--save-exact', '--ignore-scripts', '--no-save', '--no-audit', '--no-fund', '--no-package-lock', '--legacy-peer-deps', '--force', '--prefer-offline', '--omit=dev', '--production', '--progress=false']);
+const IGNORED_INSTALL_FLAGS = new Set(['-D', '--save-dev', '--save', '--save-exact', '--ignore-scripts', '--no-save', '--no-audit', '--no-fund', '--no-package-lock', '--legacy-peer-deps', '--force', '--prefer-offline', '--omit=dev', '--production', '--progress=false', '--frozen-lockfile', '--no-frozen-lockfile', '--prefer-frozen-lockfile', '--shamefully-hoist', '--offline', '--silent', '-s', '--reporter=silent']);
 async function npmInstall(args) {
   return installTransaction(async () => {
     const path = '/project/package.json';
@@ -12360,14 +12360,14 @@ const USAGE = {
   xargs: 'xargs [-n N] [command…]', env: 'env', export: 'export NAME=value…', unset: 'unset NAME…',
   source: 'source <script>', which: 'which <command>', curl: 'curl [-I] [-o file] <https://registry.npmjs.org/…>',
   wget: 'wget [-O file] <https://registry.npmjs.org/…>', node: 'node <file> | node -e "code" | node -p "expression"',
-  npm: 'npm install|ci|run <script>|ls|init', npx: 'npx <tool> [arguments…]', esbuild: 'esbuild <entry> --bundle --outfile=<file>',
+  npm: 'npm install|ci|run <script>|ls|init', pnpm: 'pnpm install|add|run <script>|dlx|exec', npx: 'npx <tool> [arguments…]', esbuild: 'esbuild <entry> --bundle --outfile=<file>',
   ps: 'ps', kill: 'kill [-SIGNAL] <pid>', ports: 'ports', open: 'open <port>', 'close-port': 'close-port <port>',
   history: 'history', test: 'test <expression>', time: 'time <command…>', offline: 'offline [status|clear]',
 };
 const SHELL_HELP = `Beownir shell · a virtual POSIX-flavoured shell (not a native OS shell)
 
 node <file> | node -e "code" | node -p "expression"      run JavaScript here
-npm install [package@range] | npm ci | npm run <script>  registry client
+npm / pnpm install [pkg] | ci | run <script>             registry client
 npx serve --port 3000 | npx esbuild <entry> --bundle     preview / bundler
 ls cd pwd cat head tail wc grep sort uniq sed find stat  files
 touch mkdir rm cp mv ln chmod du df storage tree         files, continued
@@ -12999,7 +12999,7 @@ async function executeCommand(input) {
       return 0;
     }
     case 'which': {
-      const known = ['node', 'npm', 'npx', 'esbuild'];
+      const known = ['node', 'npm', 'pnpm', 'npx', 'esbuild'];
       if (!args[0]) throw new Error('Usage: ' + USAGE.which);
       if (known.includes(args[0])) { out('/usr/bin/' + args[0] + ' (virtual)\n'); return 0; }
       errOut(args[0] + ': not found\n');
@@ -13031,6 +13031,7 @@ async function executeCommand(input) {
     }
     case 'node': case 'nodejs': return runNode(args);
     case 'npm': return runNpm(args);
+    case 'pnpm': return runPnpm(args);
     case 'npx': return runNpx(args);
     case 'esbuild': return runEsbuild(args);
     case 'serve': case 'vite': return runNpx([command, ...args]);
@@ -13221,7 +13222,7 @@ async function settleEntryWork() {
 }
 async function runNode(args) {
   if (args[0] === '-v' || args[0] === '--version') { out('v' + String(processObj.versions.node) + '\n'); return 0; }
-  if (args[0] === '--beownir') { out('Beownir 2.1 · Node-compatible worker runtime in a browser (not native Node.js) · reports v' + String(processObj.versions.node) + '\n'); return 0; }
+  if (args[0] === '--beownir') { out('Beownir 3.0 · Node-compatible worker runtime in a browser (not native Node.js) · reports v' + String(processObj.versions.node) + '\n'); return 0; }
   if (['-e', '--eval', '-p'].includes(args[0])) {
     if (args[1] === undefined) throw new Error('node -e requires a quoted code argument.');
     self.require = makeRequire(CWD + '/__eval__.js');
@@ -13366,6 +13367,32 @@ async function runNpm(args) {
     return 0;
   }
   throw new Error('Unsupported npm command: ' + sub + '. This is a constrained registry client; type npm help.');
+}
+const PNPM_HELP = `Beownir registry client — pnpm-compatible CLI surface
+  pnpm install [--ignore-scripts]
+  pnpm add [name@range] [-D] [--save-exact]
+  pnpm run <script> | pnpm <script>
+  pnpm exec <cmd…> | pnpm dlx <tool…>
+  pnpm remove <name> | ls | view <name> | init
+`;
+async function runPnpm(args) {
+  const sub = args[0];
+  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(PNPM_HELP); return 0; }
+  if (['-v', '--version'].includes(sub)) { out('9.0.0\n'); return 0; }
+  if (sub === '--beownir') { out('Beownir registry client 3.0 · pnpm-compatible CLI surface (not the pnpm executable)\n'); return 0; }
+  if (sub === 'dlx') return runNpx(args.slice(1));
+  if (['exec', 'x'].includes(sub)) return runNpm(['exec', ...args.slice(1)]);
+  const mapped = sub === 'up' ? 'update' : sub;
+  if (['install', 'i', 'add', 'update', 'ci', 'ls', 'list', 'init', 'view', 'info', 'uninstall', 'remove', 'rm', 'run', 'run-script', 'start', 'dev', 'build', 'test'].includes(mapped)) {
+    return runNpm([mapped, ...args.slice(1)]);
+  }
+  if (!String(sub).startsWith('-')) {
+    try {
+      const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
+      if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
+    } catch {}
+  }
+  throw new Error('Unsupported pnpm command: ' + sub + '. This is a constrained registry client; type pnpm help.');
 }
 async function runViteCLI(args) {
   const vite = makeRequire(CWD + '/package.json')('vite');
@@ -13561,11 +13588,11 @@ function devServer(kind,args){
  res.writeHead(200,{'content-type':mime(file)});res.end(readFileSync(file));});
  server.listen(port);out('Embedded preview adapter (not the actual '+kind+' CLI). No HMR; saving a file refreshes the preview with live reload.\n');
 }
-const HELP=`Beownir 2.1 · custom virtual OS, phase 1
+const HELP=`Beownir 3.0 · browser worker runtime
 This is a Node-compatible worker runtime, not native Node.js.
 
 node <file> | node -e "code" | node -p "expression"
-npm install [package@range] | npm ci | npm run <script> | npm help
+npm / pnpm install [pkg] | ci | run <script> | npm help
 npx esbuild <entry> --bundle --outfile=dist/app.js
 npx serve --port 5173        preview HTML / bundled browser modules
 ls cat head tail grep sort sed find du df storage tree cp mv rm chmod
