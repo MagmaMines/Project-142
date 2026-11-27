@@ -113,6 +113,7 @@ export class BeownirKernel {
   readonly ports: number[];
   readonly files: Record<string, { c?: string; d?: boolean }>;
   start(): Promise<this>;
+  stop(): void;
   destroy(): void;
   whenReady(): Promise<this>;
   on(type: string, handler: (payload: unknown) => void): () => void;

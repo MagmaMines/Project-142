@@ -311,7 +311,7 @@
       if ((message.body?.byteLength || message.body?.length || 0) > 1024 * 1024) return Promise.reject(error('EFBIG', 'Virtual request body exceeds 1 MiB.'));
       const id = 'kernel-http-' + ++sequence;
       return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { httpRoutes.delete(id); reject(error('ETIMEDOUT', 'Virtual HTTP request timed out.')); }, 15000);
+        const timer = setTimeout(() => { httpRoutes.delete(id); reject(error('ETIMEDOUT', 'Virtual HTTP request timed out.')); }, 600000);
         httpRoutes.set(id, { target: target.actorKey, resolve, reject, timer });
         target.worker.postMessage({ ...message, type: 'http', id });
       });
@@ -326,7 +326,7 @@
       worker.onmessage = event => handleActorMessage(process, event.data);
       worker.onerror = event => { event.preventDefault(); finish(process, 1, null, error('ERR_WORKER', event.message || 'Virtual worker crashed.')); };
       worker.onmessageerror = () => finish(process, 1, null, error('ERR_IPC', 'Could not decode worker message.'));
-      process.bootTimeout = setTimeout(() => finish(process, 1, null, error('ETIMEDOUT', 'Virtual process startup timed out.')), 30000);
+      process.bootTimeout = setTimeout(() => finish(process, 1, null, error('ETIMEDOUT', 'Virtual process startup timed out.')), 600000);
       if (assets) initializeProcess(process);
       publishTable(); return process;
     }
@@ -421,7 +421,7 @@
       worker.onmessage = event => handleActorMessage(entry, event.data);
       worker.onerror = event => { event.preventDefault(); finishThread(entry, 1, error('ERR_WORKER', event.message || 'Worker thread crashed.')); };
       worker.onmessageerror = () => finishThread(entry, 1, error('ERR_IPC', 'Could not decode worker thread message.'));
-      entry.bootTimeout = setTimeout(() => finishThread(entry, 1, error('ETIMEDOUT', 'Worker thread startup timed out.')), 30000);
+      entry.bootTimeout = setTimeout(() => finishThread(entry, 1, error('ETIMEDOUT', 'Worker thread startup timed out.')), 600000);
       const wasm = assets.wasm.slice().buffer;
       const deps = assets.deps ? assets.deps.slice().buffer : undefined;
       const transfer = [wasm];
@@ -555,12 +555,13 @@
         case 'unbind-http': if (listeners.get(Number(data.port)) === actor.actorKey) { listeners.delete(Number(data.port)); sendHost({ type: 'close', port: Number(data.port) }); publishTable(); } return true;
         case 'http': return routeHTTP({ ...data, type: 'http' });
         case 'host-fetch': {
-          if (!networkConfig?.useHostProxy) throw error('ENOTCAPABLE', 'Host fetch proxy relay is not enabled.');
+          const hasRelativeProxy = typeof networkConfig?.corsProxy === 'string' && networkConfig.corsProxy.startsWith('/');
+          if (!networkConfig?.useHostProxy && !hasRelativeProxy) throw error('ENOTCAPABLE', 'Host fetch proxy relay is not enabled.');
           if (typeof data.url !== 'string' || !/^https:\/\//i.test(data.url) || data.url.length > 8192) throw error('EINVAL', 'Invalid proxied fetch URL.');
           if ((data.body?.byteLength || data.body?.length || 0) > 2 * 1024 * 1024) throw error('EFBIG', 'Proxied request body exceeds 2 MiB.');
           const fetchId = 'host-fetch-' + ++sequence;
           return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => { hostFetchPending.delete(fetchId); reject(error('ETIMEDOUT', 'Host fetch proxy timed out.')); }, 30000);
+            const timer = setTimeout(() => { hostFetchPending.delete(fetchId); reject(error('ETIMEDOUT', 'Host fetch proxy timed out.')); }, 600000);
             hostFetchPending.set(fetchId, { resolve, reject, timer });
             sendHost({ type: 'host-fetch', id: fetchId, url: data.url, method: data.method || 'GET', headers: data.headers || {}, body: data.body || null });
           });

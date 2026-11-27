@@ -29,7 +29,7 @@ const timeout=(promise,ms,message)=>new Promise((resolve,reject)=>{const t=setTi
 async function removeExecutionMount(pid){try{const root=await navigator.storage?.getDirectory?.();if(!root)return;const base=await root.getDirectoryHandle('beownir-wasix-v1');await base.removeEntry('workspace-'+(0x80000000+Number(pid)),{recursive:true})}catch(error){if(error?.name!=='NotFoundError')send({type:'stderr',data:'[opfs cleanup] '+String(error?.message||error)+'\n'})}}
 function table(){send({type:'kernel-processes',processes:[...engines.values()].filter(e=>!e.utility&&!e.retired).map(e=>({pid:e.pid,ppid:0,state:e.server?'server':e.ready?'running':'starting',command:e.line,cwd:cwd.replace(/^\/workspace/,'/project'),startedAt:e.startedAt,ports:[...e.ports]}))})}
 function postEngine(engine,message){if(engine.initSent)engine.worker.postMessage(message);else engine.queued.push(message)}
-function coreCall(engine,method,args=[]){if(engine.retired)return Promise.reject(Error('Execution group has stopped'));const id=++rpcSequence;return new Promise((resolve,reject)=>{const timer=method==='tcpRead'?null:setTimeout(()=>{engine.pending.delete(id);reject(Error('Execution-group operation timed out'))},120000);engine.pending.set(id,{resolve,reject,timer});engine.worker.postMessage({type:'rpc',id,method,args})})}
+function coreCall(engine,method,args=[]){if(engine.retired)return Promise.reject(Error('Execution group has stopped'));const id=++rpcSequence;return new Promise((resolve,reject)=>{const timer=method==='tcpRead'?null:setTimeout(()=>{engine.pending.delete(id);reject(Error('Execution-group operation timed out'))},600000);engine.pending.set(id,{resolve,reject,timer});engine.worker.postMessage({type:'rpc',id,method,args})})}
 function retire(engine,reason='Execution group finished'){
  if(engine.retired)return;engine.retired=true;for(const peer of [...peerStreams])if(peer.a.engine===engine||peer.b.engine===engine)void closePeer(peer);try{engine.hostMount?.dispose?.()}catch{}Promise.resolve(engine.worker.terminate()).finally(()=>void removeExecutionMount(engine.pid));clearTimeout(engine.deadline);
  for(const pending of engine.pending.values()){clearTimeout(pending.timer);pending.reject(Error(reason))}engine.pending.clear();
@@ -91,7 +91,7 @@ async function createEngine({line='',commandId=null,utility=false,checkpointAfte
  worker.onerror=e=>{e.preventDefault();failed(engine,Error(e.message||'Execution Worker failed'))};worker.onmessageerror=()=>failed(engine,Error('Invalid execution-group message'));
  const copy=Object.fromEntries(Object.entries(files).map(([p,v])=>[p,v.d?{d:true}:{c:v.c}])),versionCopy={...versions};const fingerprint=await dependencyFingerprint(copy);const selectedCheckpoint=checkpoint?.fingerprint===fingerprint?checkpoint:null;
  worker.postMessage({type:'init',files:copy,versions:versionCopy,checkpoint:selectedCheckpoint,config:{...config,cwd,isolatedJobId:pid,needsNpm:/^\s*(?:npm|npx)(?:\s|$)/.test(line),checkpointAfter,transactionalInstall}});engine.initSent=true;for(const message of engine.queued)worker.postMessage(message);engine.queued=[];table();
- try{await timeout(engine.readyPromise,180000,'Execution engine startup timed out');await synchronizePeers(engine)}catch(e){retire(engine,e.message);throw e}return engine;
+ try{await timeout(engine.readyPromise,600000,'Execution engine startup timed out');await synchronizePeers(engine)}catch(e){retire(engine,e.message);throw e}return engine;
 }
 async function initialize(m){if(initializing)return;initializing=true;files=m.files||{};versions=m.versions||{};config=m.config||{};projectId=String(m.projectId||crypto.randomUUID());
  try{const persisted=await storage.persist();if(persisted.granted&&!persisted.persisted)send({type:'stderr',data:'[storage] this browser declined persistent storage; the workspace can be evicted when the device is low on space\n'})}catch{}
@@ -107,7 +107,7 @@ function localCommand(line,id){
  if(line.trim()==='help'){send({type:'stdout',data:'Browser WASIX Node · isolated execution groups\nUse npm/pnpm install, npm ci, npm run dev/build, node file.js.\nbeownir doctor / native-build / checkpoint / browser file.js\nEach command group has its own engine and port ownership. Source edits synchronize; committed dependencies/builds checkpoint to browser storage.\n'});send({type:'done',id,code:0});return true}return false;
 }
 async function execute(m){const line=String(m.line||'');if(!line.trim()||line.length>65536)throw Error('Invalid command');if(localCommand(line,m.id))return;
- const install=/^\s*(?:npm|pnpm)\s+(?:i|install|ci|add|update|up|remove|uninstall|rebuild)(?:\s|$)/.test(line),build=/^\s*(?:npm|pnpm)(?:\s+run)?\s+(?:build|generate)(?:\s|$)/.test(line)||/^\s*beownir\s+(?:native-build|checkpoint)(?:\s|$)/.test(line);
+ const install=/^\s*(?:npm|pnpm|yarn|bun)\s+(?:i|install|ci|add|update|up|remove|uninstall|rebuild)(?:\s|$)/.test(line),build=/^\s*(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:build|generate)(?:\s|$)/.test(line)||/^\s*beownir\s+(?:native-build|checkpoint)(?:\s|$)/.test(line);
  if(install||build)await stopAll();
  if(install||build){
   const need=install?512*1024*1024:384*1024*1024;
@@ -116,8 +116,8 @@ async function execute(m){const line=String(m.line||'');if(!line.trim()||line.le
   if(!verdict.ok){send({type:'stderr',data:capacityMessage(verdict,install?'npm install':'the build')+'\n'});send({type:'done',id:m.id,code:1});return}
  }
  const engine=await createEngine({line,commandId:m.id,checkpointAfter:install||build,transactionalInstall:install});
- const budget=install?300000:900000;
- engine.deadline=setTimeout(()=>failed(engine,Error(install?'Package operation exceeded the five-minute browser budget':'Execution group exceeded 15-minute budget')),budget);
+ const budget=install?600000:900000;
+ engine.deadline=setTimeout(()=>failed(engine,Error(install?'Package operation exceeded the ten-minute browser budget':'Execution group exceeded 15-minute budget')),budget);
  engine.worker.postMessage({type:'cmd',line,id:m.id});
 }
 function publicPort(port){if(!Number.isInteger(port)||port<1||port>65535||port>=60000&&port<=62001)throw Error('Invalid or reserved guest port');const e=ports.get(port);if(!e||e.retired)throw Error('No execution group listens on guest port '+port);return e}

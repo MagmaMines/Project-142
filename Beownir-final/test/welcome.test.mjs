@@ -83,28 +83,31 @@ test('static-host Install and Build actions use the Web mode runtime', () => {
   assert.match(setup, /nativeMode\(\)\s*\?\s*'pnpm install --ignore-scripts'\s*:\s*'npm install'/);
   assert.match(setup, /nativeMode\(\)\s*\?\s*'pnpm build'\s*:\s*'npm run build'/);
   assert.match(setup, /\[\['Install declared dependencies','npm install'\],\['Build project script','npm run build'\]\]/);
-  assert.match(setup, /Web mode includes an npm and pnpm-compatible registry installer/);
+  assert.match(setup, /Web mode includes an npm, pnpm, yarn, and bun-compatible registry installer/);
   assert.match(setup, /Web mode does not compile native C\/C\+\+ addons/);
 });
 
 test('an isolated Chromium unlocks the native capabilities', () => {
   const { sandbox } = load();
   const rows = byName(sandbox.probeCapabilities());
-  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'Native browser-WASM profile', 'OPFS execution mounts', 'Offline shell (service worker)', 'Virtual loopback TCP & UDP sockets', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
+  for (const name of ['Cross-origin isolation', 'SharedArrayBuffer', 'Native browser-WASM profile', 'OPFS execution mounts', 'Offline shell (service worker)', 'Virtual loopback TCP & UDP sockets', 'Virtual loopback TLS & HTTP/2', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto', 'Outbound HTTPS relay (registry & configured domains)']) {
     assert.equal(rows[name].ok, true, name + ' is reported as available');
   }
-  assert.equal(rows['Open a preview in another tab (host bridge)'].ok, false, 'no host is configured in this scenario');
-  assert.equal(rows['External outbound network & server TLS'].ok, false, 'external non-HTTP sockets and server TLS remain unsupported');
+  assert.equal(rows['Open a preview in another tab (host bridge)'].ok, false, 'no host or controlling service worker is active in this scenario');
+  assert.equal(rows['External raw sockets & unfiltered network'].ok, false, 'external non-HTTP raw sockets remain unsupported');
   assert.equal(rows['Unmapped native addons & OS binaries'].ok, false, 'unmapped native binaries remain unsupported');
   assert.equal(rows['TLS, raw TCP/UDP, unmapped native addons'], undefined, 'TCP/UDP is not misreported as unavailable');
 });
 
-test('a localhost service-worker browser notes same-origin loopback preview', () => {
-  const { sandbox } = load({ hostname: '127.0.0.1', swController: true });
-  const rows = byName(sandbox.probeCapabilities());
-  assert.equal(rows['Open a preview in another tab (host bridge)'].ok, false);
-  assert.match(rows['Open a preview in another tab (host bridge)'].detail, /__beownir_preview__/);
-  assert.match(rows['Framework dev servers (Vite, Next.js, Nuxt)'].detail, /HMR/);
+test('an active service worker unlocks cross-tab preview on both localhost and served origins', () => {
+  const local = byName(load({ hostname: '127.0.0.1', swController: true }).sandbox.probeCapabilities());
+  assert.equal(local['Open a preview in another tab (host bridge)'].ok, true);
+  assert.match(local['Open a preview in another tab (host bridge)'].detail, /__beownir_preview__/);
+  assert.match(local['Framework dev servers (Vite, Next.js, Nuxt)'].detail, /HMR/);
+
+  const hosted = byName(load({ hostname: 'ide.example.test', swController: true }).sandbox.probeCapabilities());
+  assert.equal(hosted['Open a preview in another tab (host bridge)'].ok, true);
+  assert.match(hosted['Open a preview in another tab (host bridge)'].detail, /__beownir_preview__/);
 });
 
 test('a plain static host reports exactly what is missing and why', () => {
@@ -116,10 +119,10 @@ test('a plain static host reports exactly what is missing and why', () => {
   assert.equal(rows['Native browser-WASM profile'].ok, false);
   assert.match(rows['Offline shell (service worker)'].detail, /file:\/\//, 'the file:// case is explained');
   // What does not depend on the environment keeps working.
-  for (const name of ['Editor, terminal, virtual filesystem', 'npm & pnpm installs', 'Servers and the preview panel', 'Virtual loopback TCP & UDP sockets', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto']) {
+  for (const name of ['Editor, terminal, virtual filesystem', 'npm & pnpm installs', 'Servers and the preview panel', 'Virtual loopback TCP & UDP sockets', 'Virtual loopback TLS & HTTP/2', 'Framework dev servers (Vite, Next.js, Nuxt)', 'X.509 certificate parsing & asymmetric crypto', 'Outbound HTTPS relay (registry & configured domains)']) {
     assert.equal(rows[name].ok, true, name + ' stays available');
   }
-  assert.equal(rows['External outbound network & server TLS'].ok, false, 'external raw sockets and server TLS are never claimed');
+  assert.equal(rows['External raw sockets & unfiltered network'].ok, false, 'external raw sockets and unfiltered domains are never claimed');
   assert.equal(rows['Unmapped native addons & OS binaries'].ok, false, 'unmapped native binaries are never claimed');
 });
 
@@ -130,6 +133,14 @@ test('OPFS and the host bridge are reported independently', () => {
   assert.match(rows['OPFS execution mounts'].detail, /IndexedDB/);
   assert.equal(rows['Open a preview in another tab (host bridge)'].ok, true);
   assert.match(rows['Offline shell (service worker)'].detail, /beownir-host\.mjs/);
+});
+
+test('worker stop never auto-restarts new workers and SW open-in-tab button stays wired', () => {
+  assert.match(page, /async function stopRuntime\(/);
+  assert.match(page, /bind\('#stop',\s*\(\)\s*=>\s*stopRuntime\(\{\s*announce:\s*true\s*\}\)\)/);
+  assert.match(page, /stop:\s*\(\)\s*=>\s*stopRuntime\(\{\s*announce:\s*true\s*\}\)/);
+  assert.match(page, /if\s*\(data === '\\x03'\)\s*\{[^}]*stopRuntime\(\{\s*announce:\s*true\s*\}\)/);
+  assert.match(page, /if\s*\(swPreviewBridgeAvailable\(\)\)\s*\{\s*openBtn\.dataset\.url\s*=\s*'\/__beownir_preview__\/'\s*\+\s*port\s*\+\s*path;\s*openBtn\.hidden\s*=\s*false;/);
 });
 
 test('the capability list marks each row and carries its reason', () => {

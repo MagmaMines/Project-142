@@ -99,7 +99,7 @@
     });
   });
   async function send(message) {
-    const channel = await Promise.race([connected, new Promise((_, reject) => setTimeout(() => reject(new Error('Preview bridge did not connect.')), 8000))]);
+    const channel = await Promise.race([connected, new Promise((_, reject) => setTimeout(() => reject(new Error('Preview bridge did not connect.')), 60000))]);
     channel.postMessage(message);
   }
   window.fetch = async function virtualFetch(input, init = {}) {
@@ -116,7 +116,7 @@
     if (body && body.byteLength > 1024 * 1024) throw new Error('Virtual request body exceeds 1 MiB.');
     const id = ++sequence;
     const response = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { waiting.delete(id); reject(new Error('Virtual request timed out.')); }, 15000);
+      const timer = setTimeout(() => { waiting.delete(id); reject(new Error('Virtual request timed out.')); }, 600000);
       waiting.set(id, { resolve, reject, timer });
       request.signal.addEventListener('abort', () => { const item = waiting.get(id); if (item) { clearTimeout(item.timer); waiting.delete(id); reject(new DOMException('Request aborted', 'AbortError')); } }, { once: true });
       send({ type: 'request', id, path: url.pathname + url.search, method: request.method, headers: reqHeaders, body }).catch(error => { clearTimeout(timer); waiting.delete(id); reject(error); });

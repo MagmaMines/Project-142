@@ -117,7 +117,7 @@ self.addEventListener('message', event => {
  * project, and deliberately not what the deployed IDE uses for untrusted code. The IDE
  * decides which mode to use; this worker just serves both faithfully. */
 const PREVIEW_PREFIX = '/__beownir_preview__/';
-const PREVIEW_TIMEOUT_MS = 20000;
+const PREVIEW_TIMEOUT_MS = 600000;
 const swCookieJars = new Map();
 function swPortJar(port) {
   let jar = swCookieJars.get(port);
@@ -265,7 +265,7 @@ const PREVIEW_WS_SHIM = `(function () {
         fire(self, 'close', { code: 1006, reason: 'connect timeout', wasClean: false });
         delete active[self._uid];
       }
-    }, 10000);
+    }, 60000);
   }
   ShimSocket.prototype.CONNECTING = 0;
   ShimSocket.prototype.OPEN = 1;

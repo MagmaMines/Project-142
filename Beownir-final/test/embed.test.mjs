@@ -243,6 +243,35 @@ test('BeownirKernel supports VirtualCookieJar, wildcard previewOrigin resolution
   const netMsg = posted.pop();
   assert.equal(netMsg.type, 'set-network');
   assert.deepEqual(JSON.parse(JSON.stringify(netMsg.network)), { allowedFetchDomains: ['registry.yarnpkg.com'], corsProxy: null, useHostProxy: true });
+
+  // stop() and kernel-stopped cleanly tear down without auto-restarting
+  let terminatedSent = false;
+  const oldChannel = { postMessage(m) { if (m?.type === 'terminate') terminatedSent = true; }, close() {} };
+  kernel._channel = oldChannel;
+  kernel._frame = { remove() {} };
+  const cmdPromise = kernel.run('node -e "setTimeout(()=>{}, 1000)"');
+  kernel.stop();
+  assert.equal(terminatedSent, true);
+  assert.equal(kernel.state, 'stopped');
+  assert.equal(kernel.ready, false);
+  await assert.rejects(cmdPromise, /stopped/);
+
+  // Relative corsProxy relays host-fetch even when useHostProxy flag is omitted
+  const fetched = [];
+  kernel._state = 'ready';
+  kernel._channel = { postMessage(msg) { posted.push(msg); }, close() {} };
+  kernel._network = { allowedFetchDomains: ['api.github.com'], corsProxy: '/__beownir_cors_proxy__', useHostProxy: false };
+  context.fetch = async (url) => {
+    fetched.push(String(url));
+    return new Response('proxy-ok', { status: 200 });
+  };
+  kernel._receive({ type: 'host-fetch', id: 'hf-1', url: 'https://api.github.com/zen', method: 'GET' });
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(fetched[0], '/__beownir_cors_proxy__?url=https%3A%2F%2Fapi.github.com%2Fzen');
+
+  kernel._receive({ type: 'kernel-stopped' });
+  assert.equal(kernel.state, 'stopped');
+
   kernel.destroy();
   tplKernel.destroy();
 });

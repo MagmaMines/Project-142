@@ -260,7 +260,7 @@ async function runtimeFetch(input, init = {}, options = {}) {
   if (!domainAllowed) {
     throw Object.assign(new Error('Network restricted to virtual loopback, https://registry.npmjs.org, and configured allowedFetchDomains (refused: ' + u.origin + ').'), { code: 'ENOTCAPABLE' });
   }
-  if (policy.useHostProxy && typeof kernelCall === 'function' && typeof kernelInfo === 'object' && kernelInfo) {
+  if ((policy.useHostProxy || (policy.corsProxy && policy.corsProxy.startsWith('/'))) && typeof kernelCall === 'function' && typeof kernelInfo === 'object' && kernelInfo) {
     const request = new Request(input instanceof Request ? input : u.href, init), method = request.method;
     const body = ['GET', 'HEAD'].includes(method) ? null : new Uint8Array(await request.arrayBuffer());
     if (body?.byteLength > 2 * 1024 * 1024) throw virtualError('EFBIG', 'Proxied request exceeds 2 MiB.');
@@ -1571,20 +1571,31 @@ function parseListenTarget(port, args) {
   return { requested: Number(requested), cb };
 }
 class Server extends EventEmitter {
-  constructor(handler){ super(); if(handler) this.on('request', handler); this.listening=false; this.requestTimeout=300000; }
+  constructor(handler, options){
+    super();
+    if(handler) this.on('request', handler);
+    this.listening=false;
+    this.requestTimeout=600000;
+    this._tlsOptions=options && typeof options==='object' ? { ...options } : {};
+    this._isHttps=false;
+    this._isHttp2=false;
+    this._isHttp2Secure=false;
+  }
   listen(port, ...rest){
     const { requested, cb } = parseListenTarget(port, rest);
     let chosen = requested;
-    if (chosen === 0) { chosen = 3000; while (SERVERS.has(chosen) && chosen < 65535) chosen++; }
-    this.port = chosen;if(!Number.isInteger(this.port)||this.port<1||this.port>65535)throw new Error('Invalid virtual port.');if(SERVERS.has(this.port))throw Object.assign(new Error('Virtual port already in use: '+this.port),{code:'EADDRINUSE'});this.listening=true;
+    if (chosen === 0) { chosen = 3000; while ((SERVERS.has(chosen) || NET_SERVERS.has(chosen)) && chosen < 65535) chosen++; }
+    this.port = chosen;if(!Number.isInteger(this.port)||this.port<1||this.port>65535)throw new Error('Invalid virtual port.');if(SERVERS.has(this.port)||NET_SERVERS.has(this.port))throw Object.assign(new Error('Virtual port already in use: '+this.port),{code:'EADDRINUSE'});this.listening=true;
     SERVERS.set(this.port, this);
     post({type:'listen', port:this.port});
-    out('\x1b[32m✔\x1b[0m server listening on \x1b[36mhttp://localhost:'+this.port+'\x1b[0m\n');
+    const scheme = (this._isHttps || this._isHttp2Secure) ? 'https' : 'http';
+    out('\x1b[32m✔\x1b[0m server listening on \x1b[36m'+scheme+'://localhost:'+this.port+'\x1b[0m\n');
     if (cb) setTimeout(cb,0);
     this.emit('listening');
     return this;
   }
   address(){ return {port:this.port, address:'127.0.0.1', family:'IPv4'}; }
+  setSecureContext(options){ this._tlsOptions = Object.assign(this._tlsOptions || {}, options || {}); return this; }
   close(cb){ SERVERS.delete(this.port); this.listening=false; post({type:'close', port:this.port}); cb&&cb(); return this; }
   setTimeout(){ return this; }
 }
@@ -1601,16 +1612,21 @@ function handleHttp(msg,callback){
   if (!srv) return reply({status:502, headers:{'content-type':'text/html'},
     body: Buffer.from('<h3 style="font:600 16px system-ui;padding:24px">No server listening on port '+msg.port+'</h3><p style="font:14px system-ui;padding:0 24px;color:#666">Run your app first (e.g. <code>node server.js</code>).</p>')});
   const incomingBody=msg.body===null||msg.body===undefined?null:Buffer.from(msg.body);const incomingHeaders={host:'localhost:'+msg.port};for(const[k,v]of Object.entries(msg.headers||{}))incomingHeaders[k.toLowerCase()]=v;if(incomingBody&&!Object.prototype.hasOwnProperty.call(incomingHeaders,'content-length'))incomingHeaders['content-length']=String(incomingBody.length);
-  const req=new IncomingMessage({method:msg.method,url:msg.url,headers:incomingHeaders,httpVersion:'1.1',httpVersionMajor:1,httpVersionMinor:1,complete:false});
-  const res = new ServerResponse(reply);res._request=req;res.req=req;req.res=res;
+  const encrypted = Boolean(srv._isHttps || srv._isHttp2Secure);
+  if (srv._isHttp2 && srv.listenerCount('stream') > 0 && typeof dispatchHttp2ServerStream === 'function') {
+    return dispatchHttp2ServerStream(srv, msg, incomingHeaders, incomingBody, reply);
+  }
+  const sock = virtualSocket();
+  sock.localPort = msg.port;
+  sock.encrypted = encrypted;
+  const httpVersion = srv._isHttp2 ? '2.0' : '1.1';
+  const req=new IncomingMessage({method:msg.method,url:msg.url,headers:incomingHeaders,httpVersion,httpVersionMajor:srv._isHttp2?2:1,httpVersionMinor:srv._isHttp2?0:1,complete:false,socket:sock});
+  const res = new ServerResponse(reply);res._request=req;res.req=req;req.res=res;res.socket=sock;res.connection=sock;
   try {
     for(const handler of srv.rawListeners('request')){const value=handler.call(srv,req,res);if(value&&typeof value.then==='function')value.catch(e=>{if(!res.finished){res.statusCode=500;res.end(String(e?.stack||e));}});}
     if(incomingBody?.length)req.push(incomingBody);
     req.push(null);req.complete=true;
-    /* Node's server.requestTimeout defaults to 300 s: a dev server's first
-     * hit legitimately spends minutes compiling. Ours honours the same knob
-     * instead of a fixed 10 s that no framework could ever meet. */
-    const requestTimeoutMs = Number.isFinite(Number(srv.requestTimeout)) && Number(srv.requestTimeout) > 0 ? Number(srv.requestTimeout) : 300000;
+    const requestTimeoutMs = Number.isFinite(Number(srv.requestTimeout)) && Number(srv.requestTimeout) > 0 ? Number(srv.requestTimeout) : 600000;
     if (!res.finished) {
       requestTimer = runtimeNativeSetTimeout(()=>{ requestTimer = null; if(!res.finished) res.writeHead(504,{'content-type':'text/plain'}).end('Virtual request timed out after '+Math.round(requestTimeoutMs/1000)+' seconds.'); }, requestTimeoutMs);
       if (requestTimer && typeof requestTimer.unref === 'function') requestTimer.unref();
@@ -1623,13 +1639,38 @@ const HTTP_TOKEN = /^[\^_`a-zA-Z\-0-9!#$%&'*+.\|~]+$/;
 const HTTP_INVALID_CHAR = /[^\t\x20-\x7e\x80-\xff]/;
 function validateHeaderName(name){ const text=String(name); if(!text || !HTTP_TOKEN.test(text)) throw Object.assign(new TypeError('Header name must be a valid HTTP token ["'+text+'"]'),{code:'ERR_INVALID_HTTP_TOKEN'}); }
 function validateHeaderValue(name, value){ if(value===undefined) throw Object.assign(new TypeError('Invalid value "undefined" for header "'+name+'"'),{code:'ERR_HTTP_INVALID_HEADER_VALUE'}); for(const item of Array.isArray(value)?value:[value]) if(HTTP_INVALID_CHAR.test(String(item))) throw Object.assign(new TypeError('Invalid character in header content ["'+name+'"]'),{code:'ERR_INVALID_CHAR'}); }
-const clientRequest = (options, callback, protocol) => new ClientRequest(options, callback, protocol);
+const clientRequest = (urlOrOpts, optionsOrCb, maybeCb, protocol) => {
+  if (typeof protocol === 'undefined' && typeof maybeCb === 'string') {
+    protocol = maybeCb;
+    maybeCb = undefined;
+  }
+  let opts, cb;
+  if (typeof urlOrOpts === 'string' || urlOrOpts instanceof URL) {
+    if (typeof optionsOrCb === 'function') { opts = urlOrOpts; cb = optionsOrCb; }
+    else {
+      const base = urlOrOpts instanceof URL ? urlOrOpts : new URL(String(urlOrOpts), (protocol || 'http') + '://localhost');
+      opts = {
+        href: base.href,
+        protocol: base.protocol,
+        hostname: base.hostname,
+        port: base.port,
+        path: base.pathname + base.search,
+        ...(optionsOrCb || {}),
+      };
+      cb = typeof maybeCb === 'function' ? maybeCb : undefined;
+    }
+  } else {
+    opts = urlOrOpts;
+    cb = typeof optionsOrCb === 'function' ? optionsOrCb : undefined;
+  }
+  return new ClientRequest(opts, cb, protocol);
+};
 const HTTP = { createServer:(...a)=>new Server(a.find(x=>typeof x==='function')), Server, ServerResponse, IncomingMessage,
   STATUS_CODES:HTTP_STATUS_CODES,
   METHODS:['ACL','BIND','CHECKOUT','CONNECT','COPY','DELETE','GET','HEAD','LINK','LOCK','M-SEARCH','MERGE','MKACTIVITY','MKCALENDAR','MKCOL','MOVE','NOTIFY','OPTIONS','PATCH','POST','PROPFIND','PROPPATCH','PURGE','PUT','QUERY','REBIND','REPORT','SEARCH','SOURCE','SUBSCRIBE','TRACE','UNBIND','UNLINK','UNLOCK','UNSUBSCRIBE'],
   maxHeaderSize:16384, validateHeaderName, validateHeaderValue, setMaxIdleHTTPParsers(){ return 0; },
-  request(opts, cb){ return clientRequest(opts, cb, 'http'); },
-  get(opts, cb){ const r = clientRequest(opts, cb, 'http'); r.end(); return r; },
+  request(urlOrOpts, optsOrCb, cb){ return clientRequest(urlOrOpts, optsOrCb, cb, 'http'); },
+  get(urlOrOpts, optsOrCb, cb){ const r = clientRequest(urlOrOpts, optsOrCb, cb, 'http'); r.end(); return r; },
   Agent:class Agent { constructor(options={}){ Object.assign(this,{keepAlive:false,maxSockets:Infinity,maxFreeSockets:256},options); } destroy(){} }, globalAgent:null };
 /* ---------- HTTP client ----------
  * A real ClientRequest: same request/response contract Node exposes, dispatched
@@ -3224,7 +3265,289 @@ class NetServer extends EventEmitter {
 }
 function netIsIP(s){s=String(s||'');if(/^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(s))return 4;if(s.includes(':')){try{new URL('http://['+s+']/');return 6;}catch(e){}}return 0;}
 const NET={Server:NetServer,Socket:NetSocket,createServer:(opts,listener)=>{if(typeof opts==='function'){listener=opts;opts={};}const s=new NetServer(listener);if(opts)s.allowHalfOpen=!!opts.allowHalfOpen;return s;},connect:(...a)=>new NetSocket().connect(...a),createConnection:(...a)=>new NetSocket().connect(...a),isIP:netIsIP,isIPv4:s=>netIsIP(s)===4,isIPv6:s=>netIsIP(s)===6,BlockList:class{check(){return false;}addAddress(){}addRange(){}addSubnet(){}},SocketAddress:class{constructor(o={}){Object.assign(this,o);this.address=o.address||'127.0.0.1';this.port=o.port||0;this.family=o.family||'IPv4';}}};
-const TLS={connect:()=>{const s=new NetSocket();queueMicrotask(()=>s.emit('error',netError('ERR_BROWSER_RAW_TLS_UNSUPPORTED','Raw TLS sockets are blocked by browser security. Use https.request/fetch, whose TLS is handled by the browser.')));return s;},createServer:()=>{throw netError('ERR_BROWSER_TLS_SERVER_UNSUPPORTED','TLS server sockets/certificates cannot be hosted by a browser-only page. Use the virtual HTTP server or a remote TLS terminator.');},TLSSocket:NetSocket,DEFAULT_ECDH_CURVE:'auto',DEFAULT_MIN_VERSION:'TLSv1.2',DEFAULT_MAX_VERSION:'TLSv1.3'};
+class TLSSecureContext {
+  constructor(options = {}) {
+    this.options = { ...(options || {}) };
+    this.context = this.options;
+  }
+}
+function tlsNormalizeAlpn(list) {
+  if (!list) return [];
+  if (Array.isArray(list)) return list.map(x => String(x)).filter(Boolean);
+  if (typeof Uint8Array !== 'undefined' && ArrayBuffer.isView(list)) {
+    const u8 = new Uint8Array(list.buffer, list.byteOffset, list.byteLength);
+    const out = []; let i = 0;
+    while (i < u8.length) {
+      const len = u8[i++];
+      if (!len || i + len > u8.length) break;
+      out.push(Buffer.from(u8.subarray(i, i + len)).toString('utf8'));
+      i += len;
+    }
+    return out;
+  }
+  return [String(list)];
+}
+function tlsExtractCertDetails(pemOrDer) {
+  if (!pemOrDer) return {};
+  try {
+    const X509 = CORE?.crypto?.X509Certificate;
+    if (typeof X509 !== 'function') return {};
+    const first = Array.isArray(pemOrDer) ? pemOrDer[0] : pemOrDer;
+    const x509 = new X509(first);
+    const toObj = str => {
+      const o = {};
+      for (const line of String(str || '').split('\n')) {
+        const idx = line.indexOf('=');
+        if (idx > 0) o[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+      }
+      return o;
+    };
+    return {
+      subject: toObj(x509.subject),
+      issuer: toObj(x509.issuer),
+      subjectaltname: x509.subjectAltName || undefined,
+      valid_from: x509.validFrom,
+      valid_to: x509.validTo,
+      fingerprint: x509.fingerprint,
+      fingerprint256: x509.fingerprint256,
+      serialNumber: x509.serialNumber,
+      raw: Buffer.from(x509.raw),
+      _x509: x509,
+    };
+  } catch {
+    return {};
+  }
+}
+function tlsVerifyServerCert(certPem, caOpt, servername) {
+  const details = tlsExtractCertDetails(certPem);
+  const leaf = details._x509;
+  if (!leaf) return { authorized: true, authorizationError: null, peerCert: details };
+  const caList = (Array.isArray(caOpt) ? caOpt : caOpt ? [caOpt] : []).concat(CORE?.tls?.rootCertificates || []);
+  let verified = false;
+  for (const caItem of caList) {
+    try {
+      const caX509 = new CORE.crypto.X509Certificate(caItem);
+      if (leaf.verify(caX509.publicKey) || leaf.fingerprint256 === caX509.fingerprint256) { verified = true; break; }
+    } catch {}
+  }
+  if (!verified && caList.length === 0) {
+    return {
+      authorized: false,
+      authorizationError: leaf.issuer === leaf.subject ? 'DEPTH_ZERO_SELF_SIGNED_CERT' : 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+      peerCert: details,
+    };
+  }
+  if (!verified) return { authorized: false, authorizationError: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', peerCert: details };
+  if (servername && !netIsIP(servername) && typeof leaf.checkHost === 'function') {
+    const matched = leaf.checkHost(servername);
+    if (!matched) return { authorized: false, authorizationError: 'ERR_TLS_CERT_ALTNAME_INVALID', peerCert: details };
+  }
+  return { authorized: true, authorizationError: null, peerCert: details };
+}
+class TLSSocket extends NetSocket {
+  constructor(socketOrOptions, tlsOptions = {}) {
+    const isWrappingSocket = socketOrOptions && typeof socketOrOptions.on === 'function' && typeof socketOrOptions.write === 'function';
+    const opts = isWrappingSocket ? (tlsOptions || {}) : ((socketOrOptions && typeof socketOrOptions === 'object') ? socketOrOptions : (tlsOptions || {}));
+    super(opts);
+    this.encrypted = true;
+    this.authorized = false;
+    this.authorizationError = null;
+    this.alpnProtocol = false;
+    this.servername = opts.servername || opts.host || 'localhost';
+    this._tlsOptions = { ...opts };
+    this._peerCert = {};
+    this._ownCert = opts.cert ? tlsExtractCertDetails(opts.cert) : {};
+    this._protocol = opts.maxVersion || 'TLSv1.3';
+    this._rawSocket = isWrappingSocket ? socketOrOptions : null;
+    this._sessionId = Buffer.alloc(32);
+    if (hasSecureRandom()) try { secureRandomBytes(this._sessionId); } catch {}
+    if (this._rawSocket) {
+      this._rawSocket.on('data', chunk => { this.bytesRead += chunk.length; this.push(chunk); });
+      this._rawSocket.on('end', () => this.push(null));
+      this._rawSocket.on('error', err => this.emit('error', err));
+      this._rawSocket.on('close', hadErr => this.emit('close', hadErr));
+      if (!opts.isServer) {
+        this.authorized = opts.rejectUnauthorized === false || Boolean(opts.ca);
+        this.alpnProtocol = tlsNormalizeAlpn(opts.ALPNProtocols)[0] || false;
+        queueMicrotask(() => { if (!this.destroyed) this.emit('secureConnect'); });
+      }
+    }
+  }
+  getProtocol() { return this._protocol; }
+  getCipher() { return { name: 'TLS_AES_256_GCM_SHA384', standardName: 'TLS_AES_256_GCM_SHA384', version: this._protocol }; }
+  getSharedSigalgs() { return ['ECDSA+SHA256', 'RSA-PSS+SHA256', 'RSA+SHA256']; }
+  getPeerCertificate(detailed = false) {
+    const out = { ...this._peerCert };
+    delete out._x509;
+    if (!detailed && out.raw && !Object.keys(out).length) return {};
+    return out;
+  }
+  getCertificate() {
+    const out = { ...this._ownCert };
+    delete out._x509;
+    return out;
+  }
+  getSession() { return this._sessionId; }
+  isSessionReused() { return false; }
+  setServername(name) { this.servername = String(name || ''); }
+  setMaxSendFragment() { return true; }
+  disableRenegotiation() {}
+  renegotiate(options, callback) {
+    if (typeof options === 'function') { callback = options; options = {}; }
+    if (callback) queueMicrotask(() => callback(null));
+    return true;
+  }
+  write(chunk, encoding, cb) {
+    if (this._rawSocket) return this._rawSocket.write(chunk, encoding, cb);
+    return super.write(chunk, encoding, cb);
+  }
+  end(data, encoding, cb) {
+    if (this._rawSocket) { this._rawSocket.end(data, encoding, cb); return this; }
+    return super.end(data, encoding, cb);
+  }
+  destroy(err) {
+    if (this._rawSocket && !this._rawSocket.destroyed) this._rawSocket.destroy(err);
+    return super.destroy(err);
+  }
+  connect(...args) {
+    const cb = args.find(x => typeof x === 'function');
+    const first = args[0];
+    let opts = {};
+    if (first && typeof first === 'object' && !(first instanceof URL)) {
+      opts = { ...this._tlsOptions, ...first };
+    } else if (typeof first === 'string' && !/^\d+$/.test(first)) {
+      opts = { ...this._tlsOptions, path: first, ...(args[1] && typeof args[1] === 'object' ? args[1] : {}) };
+    } else {
+      const port = Number(first);
+      const host = typeof args[1] === 'string' ? args[1] : (args[1] && typeof args[1] === 'object' ? (args[1].host || '127.0.0.1') : '127.0.0.1');
+      const extra = args.find(x => x && typeof x === 'object' && x !== first);
+      opts = { ...this._tlsOptions, port, host, ...(extra || {}) };
+    }
+    this._tlsOptions = opts;
+    if (opts.servername) this.servername = String(opts.servername);
+    else if (opts.host && !netIsIP(opts.host)) this.servername = String(opts.host);
+    if (cb) this.once('secureConnect', cb);
+    if (opts.socket && typeof opts.socket.on === 'function') {
+      this._rawSocket = opts.socket;
+      this.authorized = opts.rejectUnauthorized === false || Boolean(opts.ca);
+      this.alpnProtocol = tlsNormalizeAlpn(opts.ALPNProtocols)[0] || false;
+      queueMicrotask(() => { if (!this.destroyed) this.emit('secureConnect'); });
+      return this;
+    }
+    const pipe = opts.path && opts.port === undefined ? resolve(String(opts.path)) : null;
+    this.connecting = true;
+    if (!pipe) {
+      this.remotePort = Number(opts.port) || 443;
+      this.remoteAddress = String(opts.host || opts.hostname || '127.0.0.1');
+    }
+    queueMicrotask(() => {
+      if (this.destroyed) return;
+      const hostLower = String(this.remoteAddress || '').toLowerCase();
+      if (!pipe && !['127.0.0.1', 'localhost', '::1', '0.0.0.0'].includes(hostLower)) {
+        this.connecting = false;
+        const e = netError('ERR_BROWSER_RAW_TLS_UNSUPPORTED', 'Raw external TLS sockets are blocked by browser security. Use https.request/fetch (browser-managed TLS) or virtual loopback tls.createServer/tls.connect.');
+        this.emit('error', e); this.destroy(e); return;
+      }
+      const key = pipe || this.remotePort;
+      const server = NET_SERVERS.get(key);
+      if (!server || !server.listening) {
+        this.connecting = false;
+        const code = pipe ? (FS[pipe] ? 'ECONNREFUSED' : 'ENOENT') : 'ECONNREFUSED';
+        const e = netError(code, 'connect ' + code + ' ' + (pipe || (hostLower + ':' + this.remotePort)));
+        this.emit('error', e); this.destroy(e); return;
+      }
+      if (!server._isTls) {
+        this.connecting = false;
+        const e = netError('ERR_SSL_WRONG_VERSION_NUMBER', 'TLS handshake failed: target loopback port is not a tls.Server.');
+        this.emit('error', e); this.destroy(e); return;
+      }
+      const completeHandshake = (ctxOpts = {}) => {
+        if (this.destroyed) return;
+        const merged = { ...server._tlsOptions, ...(ctxOpts || {}) };
+        const clientAlpn = tlsNormalizeAlpn(opts.ALPNProtocols);
+        const serverAlpn = tlsNormalizeAlpn(merged.ALPNProtocols);
+        let negotiatedAlpn = false;
+        for (const proto of clientAlpn) {
+          if (serverAlpn.includes(proto)) { negotiatedAlpn = proto; break; }
+        }
+        if (!negotiatedAlpn && clientAlpn.length === 0 && serverAlpn.length === 1) negotiatedAlpn = serverAlpn[0];
+        const verification = tlsVerifyServerCert(merged.cert, opts.ca, this.servername);
+        this.authorized = verification.authorized;
+        this.authorizationError = verification.authorizationError;
+        this._peerCert = verification.peerCert || {};
+        if (!this.authorized && opts.rejectUnauthorized !== false) {
+          this.connecting = false;
+          const err = Object.assign(new Error(verification.authorizationError || 'TLS certificate verification failed'), { code: verification.authorizationError || 'ERR_TLS_CERT_ALTNAME_INVALID' });
+          this.emit('error', err); this.destroy(err); return;
+        }
+        const peer = new TLSSocket({ allowHalfOpen: server.allowHalfOpen, isServer: true, cert: merged.cert, servername: this.servername });
+        this._peer = peer; peer._peer = this; peer._server = server;
+        peer.alpnProtocol = negotiatedAlpn;
+        this.alpnProtocol = negotiatedAlpn;
+        peer.authorized = !merged.requestCert ? true : Boolean(opts.cert);
+        peer.remoteAddress = '127.0.0.1'; peer.remotePort = this.localPort;
+        if (!pipe) { peer.localPort = this.remotePort; this.localPort = server.port; }
+        server.connections++;
+        peer.once('close', () => { server.connections = Math.max(0, server.connections - 1); });
+        this.connecting = false;
+        this.emit('connect');
+        this.emit('secureConnect');
+        server.emit('connection', peer);
+        server.emit('secureConnection', peer);
+      };
+      if (typeof server._tlsOptions.SNICallback === 'function') {
+        server._tlsOptions.SNICallback(this.servername, (err, ctx) => {
+          if (err) { this.connecting = false; this.emit('error', err); this.destroy(err); return; }
+          completeHandshake(ctx ? (ctx.options || ctx) : server._resolveContext(this.servername));
+        });
+      } else {
+        completeHandshake(server._resolveContext(this.servername));
+      }
+    });
+    return this;
+  }
+}
+class TLSServer extends NetServer {
+  constructor(options = {}, listener) {
+    if (typeof options === 'function') { listener = options; options = {}; }
+    super(null);
+    this._isTls = true;
+    this._tlsOptions = { ...(options || {}) };
+    this._sniContexts = new Map();
+    this._ticketKeys = Buffer.alloc(48);
+    if (hasSecureRandom()) try { secureRandomBytes(this._ticketKeys); } catch {}
+    if (typeof listener === 'function') this.on('secureConnection', listener);
+  }
+  addContext(hostname, context) {
+    this._sniContexts.set(String(hostname || '').toLowerCase(), context instanceof TLSSecureContext ? context.options : { ...(context || {}) });
+    return this;
+  }
+  setSecureContext(options = {}) {
+    this._tlsOptions = Object.assign(this._tlsOptions || {}, options || {});
+    return this;
+  }
+  _resolveContext(servername) {
+    const target = String(servername || '').toLowerCase();
+    if (this._sniContexts.has(target)) return this._sniContexts.get(target);
+    for (const [pattern, ctx] of this._sniContexts) {
+      if (pattern.startsWith('*.') && target.endsWith(pattern.slice(1)) && target.length > pattern.length - 1) return ctx;
+    }
+    return this._tlsOptions;
+  }
+  getTicketKeys() { return Buffer.from(this._ticketKeys); }
+  setTicketKeys(keys) { if (Buffer.isBuffer(keys) || ArrayBuffer.isView(keys)) this._ticketKeys = Buffer.from(keys); }
+}
+const TLS = {
+  Server: TLSServer,
+  TLSSocket,
+  SecureContext: TLSSecureContext,
+  createSecureContext: (options = {}) => new TLSSecureContext(options),
+  createServer: (options, listener) => new TLSServer(options, listener),
+  connect: (...args) => new TLSSocket().connect(...args),
+  DEFAULT_ECDH_CURVE: 'auto',
+  DEFAULT_MIN_VERSION: 'TLSv1.2',
+  DEFAULT_MAX_VERSION: 'TLSv1.3',
+};
 // Implemented by runtime-process.js; subprocesses never execute in this Worker.
 const CHILD_PROCESS = {};
 function shellQuote(value){return "'"+String(value).split("'").join("'\\''")+"'";}
@@ -4125,11 +4448,367 @@ async function postMessageToThread(threadId, value, transferList) {
   queueMicrotask(() => { processEvents.emit('workerMessage', cloned, myId); });
 }
 
+class Http2ServerStream extends Duplex {
+  constructor(session, id, headers, replyFn, requestTimeoutMs) {
+    super();
+    this.id = id;
+    this.session = session;
+    this.headers = headers;
+    this.sentHeaders = null;
+    this.headersSent = false;
+    this.aborted = false;
+    this.closed = false;
+    this._status = 200;
+    this._resHeaders = {};
+    this._outChunks = [];
+    this._outSize = 0;
+    this._reply = replyFn;
+    this._replied = false;
+    this._timer = null;
+    const timeoutMs = Number.isFinite(Number(requestTimeoutMs)) && Number(requestTimeoutMs) > 0 ? Number(requestTimeoutMs) : 600000;
+    this._timer = runtimeNativeSetTimeout(() => {
+      this._timer = null;
+      if (!this._replied) {
+        this._replied = true;
+        this._reply({ status: 504, statusMessage: HTTP_STATUS_LINE(504), headers: { 'content-type': 'text/plain' }, body: Buffer.from('HTTP/2 stream timed out after ' + Math.round(timeoutMs / 1000) + ' seconds.') });
+      }
+    }, timeoutMs);
+    if (this._timer && typeof this._timer.unref === 'function') this._timer.unref();
+  }
+  _read() {}
+  respond(headers = {}, options = {}) {
+    if (this.headersSent) throw Object.assign(new Error('Cannot send headers after they are sent'), { code: 'ERR_HTTP2_HEADERS_SENT' });
+    this.headersSent = true;
+    this.sentHeaders = { ...headers };
+    if (headers[':status'] !== undefined) this._status = Number(headers[':status']) || 200;
+    for (const [k, v] of Object.entries(headers)) {
+      const lower = String(k).toLowerCase();
+      if (!lower.startsWith(':')) this._resHeaders[lower] = v;
+    }
+    if (options.endStream) this.end();
+    return this;
+  }
+  additionalHeaders() {}
+  pushStream(headers, options, cb) {
+    if (typeof options === 'function') cb = options;
+    if (cb) queueMicrotask(() => cb(Object.assign(new Error('HTTP/2 server push is disabled in loopback mode'), { code: 'ERR_HTTP2_PUSH_DISABLED' })));
+  }
+  setTimeout() { return this; }
+  write(chunk, encoding, callback) {
+    if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
+    if (!this.writable) { const err = new Error('write after end'); if (callback) callback(err); else this.emit('error', err); return false; }
+    this._write(chunk, encoding, err => {
+      if (err) this.emit('error', err);
+      if (callback) callback(err);
+    });
+    return true;
+  }
+  end(chunk, encoding, callback) {
+    if (typeof chunk === 'function') { callback = chunk; chunk = undefined; }
+    else if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
+    if (!this.writable) { if (callback) queueMicrotask(callback); return this; }
+    if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+    this.writable = false;
+    this._final(err => {
+      if (err) this.emit('error', err);
+      if (callback) callback(err);
+      this.emit('finish');
+    });
+    return this;
+  }
+  _write(chunk, encoding, callback) {
+    if (!this.headersSent) this.respond({ ':status': this._status });
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
+    this._outSize += buf.length;
+    if (this._outSize > 8 * 1024 * 1024) return callback(new Error('Virtual HTTP/2 response exceeds 8 MiB.'));
+    this._outChunks.push(buf);
+    callback();
+  }
+  _final(callback) {
+    if (!this.headersSent) this.respond({ ':status': this._status });
+    if (this._timer) { runtimeNativeClearTimeout(this._timer); this._timer = null; }
+    if (!this._replied) {
+      this._replied = true;
+      this._reply({
+        status: this._status,
+        statusMessage: HTTP_STATUS_LINE(this._status),
+        headers: this._resHeaders,
+        body: Buffer.concat(this._outChunks),
+      });
+    }
+    this.closed = true;
+    callback();
+    queueMicrotask(() => { if (!this.destroyed) this.emit('close'); });
+  }
+  close(code = 0, callback) {
+    if (typeof code === 'function') { callback = code; code = 0; }
+    if (!this._replied) this.end();
+    this.closed = true;
+    if (callback) queueMicrotask(callback);
+  }
+}
+
+function dispatchHttp2ServerStream(srv, msg, incomingHeaders, incomingBody, reply) {
+  if (!srv._h2NextStreamId) srv._h2NextStreamId = 1;
+  const streamId = srv._h2NextStreamId;
+  srv._h2NextStreamId += 2;
+  const h2Sock = virtualSocket();
+  h2Sock.localPort = msg.port;
+  h2Sock.encrypted = Boolean(srv._isHttp2Secure);
+  h2Sock.alpnProtocol = srv._isHttp2Secure ? 'h2' : 'h2c';
+  const session = Object.assign(new EventEmitter(), { socket: h2Sock, encrypted: Boolean(srv._isHttp2Secure), alpnProtocol: h2Sock.alpnProtocol, closed: false, destroyed: false });
+  const h2Headers = {
+    ':method': String(msg.method || 'GET').toUpperCase(),
+    ':path': msg.url || '/',
+    ':scheme': srv._isHttp2Secure ? 'https' : 'http',
+    ':authority': incomingHeaders.host || ('localhost:' + msg.port),
+    ...incomingHeaders,
+  };
+  const stream = new Http2ServerStream(session, streamId, h2Headers, reply, srv.requestTimeout);
+  try {
+    srv.emit('stream', stream, h2Headers, 0);
+    if (incomingBody?.length) stream.push(incomingBody);
+    stream.push(null);
+  } catch (e) {
+    if (!stream._replied) {
+      stream._replied = true;
+      reply({ status: 500, headers: { 'content-type': 'text/plain' }, body: Buffer.from(String(e && e.stack || e)) });
+    }
+  }
+}
+
+class ClientHttp2Stream extends Duplex {
+  constructor(session, id, headers, options = {}) {
+    super();
+    this.id = id;
+    this.session = session;
+    this.sentHeaders = { ...headers };
+    this._reqChunks = [];
+    this._dispatched = false;
+    this._endScheduled = false;
+    this.closed = false;
+    this.aborted = false;
+    this.rstCode = 0;
+    const method = String(headers[':method'] || 'GET').toUpperCase();
+    const autoEnd = options.endStream === true || (options.endStream !== false && /^(GET|HEAD|DELETE|OPTIONS)$/.test(method));
+    if (autoEnd) {
+      this._endScheduled = true;
+      queueMicrotask(() => { if (!this._dispatched && !this.destroyed) this.end(); });
+    }
+  }
+  _read() {}
+  write(chunk, encoding, callback) {
+    if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
+    if (!this.writable) { const err = new Error('write after end'); if (callback) callback(err); else this.emit('error', err); return false; }
+    this._write(chunk, encoding, err => {
+      if (err) this.emit('error', err);
+      if (callback) callback(err);
+    });
+    return true;
+  }
+  end(chunk, encoding, callback) {
+    if (typeof chunk === 'function') { callback = chunk; chunk = undefined; }
+    else if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
+    if (!this.writable || this._dispatched) { if (callback) queueMicrotask(callback); return this; }
+    if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+    this.writable = false;
+    this._final(err => {
+      if (err) this.emit('error', err);
+      if (callback) callback(err);
+      this.emit('finish');
+    });
+    return this;
+  }
+  _write(chunk, encoding, callback) {
+    this._endScheduled = false;
+    this._reqChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding));
+    callback();
+  }
+  _final(callback) {
+    callback();
+    if (!this._dispatched && !this.destroyed) {
+      this._dispatched = true;
+      this.session._dispatchStream(this);
+    }
+  }
+  close(code = 0, callback) {
+    if (typeof code === 'function') { callback = code; code = 0; }
+    this.rstCode = code;
+    this.closed = true;
+    this.destroy();
+    if (callback) queueMicrotask(callback);
+  }
+  setTimeout() { return this; }
+}
+
+class ClientHttp2Session extends EventEmitter {
+  constructor(authority, options = {}) {
+    super();
+    this.options = { ...(options || {}) };
+    this.type = 1;
+    this.closed = false;
+    this.destroyed = false;
+    this.connecting = true;
+    this.alpnProtocol = 'h2';
+    this._nextStreamId = 1;
+    this._url = authority instanceof URL ? authority : new URL(String(authority), 'https://localhost');
+    this.encrypted = this._url.protocol === 'https:';
+    this.socket = Object.assign(virtualSocket(), { encrypted: this.encrypted, alpnProtocol: this.encrypted ? 'h2' : 'h2c' });
+    this._readyPromise = this._connect();
+  }
+  async _connect() {
+    await new Promise(r => queueMicrotask(r));
+    if (this.destroyed || this.closed) return false;
+    const host = String(this._url.hostname || 'localhost').toLowerCase();
+    if (!LOOPBACK_HOSTS.has(host)) {
+      const err = Object.assign(new Error('External HTTP/2 sessions are blocked by browser sandboxing. Use fetch() or https.request() (browser-managed HTTP/2+TLS), or loopback http2.createServer/createSecureServer.'), { code: 'ERR_BROWSER_RAW_HTTP2_UNSUPPORTED' });
+      this.connecting = false;
+      this.emit('error', err);
+      this.destroy(err);
+      return false;
+    }
+    const port = Number(this._url.port) || (this._url.protocol === 'https:' ? 443 : 80);
+    this._port = port;
+    this.socket.remotePort = port;
+    if (!SERVERS.has(port)) {
+      let existsRemote = false;
+      if (typeof kernelInfo === 'object' && kernelInfo && typeof kernelCall === 'function') {
+        try {
+          const procs = await kernelCall('ps');
+          existsRemote = Array.isArray(procs) && procs.some(p => Array.isArray(p.ports) && p.ports.includes(port));
+        } catch {}
+      }
+      if (!existsRemote) {
+        const err = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:' + port), { code: 'ECONNREFUSED', errno: -111, syscall: 'connect', address: '127.0.0.1', port });
+        this.connecting = false;
+        this.emit('error', err);
+        this.destroy(err);
+        return false;
+      }
+    }
+    this.connecting = false;
+    this.emit('connect', this, this.socket);
+    return true;
+  }
+  request(headers = {}, options = {}) {
+    if (this.destroyed || this.closed) throw Object.assign(new Error('HTTP/2 session is closed'), { code: 'ERR_HTTP2_INVALID_SESSION' });
+    const id = this._nextStreamId;
+    this._nextStreamId += 2;
+    return new ClientHttp2Stream(this, id, headers, options);
+  }
+  async _dispatchStream(stream) {
+    try {
+      const ok = await this._readyPromise;
+      if (!ok || this.destroyed || this.closed || stream.destroyed) return;
+      const h = stream.sentHeaders || {};
+      const method = String(h[':method'] || 'GET').toUpperCase();
+      const path = String(h[':path'] || '/');
+      const headers = { host: String(h[':authority'] || this._url.host || ('localhost:' + this._port)) };
+      for (const [k, v] of Object.entries(h)) {
+        const lower = String(k).toLowerCase();
+        if (!lower.startsWith(':')) headers[lower] = Array.isArray(v) ? v.join(', ') : String(v);
+      }
+      const body = stream._reqChunks.length ? Buffer.concat(stream._reqChunks) : null;
+      if (body && !Object.prototype.hasOwnProperty.call(headers, 'content-length')) headers['content-length'] = String(body.length);
+      let result;
+      if (SERVERS.has(this._port)) {
+        result = await new Promise(resolve => {
+          handleHttp({ port: this._port, url: path, method, headers, body }, resolve);
+        });
+      } else {
+        result = await kernelCall('http', { port: this._port, url: path, method, headers, body });
+      }
+      if (this.destroyed || stream.destroyed) return;
+      const responseHeaders = { ':status': Number(result.status) || 200 };
+      for (const [k, v] of Object.entries(result.headers || {})) responseHeaders[String(k).toLowerCase()] = v;
+      stream.emit('response', responseHeaders, 0);
+      if (result.body && result.body.length) stream.push(Buffer.from(result.body));
+      stream.push(null);
+      stream.closed = true;
+      queueMicrotask(() => { if (!stream.destroyed) stream.emit('close'); });
+    } catch (e) {
+      if (!stream.destroyed) stream.emit('error', e);
+    }
+  }
+  ping(payload, callback) {
+    if (typeof payload === 'function') { callback = payload; payload = Buffer.alloc(8); }
+    const buf = Buffer.isBuffer(payload) ? payload : Buffer.alloc(8);
+    if (callback) queueMicrotask(() => callback(null, 0, buf));
+    return true;
+  }
+  settings(settings, callback) { if (callback) queueMicrotask(() => callback(null)); }
+  setTimeout() { return this; }
+  ref() { return this; }
+  unref() { return this; }
+  close(callback) {
+    this.closed = true;
+    if (callback) this.once('close', callback);
+    queueMicrotask(() => this.emit('close'));
+  }
+  destroy(error) {
+    this.destroyed = true;
+    this.closed = true;
+    if (error) queueMicrotask(() => { try { this.emit('close'); } catch {} });
+    else queueMicrotask(() => this.emit('close'));
+  }
+}
+
+class HttpsServer extends Server {
+  constructor(options, handler) {
+    if (typeof options === 'function') { handler = options; options = {}; }
+    super(handler, options);
+    this._isHttps = true;
+  }
+}
+const HTTPS = Object.assign({}, HTTP, {
+  Server: HttpsServer,
+  createServer: (...a) => {
+    const opts = a.find(x => x && typeof x === 'object');
+    const handler = a.find(x => typeof x === 'function');
+    return new HttpsServer(opts, handler);
+  },
+  request: (urlOrOpts, optsOrCb, cb) => clientRequest(urlOrOpts, optsOrCb, cb, 'https'),
+  get: (urlOrOpts, optsOrCb, cb) => { const r = clientRequest(urlOrOpts, optsOrCb, cb, 'https'); r.end(); return r; },
+  Agent: HTTP.Agent,
+});
+
+class Http2Server extends Server {
+  constructor(options, handler) {
+    if (typeof options === 'function') { handler = options; options = {}; }
+    super(handler, options);
+    this._isHttp2 = true;
+  }
+}
+class Http2SecureServer extends Server {
+  constructor(options, handler) {
+    if (typeof options === 'function') { handler = options; options = {}; }
+    super(handler, options);
+    this._isHttp2 = true;
+    this._isHttp2Secure = true;
+  }
+}
+const HTTP2 = Object.assign({}, HTTP, {
+  Server: Http2Server,
+  Http2Server,
+  Http2SecureServer,
+  ClientHttp2Session,
+  ClientHttp2Stream,
+  ServerHttp2Stream: Http2ServerStream,
+  createServer: (options, handler) => new Http2Server(options, handler),
+  createSecureServer: (options, handler) => new Http2SecureServer(options, handler),
+  connect: (authority, options, listener) => {
+    if (typeof options === 'function') { listener = options; options = {}; }
+    const session = new ClientHttp2Session(authority, options);
+    if (typeof listener === 'function') session.once('connect', listener);
+    return session;
+  },
+});
+
 const CORE = {
   path:PATH, fs:FSMOD, 'fs/promises':FSMOD.promises, os:OS, process:processObj, util:UTIL, events:Object.assign(EventEmitter,{EventEmitter, once:(e,n)=>new Promise(r=>e.once(n,r)), default:EventEmitter}),
   stream:STREAMMOD, 'stream/promises':STREAM_PROMISES, buffer:{Buffer, constants:{}}, http:HTTP,
-  https:Object.assign({}, HTTP, {request:(o,cb)=>clientRequest(o,cb,'https'), get:(o,cb)=>{const r=clientRequest(o,cb,'https');r.end();return r;}, Agent:HTTP.Agent}),
-  http2:{...HTTP,connect:()=>{throw new Error('HTTP/2 client transport is not implemented; use https.request or fetch over browser-managed TLS.');}}, net:NET, tls:TLS,
+  https:HTTPS,
+  http2:HTTP2, net:NET, tls:TLS,
   dns:{lookup:(h,cb)=>queueMicrotask(()=>cb(Object.assign(new Error('DNS sockets are unavailable in browser mode.'),{code:'ENOTSUP'}))),promises:{lookup:async()=>{throw new Error('DNS lookup unavailable in browser mode.');}}},
   url:URLMOD, querystring:lazyModule(loadNodeQuerystring), wasi:lazyModule(loadNodeWasi), crypto:CRYPTO, zlib:ZLIB, assert:ASSERT, 'assert/strict':ASSERT,
   string_decoder:{StringDecoder:NodeStringDecoder},
@@ -4333,15 +5012,13 @@ let pendingQuestion = null;
   vm.createScript = (code, options) => new CORE.vm.Script(code, options);
   vm.measureMemory = vm.measureMemory || (async () => ({ total: { jsMemoryEstimate: 0, jsMemoryRange: [0, 0] }, current: {}, other: {} }));
 
-  // http2: honest surface. Client transport is not implemented, so it says so.
+  // http2: virtualized loopback HTTP/2 streams, sessions & servers.
   const http2 = CORE.http2;
   http2.constants = http2.constants || { NGHTTP2_CANCEL: 8, NGHTTP2_ENHANCE_YOUR_CALM: 11, NGHTTP2_INADEQUATE_SECURITY: 12, NGHTTP2_INTERNAL_ERROR: 2, NGHTTP2_NO_ERROR: 0, NGHTTP2_PROTOCOL_ERROR: 1, NGHTTP2_REFUSED_STREAM: 7, HTTP2_HEADER_STATUS: ':status', HTTP2_HEADER_METHOD: ':method', HTTP2_HEADER_PATH: ':path', HTTP2_HEADER_AUTHORITY: ':authority', HTTP2_HEADER_SCHEME: ':scheme', NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS: 3 };
   http2.getDefaultSettings = () => ({ headerTableSize: 4096, enablePush: true, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 100, maxHeaderListSize: 65535, enableConnectProtocol: false });
   http2.getPackedSettings = () => Buffer.alloc(0);
   http2.getUnpackedSettings = () => ({});
   http2.sensitiveHeaders = Symbol('nodejs.http2.sensitiveHeaders');
-  /* The HTTP/2 server request/response wrappers exist so instanceof checks and
-   * subclassing work; the h2 server itself still speaks HTTP/1.1. */
   http2.Http2ServerRequest = http2.Http2ServerRequest || class Http2ServerRequest extends STREAM.Readable {
     constructor(stream, headers = {}, options = {}, rawHeaders = []) { super(); this.stream = stream; this.headers = headers; this.rawHeaders = rawHeaders; this.httpVersion = '2.0'; this.httpVersionMajor = 2; this.httpVersionMinor = 0; this.method = headers[':method'] || 'GET'; this.url = headers[':path'] || '/'; this.authority = headers[':authority']; this.scheme = headers[':scheme'] || 'https'; this.aborted = false; this.complete = false; this.trailers = {}; this.rawTrailers = []; this.socket = stream && stream.session ? stream.session.socket : undefined; this.options = options; }
     setTimeout() { return this; } setEncoding() { return super.setEncoding.apply(this, arguments); }
@@ -4358,7 +5035,17 @@ let pendingQuestion = null;
     _write(chunk, encoding, callback) { this.stream && typeof this.stream.respond === 'function' ? this.stream.respond({ ':status': this.statusCode }) : undefined; callback(); }
   };
   http2.createSecureServer = http2.createSecureServer || ((options, listener) => http2.createServer(options, listener));
-  http2.performServerHandshake = http2.performServerHandshake || ((socket, options, callback) => { const error = Object.assign(new Error('HTTP/2 server handshakes are not available in the browser runtime.'), { code: 'ERR_HTTP2_NOT_SUPPORTED' }); if (callback) callback(error); else throw error; });
+  http2.performServerHandshake = http2.performServerHandshake || ((socket, options, callback) => {
+    if (typeof options === 'function') { callback = options; options = {}; }
+    if (!socket || typeof socket.write !== 'function') {
+      const error = Object.assign(new TypeError('socket must be a net.Socket / stream'), { code: 'ERR_INVALID_ARG_TYPE' });
+      if (callback) { callback(error); return; }
+      throw error;
+    }
+    const srv = new Http2Server(options, callback);
+    if (callback) queueMicrotask(() => srv.emit('stream', new Http2ServerStream({ socket, encrypted: Boolean(socket.encrypted), alpnProtocol: 'h2' }, 1, { ':method': 'GET', ':path': '/' }, () => {}, 600000), { ':method': 'GET', ':path': '/' }, 0));
+    return srv;
+  });
 
   // process: the remaining documented fields.
   processObj.release = { name: 'node' };
@@ -4382,15 +5069,29 @@ let pendingQuestion = null;
   timerPromises.scheduler = timerPromises.scheduler || { wait: (delay, options = {}) => new Promise(resolve => runtimeNativeSetTimeout(resolve, delay, options.signal?.aborted ? undefined : undefined)), yield: () => new Promise(resolve => runtimeNativeSetTimeout(resolve, 0)) };
   CORE.timers.promises = timerPromises;
 
-  // tls/dns/http2/server types that only need to exist for instanceof checks.
-  CORE.tls.SecureContext = CORE.tls.SecureContext || class SecureContext { constructor() { this.context = {}; } };
-  CORE.tls.Server = CORE.tls.Server || class Server extends EventEmitter { listen() { return this; } close(callback) { callback?.(); return this; } addContext() {} };
-  CORE.tls.checkServerIdentity = CORE.tls.checkServerIdentity || (() => undefined);
-  CORE.tls.getCACertificates = CORE.tls.getCACertificates || (() => []);
-  CORE.tls.convertALPNProtocols = CORE.tls.convertALPNProtocols || (() => Buffer.alloc(0));
+  // tls/dns/http2/server utilities & certificate checks.
+  CORE.tls.SecureContext = CORE.tls.SecureContext || TLSSecureContext;
+  CORE.tls.Server = CORE.tls.Server || TLSServer;
+  CORE.tls.checkServerIdentity = CORE.tls.checkServerIdentity || ((host, cert) => {
+    const x509 = cert && cert._x509 ? cert._x509 : (cert && cert.raw && typeof CORE.crypto?.X509Certificate === 'function' ? (() => { try { return new CORE.crypto.X509Certificate(cert.raw); } catch { return null; } })() : null);
+    if (x509 && typeof x509.checkHost === 'function' && host && !netIsIP(host)) {
+      if (!x509.checkHost(host)) return Object.assign(new Error('Hostname/IP does not match certificate\'s altnames: Host: ' + host), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' });
+    }
+    return undefined;
+  });
+  CORE.tls.getCACertificates = CORE.tls.getCACertificates || (() => [...(CORE.tls.rootCertificates || [])]);
+  CORE.tls.convertALPNProtocols = CORE.tls.convertALPNProtocols || ((protocols, out) => {
+    const items = tlsNormalizeAlpn(protocols);
+    const parts = [];
+    for (const p of items) {
+      const b = Buffer.from(p, 'utf8');
+      parts.push(Buffer.from([b.length]), b);
+    }
+    const buf = Buffer.concat(parts);
+    if (out && typeof out === 'object') out.ALPNProtocols = buf;
+    return buf;
+  });
   CORE.tls.setDefaultCACertificates = CORE.tls.setDefaultCACertificates || (certificates => { CORE.tls.rootCertificates = Array.isArray(certificates) ? [...certificates] : CORE.tls.rootCertificates; });
-  /* createSecurePair is deprecated in Node but still called by old proxies. There
-   * is no TLS record layer here, so the pair is a plain duplex pass-through. */
   CORE.tls.createSecurePair = CORE.tls.createSecurePair || (() => {
     const pair = new EventEmitter();
     pair.cleartext = new STREAM.PassThrough();
@@ -14110,7 +14811,7 @@ it is restored from a compressed dependency checkpoint after a reload.
 The lightweight serve adapter uses live reload (no HMR) and preserves scroll,
 form values and focus. Installed Vite 6 has a bounded Node-API path for builds
 and virtual dev/HMR tests; arbitrary CLI options and plugins are not supported.
-worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); spawnSync/execFileSync run via SharedArrayBuffer + Atomics.wait when isolated. Virtual loopback TCP/UDP (net, dgram, WASI sockets) and loopback HTTP/WebSockets run inside the runtime; no native OS binaries, raw external non-HTTP sockets, server TLS, unmapped native addons, or full Next.js/Nuxt CLIs without three-origin WASIX hosting.
+worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); spawnSync/execFileSync run via SharedArrayBuffer + Atomics.wait when isolated. Virtual loopback TCP/UDP/TLS/HTTP/HTTP2/WebSockets (net, dgram, tls, https, http2, WASI sockets) run inside the runtime; no native OS binaries, raw external non-HTTP sockets, unmapped native addons, or full Next.js/Nuxt CLIs without three-origin WASIX hosting.
 `;
 post({type:'boot'});
 
@@ -14137,7 +14838,7 @@ function kernelCall(op, data = {}, transfer) {
   if (kernelPending.size >= 256) return Promise.reject(virtualError('EAGAIN', 'Too many outstanding virtual OS calls.'));
   const id = ++kernelCounter;
   return new Promise((resolve, reject) => {
-    const timer = runtimeNativeSetTimeout(() => { kernelPending.delete(id); reject(virtualError('ETIMEDOUT', 'Virtual OS call timed out: ' + op)); kernelMaybeIdle(); }, 20000);
+    const timer = runtimeNativeSetTimeout(() => { kernelPending.delete(id); reject(virtualError('ETIMEDOUT', 'Virtual OS call timed out: ' + op)); kernelMaybeIdle(); }, 600000);
     kernelPending.set(id, { resolve, reject, timer });
     if (Array.isArray(transfer) && transfer.length) self.postMessage({ type: 'kernel-call', id, op, data }, transfer.filter(Boolean));
     else post({ type: 'kernel-call', id, op, data });
@@ -14321,7 +15022,8 @@ Server.prototype.listen = function(port, ...args) {
     SERVERS.set(port, this); this.listening = true; post({ type: 'listen', port });
     // Node prints nothing on listen; keep the hint out of stdout so a piped or
     // redirected `node server.js` is byte-identical.
-    emitOutput('notice', '\x1b[32m✔\x1b[0m PID ' + kernelInfo.pid + ' listening on \x1b[36mhttp://localhost:' + port + '\x1b[0m\n');
+    const scheme = (this._isHttps || this._isHttp2Secure) ? 'https' : 'http';
+    emitOutput('notice', '\x1b[32m✔\x1b[0m PID ' + kernelInfo.pid + ' listening on \x1b[36m' + scheme + '://localhost:' + port + '\x1b[0m\n');
     this.emit('listening'); callback?.();
   }).catch(e => { this._kernelBinding = false; try { this.emit('error', e); } catch (failure) { kernelUnhandled(failure); } }).finally(kernelMaybeIdle);
   return this;

@@ -319,8 +319,8 @@
       const policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"" + policyText + "\">";
       frame.srcdoc = '<!doctype html><meta charset="utf-8">' + policy + '<script>' + BUILD.kernel.replace(/<\/script/gi, '<\\/script') + '<\/script>';
       this._bootTimer = setTimeout(() => {
-        this._fail(new Error('The kernel frame did not report back within 20 s. Sandboxed iframes or blob workers may be blocked on this page.'));
-      }, 20000);
+        this._fail(new Error('The kernel frame did not report back within 600 s. Sandboxed iframes or blob workers may be blocked on this page.'));
+      }, 600000);
       frame.addEventListener('load', () => {
         if (this._destroyed || this._frame !== frame || !frame.contentWindow) return;
         const pair = new MessageChannel();
@@ -349,22 +349,20 @@
       return document.body || document.documentElement;
     }
 
-    /** Stops every process, server and timer, and removes the frame. */
-    destroy() {
-      if (this._destroyed) return;
-      this._destroyed = true;
+    _teardown(state, reason) {
       clearTimeout(this._bootTimer);
       this._bootTimer = null;
-      this._setState('destroyed');
+      this._setState(state);
       try { this._channel?.postMessage({ type: 'terminate' }); } catch {}
       try { this._channel?.close(); } catch {}
       try { this._frame?.remove(); } catch {}
+      const err = new Error(reason);
       for (const pending of this._commands.values()) {
         clearTimeout(pending.timer);
-        pending.reject(new Error('The kernel was destroyed.'));
+        pending.reject(err);
       }
       this._commands.clear();
-      for (const pending of this._pendingHttp.values()) pending.reject(new Error('The kernel was destroyed.'));
+      for (const pending of this._pendingHttp.values()) pending.reject(err);
       this._pendingHttp.clear();
       for (const pending of this._pendingProfiler.values()) {
         clearTimeout(pending.timer);
@@ -372,11 +370,25 @@
       }
       this._pendingProfiler.clear();
       this._ports.clear();
-      this._ready.reject(new Error('The kernel was destroyed.'));
-      this._booted.reject(new Error('The kernel was destroyed.'));
+      this._ready.reject(err);
+      this._booted.reject(err);
       this._frame = null;
       this._channel = null;
-      this._emit('state', { state: 'destroyed' });
+    }
+
+    /** Stops every process, server and timer without auto-restarting; call start() to boot again. */
+    stop() {
+      if (this._destroyed || this._state === 'stopped') return;
+      this._teardown('stopped', 'The kernel was stopped.');
+      this._ready = this._deferred();
+      this._booted = this._deferred();
+    }
+
+    /** Stops every process, server and timer, and removes the frame permanently. */
+    destroy() {
+      if (this._destroyed) return;
+      this._destroyed = true;
+      this._teardown('destroyed', 'The kernel was destroyed.');
     }
 
     get state() { return this._state; }
@@ -515,6 +527,7 @@
     async run(command, { timeoutMs = 0, onData } = {}) {
       if (typeof command !== 'string' || !command.trim()) throw new TypeError('run() needs a command string.');
       await this._ready.promise;
+      if (!this._channel || this._destroyed || this._state === 'stopped') throw new Error('Kernel was stopped before command started.');
       const id = 'cmd-' + (++this._commandSeq);
       const pending = this._deferred();
       const timer = timeoutMs > 0 ? setTimeout(() => {
@@ -538,6 +551,7 @@
     /** Kills a process by pid, or everything with `all: true`. */
     async kill(pid, signal = 'SIGTERM') {
       await this._ready.promise;
+      if (!this._channel || this._destroyed || this._state === 'stopped') throw new Error('Kernel is not running.');
       this._channel.postMessage({ type: 'kill-process', pid, signal, tree: true });
       return true;
     }
@@ -550,6 +564,7 @@
      */
     async http(input, init = {}) {
       await this._ready.promise;
+      if (!this._channel || this._destroyed || this._state === 'stopped') throw new Error('Kernel was stopped.');
       const pStart = this._profiler.enabled && typeof performance !== 'undefined' && performance.now ? performance.now() : 0;
       const url = new URL(String(input), 'http://localhost');
       const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
@@ -629,10 +644,13 @@
      * Polls a virtual URL until it answers (a dev server is up) or the deadline
      * passes. Resolves with the final response.
      */
-    async waitForServer(port, { path = '/', timeoutMs = 30000, intervalMs = 250 } = {}) {
+    async waitForServer(port, { path = '/', timeoutMs = 600000, intervalMs = 250 } = {}) {
       const deadline = Date.now() + timeoutMs;
       let lastError = null;
       while (Date.now() < deadline) {
+        if (this._state === 'stopped' || this._state === 'destroyed' || this._state === 'error') {
+          throw new Error('Kernel stopped while waiting for port ' + port);
+        }
         try {
           const response = await this.http('http://localhost:' + port + path);
           if (response.status < 500) return response;
@@ -917,7 +935,8 @@
         }
         case 'host-fetch': {
           const handleHostFetch = async () => {
-            if (!this._network || !this._network.useHostProxy) {
+            const hasRelativeProxy = typeof this._network?.corsProxy === 'string' && this._network.corsProxy.startsWith('/');
+            if (!this._network || (!this._network.useHostProxy && !hasRelativeProxy)) {
               throw Object.assign(new Error('Host fetch proxy relay is disabled.'), { code: 'ENOTCAPABLE' });
             }
             const target = new URL(String(message.url || ''));
@@ -1016,7 +1035,11 @@
           this._fail(new Error(message.message || 'The kernel stopped unexpectedly.'));
           break;
         case 'kernel-stopped':
-          if (!this._destroyed) this._setState('stopped');
+          if (!this._destroyed && this._state !== 'stopped') {
+            this._teardown('stopped', 'The kernel stopped.');
+            this._ready = this._deferred();
+            this._booted = this._deferred();
+          }
           break;
         default:
           /* kernel-processes, pkgprogress, notice, clear, open … surface as
@@ -1051,7 +1074,7 @@
       const policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; base-uri 'none'; object-src 'none'; form-action 'none'\">";
       const bridge = "window.onmessage=function(event){var port=event.ports[0];if(!port)return;port.onmessage=function(message){try{var out=pako.ungzip(message.data);port.postMessage(out,[out.buffer]);}catch(failure){port.postMessage({error:String(failure&&failure.message||failure)});}};port.start();};";
       frame.srcdoc = '<!doctype html><meta charset="utf-8">' + policy + '<script>' + BUILD.pako.replace(/<\/script/gi, '<\\/script') + '<\/script><script>' + bridge + '<\/script>';
-      const timer = setTimeout(() => { cleanup(); reject(new Error('The bundled decompressor did not answer within 30 s.')); }, 30000);
+      const timer = setTimeout(() => { cleanup(); reject(new Error('The bundled decompressor did not answer within 600 s.')); }, 600000);
       const cleanup = () => { clearTimeout(timer); try { frame.remove(); } catch {} };
       frame.addEventListener('load', () => {
         const pair = new MessageChannel();

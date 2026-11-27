@@ -307,6 +307,24 @@ function startServer(embedBundle, siteHtml, coi) {
     }
     console.log('PASS  COI main site srcdoc VirtualCookieJar cookie isolation');
 
+    // Verify Stop cleanly terminates all workers and NEVER auto-restarts until explicit Run
+    const stopBootBefore = await p2.evaluate(() => window.Beownir.status().bootCounter);
+    await p2.evaluate(() => window.Beownir.stop());
+    await p2.waitForTimeout(800);
+    const stoppedStatus = await p2.evaluate(() => window.Beownir.status());
+    if (stoppedStatus.stopped !== true || stoppedStatus.ready !== false || stoppedStatus.ports.length !== 0 || stoppedStatus.bootCounter !== stopBootBefore) {
+      throw new Error('Stop must cleanly halt without auto-restarting: ' + JSON.stringify({ stopBootBefore, stoppedStatus }));
+    }
+    const postStopRun = await p2.evaluate(async () => {
+      await window.Beownir.write('after_stop.js', "console.log('RESTART_AFTER_STOP_OK');");
+      await window.Beownir.run('node /project/after_stop.js');
+      return { status: window.Beownir.status(), text: await window.Beownir.terminalText() };
+    });
+    if (postStopRun.status.stopped !== false || postStopRun.status.ready !== true || !postStopRun.text.includes('RESTART_AFTER_STOP_OK')) {
+      throw new Error('Explicit run after Stop failed to restart runtime: ' + JSON.stringify(postStopRun));
+    }
+    console.log('PASS  COI main site Stop halts without auto-restart and Run resumes cleanly');
+
     // 3. Plain HTTP Degraded Non-COI mode
     const ctxPlain = await browser.newContext({ bypassCSP: false });
     const p3 = await ctxPlain.newPage();

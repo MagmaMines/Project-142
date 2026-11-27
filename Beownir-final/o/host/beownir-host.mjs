@@ -4029,7 +4029,7 @@ function createPreviewBroker() {
       const timer = method === "tcpRead" ? null : setTimeout(() => {
         session.pending.delete(id);
         reject(new Error("Browser network operation timed out"));
-      }, 12e4);
+      }, 6e5);
       session.pending.set(id, { resolve, reject, timer, streamId });
       session.ws.send(JSON.stringify({ id, method, args }), (e) => {
         if (e) {
@@ -4434,7 +4434,7 @@ async function handleCorsProxy(req, res, c) {
         const client = (currentUrl.protocol === "https:" ? https : http).request(currentUrl, {
           method: req.method,
           headers: forwardHeaders,
-          timeout: 30000,
+          timeout: 6e5,
           lookup: (_h, _opts, cb) => cb(null, resolved.address, resolved.family)
         }, resolve);
         client.on("timeout", () => client.destroy(Error("Upstream proxy request timed out")));
@@ -4686,7 +4686,7 @@ preview.on("upgrade", (req, socket, head) => {
   }
 });
 for (const [server, port, name] of [[ide, base, "IDE"], [runtime, base + 1, "Isolated runtime"], [preview, base + 2, "App preview"]]) {
-  server.requestTimeout = 3e4;
+  server.requestTimeout = 6e5;
   server.headersTimeout = 66e3;
   server.keepAliveTimeout = 65e3;
   server.maxHeadersCount = 100;

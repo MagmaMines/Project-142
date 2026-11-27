@@ -130,3 +130,32 @@ test('http/https ClientRequest forwards multi-value Set-Cookie headers cleanly',
   assert.equal(result.body, 'done');
   assert.deepEqual(result.setCookie, ['a=1; Path=/; HttpOnly', 'b=2; Path=/; SameSite=Lax']);
 });
+
+test('relative corsProxy paths relay through kernel host-fetch instead of failing in opaque blob workers', async () => {
+  const rt = loadRuntime({ keep: true });
+  const relayedCalls = [];
+  const origOnMsg = rt.sandbox.self.onmessage;
+  const origPost = rt.sandbox.self.postMessage;
+  rt.sandbox.self.postMessage = msg => {
+    if (msg && msg.type === 'kernel-call' && msg.op === 'host-fetch') {
+      relayedCalls.push(msg.data);
+      setTimeout(() => origOnMsg({
+        data: {
+          type: 'kernel-reply',
+          id: msg.id,
+          result: { status: 200, statusText: 'OK', headers: { 'content-type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify({ relayed: true, url: msg.data.url })) },
+        },
+      }), 0);
+      return;
+    }
+    return origPost(msg);
+  };
+  const out = await rt.evaluate(`(async () => {
+    setNetworkConfig({ allowedFetchDomains: ['api.github.com'], corsProxy: '/__beownir_cors_proxy__' });
+    const res = await fetch('https://api.github.com/zen');
+    return await res.json();
+  })()`);
+  assert.equal(out.relayed, true);
+  assert.equal(out.url, 'https://api.github.com/zen');
+  assert.equal(relayedCalls.length, 1);
+});
