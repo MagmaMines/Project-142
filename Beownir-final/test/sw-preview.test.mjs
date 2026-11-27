@@ -297,3 +297,25 @@ test('multi-tab kernelClient probes skip non-IDE tabs and route to the tab runni
   assert.equal(await response2.text(), 'FROM_SECOND_TAB');
 });
 
+test('popup viewer windows (?beownir-preview=1) are excluded from kernel selection', async () => {
+  const popupTab = {
+    id: 'tab-popup',
+    url: ORIGIN + '/?beownir-preview=1&port=3000&path=%2F',
+    answer(_msg, port) {
+      port.postMessage({ status: 500, headers: {}, body: new TextEncoder().encode('WRONG_POPUP_TAB') });
+    },
+  };
+  const ideTab = {
+    id: 'tab-ide',
+    url: ORIGIN + '/',
+    answer(message, port) {
+      if (message.type === 'beownir-sw-probe') { port.postMessage({ ok: true, hasPort: true }); return; }
+      port.postMessage({ status: 200, headers: { 'content-type': 'text/plain' }, body: new TextEncoder().encode('FROM_IDE_TAB') });
+    },
+  };
+  const worker = loadWorker({ windows: [popupTab, ideTab] });
+  const response = await worker.fetchEvent(ORIGIN + '/__beownir_preview__/3000/').answer();
+  assert.equal(await response.text(), 'FROM_IDE_TAB');
+});
+
+

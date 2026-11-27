@@ -554,7 +554,7 @@ function previewRoute(url) {
 function isPreviewWindowClient(client) {
   try {
     const u = new URL(client.url);
-    if (u.pathname.startsWith(PREVIEW_PREFIX) || u.pathname.startsWith('/__beownir_preview__/')) return true;
+    if (u.pathname.startsWith(PREVIEW_PREFIX) || u.pathname.startsWith('/__beownir_preview__/') || u.searchParams.get('beownir-preview') === '1') return true;
   } catch {}
   if (client.id && claimedPreviewPort(client.id)) return true;
   return false;

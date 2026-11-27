@@ -142,6 +142,9 @@ test('worker stop never auto-restarts new workers and SW / popup open-in-tab but
   assert.match(page, /function openPreviewInPopup\(port,\s*path\)/);
   assert.match(page, /function isThirdPartyEmbedded\(\)/);
   assert.match(page, /function swScopePath\(\)/);
+  assert.match(page, /function encodePopupSnapshot\(snap\)/);
+  assert.match(page, /window\.__BEOWNIR_POPUP_MODE__/);
+  assert.match(page, /updateViaCache:\s*'none'/);
 });
 
 test('the capability list marks each row and carries its reason', () => {
