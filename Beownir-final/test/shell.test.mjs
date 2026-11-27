@@ -152,8 +152,10 @@ test('unknown commands and bad usage fail with helpful messages', () => withScra
   await assert.rejects(run('curl --head'), /Usage: curl/);
   await assert.rejects(run('printf'), /Usage: printf/);
   await assert.rejects(run('echo "unclosed'), /Unclosed quote/);
-  await assert.rejects(run('echo a; echo b'), /Semicolon command lists are not supported/);
-  assert.match((await run('ls --help')).stdout, /ls \[-la\]/);
+  assert.equal((await run('echo a; echo b')).stdout, 'a\nb\n');
+  assert.equal((await run('false; echo $?')).stdout, '1\n');
+  assert.equal((await run('false && echo no; echo yes')).stdout, 'yes\n');
+  assert.match((await run('ls --help')).stdout, /ls \[-laRh1\]/);
   assert.match((await run('help')).stdout, /Beownir shell/);
 }));
 
@@ -261,3 +263,126 @@ test('runCommand reports the exit code through the worker protocol', async () =>
   assert.equal(done.code, 0);
   assert.ok(messages.some(message => message.type === 'stdout' && /protocol/.test(message.data)));
 });
+
+test('quoting, escapes, per-stage redirections, and /dev/null work cleanly', () => withScratch(async () => {
+  await run('export VAR=hi');
+  assert.equal((await run('echo \'lit:\'"$VAR"')).stdout, 'lit:hi\n');
+  assert.equal((await run('echo "$VAR"\':$HOME\'')).stdout, 'hi:$HOME\n');
+  assert.equal((await run('echo "\\$VAR"')).stdout, '$VAR\n');
+  assert.equal((await run('echo \\$VAR')).stdout, '$VAR\n');
+
+  await run('echo alpha 1> /project/scratch/one.txt');
+  assert.equal((await run('cat /project/scratch/one.txt')).stdout, 'alpha\n');
+  await run('echo a2> /project/scratch/mid.txt');
+  assert.equal((await run('cat /project/scratch/mid.txt')).stdout, 'a2\n');
+  await run('export TARGET=/project/scratch/varout.txt && echo ok > "$TARGET"');
+  assert.equal((await run('cat /project/scratch/varout.txt')).stdout, 'ok\n');
+  await assert.rejects(run('echo x > "/project/scratch/unclosed'), /Unclosed quote/);
+
+  assert.equal((await run('echo ignored > /dev/null')).stdout, '');
+  assert.equal((await run('cat < /dev/null')).stdout, '');
+  assert.equal((await run('false | echo after')).stdout, 'after\n');
+  const errPipe = await run('cat /project/scratch/missing.txt 2>&1 | grep ENOENT');
+  assert.equal(errPipe.code, 0);
+  assert.match(errPipe.stdout, /ENOENT/);
+  const suppressed = await run('cat /project/scratch/missing.txt 2>/dev/null | wc -l');
+  assert.equal(suppressed.code, 0);
+  assert.equal(suppressed.stderr, '');
+  assert.equal(suppressed.stdout.trim(), '0');
+}));
+
+test('POSIX flags and edge cases across text/fs/process utilities work', () => withScratch(async () => {
+  await run('mkdir -p /project/scratch/sub && cd /project/scratch/sub');
+  const cdBack = await run('cd /project/scratch && cd -');
+  assert.match(cdBack.stdout, /\/project\/scratch\/sub\n$/);
+  assert.equal((await run('pwd')).stdout, '/project/scratch/sub\n');
+  await run('cd /project');
+
+  await run('touch /project/scratch/sub/x.txt /project/scratch/sub/y.txt');
+  assert.equal((await run('ls -1 /project/scratch/sub')).stdout, 'x.txt\ny.txt\n');
+  assert.match((await run('ls -lh /project/scratch/sub')).stdout, /0 B\s+.*x\.txt/);
+  assert.match((await run('ls -R /project/scratch')).stdout, /\/project\/scratch\/sub:/);
+
+  assert.equal((await run("printf 'one\\ntwo\\n' | cat -")).stdout, 'one\ntwo\n');
+  assert.equal((await run("printf 'raw-no-nl' | cat")).stdout, 'raw-no-nl');
+  assert.equal((await run("printf 'one\\ntwo\\n' | head -n 1 -")).stdout, 'one\n');
+  assert.equal((await run("printf 'one\\ntwo\\n' | tail -n 1 -")).stdout, 'two\n');
+  assert.equal((await run("printf 'a\\na\\nb\\n' | uniq -")).stdout, 'a\nb\n');
+
+  assert.equal((await run("printf 'a.b\\naxb\\n' | grep -F a.b")).stdout, 'a.b\n');
+  assert.equal((await run("printf 'foobar\\nfoo\\n' | grep -w foo")).stdout, 'foo\n');
+  assert.equal((await run("printf 'hi\\n' | grep -q hi")).stdout, '');
+  assert.equal((await run("printf 'hi\\n' | grep -q hi")).code, 0);
+  assert.equal((await run("printf 'one\\ntwo\\nthree\\n' | grep -e one -e three")).stdout, 'one\nthree\n');
+
+  await run("printf 'b' > /project/scratch/s1.txt && printf 'a' > /project/scratch/s2.txt");
+  assert.equal((await run('sort /project/scratch/s1.txt /project/scratch/s2.txt')).stdout, 'a\nb\n');
+  assert.equal((await run("printf '10\\nalpha\\n2\\n' | sort -n")).stdout, 'alpha\n2\n10\n');
+
+  assert.equal((await run("printf 'a,b,c\\nd,e,f\\n' | cut -d, -f1,2")).stdout, 'a,b\nd,e\n');
+  assert.equal((await run("printf 'a,b,c\\n' | cut -d, -f2-")).stdout, 'b,c\n');
+  assert.equal((await run("printf 'a\\nb\\n' | tr '\\n' ','")).stdout, 'a,b,');
+
+  assert.equal((await run("printf 'aaa\\n' | sed s/a/b/")).stdout, 'baa\n');
+  assert.equal((await run("printf 'aaa\\n' | sed s/a/b/g")).stdout, 'bbb\n');
+  assert.equal((await run("printf 'foo/bar\\n' | sed 's/foo\\/bar/baz\\/qux/'")).stdout, 'baz/qux\n');
+  assert.equal((await run("printf 'k=9\\n' | sed 's/(k)=([0-9])/\\2:\\1/'")).stdout, '9:k\n');
+  assert.equal((await run("printf 'abc\\n' | sed -e s/a/x/ -e s/c/z/")).stdout, 'xbz\n');
+
+  await run("printf 'first\\n' > /project/scratch/f1.txt && printf 'second\\n' > /project/scratch/f2.txt");
+  await run('sed -i s/first/FIRST/ /project/scratch/f1.txt /project/scratch/f2.txt');
+  assert.equal((await run('cat /project/scratch/f1.txt')).stdout, 'FIRST\n');
+  assert.equal((await run('cat /project/scratch/f2.txt')).stdout, 'second\n');
+
+  assert.match((await run('du -a /project/scratch')).stdout, /f1\.txt/);
+  assert.equal((await run('echo hello -n')).stdout, 'hello -n\n');
+  assert.equal((await run("echo -e '\\\\n'")).stdout, '\\n\n');
+  assert.equal((await run("printf '%-4s %03d\\n' a 7 b 12")).stdout, 'a    007\nb    012\n');
+
+  assert.equal((await run('test hello')).code, 0);
+  assert.equal((await run('test ! -f /project/scratch/missing')).code, 0);
+  assert.equal((await run('test -L /project/scratch/missing')).code, 1);
+  await run('ln -s /project/scratch/f1.txt /project/scratch/f1.link');
+  assert.equal((await run('test -L /project/scratch/f1.link')).code, 0);
+  await assert.rejects(run('[ -f /project/scratch/f1.txt ] ]'), /too many arguments/);
+  await assert.rejects(run('[ -f /project/scratch/f1.txt'), /missing closing/);
+  assert.equal((await run("time echo '*'")).stdout, '*\n');
+
+  assert.equal((await run('ports')).stdout, '(no listening ports)\n');
+  assert.equal((await run('kill -0 123')).code, 0);
+  const opened = await run('open http://localhost:5173/app');
+  assert.ok(opened.messages.some(m => m.type === 'open' && m.port === 5173));
+  assert.doesNotMatch((await run('help all')).stdout, /No HMR|bounded Node-API/);
+}));
+
+test('curl fetches virtual loopback servers with methods, repeated headers and -I', () => withScratch(async () => {
+  const srv = rt.serveRemote(4123, req => ({
+    status: 200,
+    headers: { 'content-type': 'application/json', 'x-seen-method': req.method },
+    body: Buffer.from(JSON.stringify({ url: req.url, h1: req.headers['x-one'], h2: req.headers['x-two'], body: req.body ? req.body.toString() : null })),
+  }));
+  try {
+    const getRes = await run('curl http://127.0.0.1:4123/hello');
+    assert.equal(getRes.code, 0);
+    assert.equal(JSON.parse(getRes.stdout).url, '/hello');
+
+    const headRes = await run('curl -I http://localhost:4123/hello');
+    assert.equal(headRes.code, 0);
+    assert.match(headRes.stdout, /HTTP 200/);
+    assert.match(headRes.stdout, /x-seen-method:\s*HEAD/i);
+
+    const postRes = await run('curl -X POST -H "X-One: alpha" -H "X-Two: beta" -d "{\\"ok\\":true}" http://127.0.0.1:4123/submit');
+    assert.equal(postRes.code, 0);
+    const parsed = JSON.parse(postRes.stdout);
+    assert.equal(parsed.h1, 'alpha');
+    assert.equal(parsed.h2, 'beta');
+    assert.equal(parsed.body, '{"ok":true}');
+
+    const saved = await run('curl -s -o /project/scratch/resp.json http://127.0.0.1:4123/saved');
+    assert.equal(saved.code, 0);
+    assert.equal(saved.stdout, '');
+    assert.equal(JSON.parse((await run('cat /project/scratch/resp.json')).stdout).url, '/saved');
+  } finally {
+    srv.close();
+  }
+}));

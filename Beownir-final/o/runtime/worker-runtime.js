@@ -13866,10 +13866,14 @@ async function saveDependencyCheckpoint() {
 }
 
 
-function staticResponse(urlPath){
+function staticResponseForRoots(urlPath, customRoots){
   let path;try{path=decodeURIComponent(String(urlPath).split('?')[0]);}catch{return null;}
   if(!path.startsWith('/')||path.includes('\\')||path.includes('\0')||path.split('/').includes('..'))return null;
-  for(const root of ['/project','/project/public','/project/dist','/project/src']){let file=normalize(root+path);if(!file.startsWith(root+'/')&&file!==root)continue;if(FS[file]?.d)file+='/index.html';if(path==='/')file=root+'/index.html';if(FS[file]&&!FS[file].d)return{file};}return null;
+  const roots=Array.isArray(customRoots)&&customRoots.length?customRoots:['/project','/project/public','/project/dist','/project/src'];
+  for(const root of roots){const base=root==='/'?'':root;let file=normalize(base+path);if(root!=='/'&&!file.startsWith(root+'/')&&file!==root)continue;if(FS[file]?.d)file=(file==='/'?'':file)+'/index.html';if(path==='/')file=base+'/index.html';if(FS[file]&&!FS[file].d)return{file};}return null;
+}
+function staticResponse(urlPath){
+  return staticResponseForRoots(urlPath);
 }
 function mime(file){return ({html:'text/html; charset=utf-8',htm:'text/html; charset=utf-8',js:'text/javascript',mjs:'text/javascript',jsx:'text/javascript',ts:'text/javascript',tsx:'text/javascript',css:'text/css',json:'application/json',svg:'image/svg+xml',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',avif:'image/avif',ico:'image/x-icon',woff:'font/woff',woff2:'font/woff2',ttf:'font/ttf',txt:'text/plain',wasm:'application/wasm',mp3:'audio/mpeg',mp4:'video/mp4'})[extname(file).slice(1).toLowerCase()]||'application/octet-stream';}
 function syncBack(){
@@ -13949,10 +13953,9 @@ for (const [name, value] of Object.entries({
 }
 
 /* ---------- virtual shell ----------
- * A small but honest POSIX-flavoured shell for the browser runtime. It supports
- * quoting, pipelines, redirection, globbing and real exit codes; it is not a
- * POSIX process table. Anything unsupported says so instead of guessing. */
-const SHELL = { stdin: '', history: [], lastCode: 0, lastStorage: null };
+ * POSIX-flavoured shell for the browser runtime. Supports quoting, parameter
+ * expansion, pipelines, per-stage redirections, globbing, and real exit codes. */
+const SHELL = { stdin: '', history: [], lastCode: 0, lastStorage: null, prevCwd: null };
 
 const stdinText = () => (typeof SHELL.stdin === 'string' ? SHELL.stdin : '');
 const contentText = value => (typeof value === 'string' ? value : decodeBytes(value));
@@ -13969,23 +13972,58 @@ function expandVariables(word) {
   });
 }
 
-/** Splits a command line on whitespace while honouring quotes and escapes. */
+/** Splits a command line on whitespace while honouring per-segment quotes and escapes. */
 function splitArgs(line) {
-  const result = []; const quoted = []; let current = '', quote = null, started = false, kind = 0;
+  const result = [], quoted = [];
+  let current = '', seg = '', quote = null, started = false, anyQuote = false;
+  const flushSeg = () => {
+    if (!seg) return;
+    current += quote === "'" ? seg : expandVariables(seg);
+    seg = '';
+  };
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === '\\' && quote !== "'") {
       const next = line[i + 1];
-      if (next && (quote !== '"' || ['"', '\\', '$', '`'].includes(next))) { current += next; i++; started = true; continue; }
-      current += ch; started = true; continue;
+      if (next !== undefined && (quote !== '"' || ['"', '\\', '$', '`'].includes(next))) {
+        flushSeg();
+        current += next;
+        i++;
+        started = true;
+        continue;
+      }
+      seg += ch; started = true; continue;
     }
-    if (quote) { if (ch === quote) quote = null; else current += ch; started = true; continue; }
-    if (ch === '"' || ch === "'") { quote = ch; kind = ch === "'" ? 2 : (kind === 2 ? 2 : 1); started = true; continue; }
-    if (/\s/.test(ch)) { if (started) { result.push(kind === 2 ? current : expandVariables(current)); quoted.push(kind); current = ''; started = false; kind = 0; } continue; }
-    current += ch; started = true;
+    if (quote) {
+      if (ch === quote) { flushSeg(); quote = null; }
+      else seg += ch;
+      started = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      flushSeg();
+      quote = ch;
+      anyQuote = true;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (started) {
+        flushSeg();
+        result.push(current);
+        quoted.push(anyQuote ? 1 : 0);
+        current = ''; seg = ''; started = false; anyQuote = false;
+      }
+      continue;
+    }
+    seg += ch; started = true;
   }
   if (quote) throw new Error('Unclosed quote in command.');
-  if (started) { result.push(kind === 2 ? current : expandVariables(current)); quoted.push(kind); }
+  if (started) {
+    flushSeg();
+    result.push(current);
+    quoted.push(anyQuote ? 1 : 0);
+  }
   result.quoted = quoted;
   return result;
 }
@@ -14013,13 +14051,13 @@ function commandChunks(line) {
     if (ch === '"' || ch === "'") { quote = ch; continue; }
     if (ch === '&' && line[i + 1] === '&') { chunks.push({ operator, text: line.slice(start, i) }); operator = '&&'; i++; start = i + 1; continue; }
     if (ch === '|' && line[i + 1] === '|') { chunks.push({ operator, text: line.slice(start, i) }); operator = '||'; i++; start = i + 1; continue; }
-    if (ch === ';') throw new Error('Semicolon command lists are not supported. Use separate commands or && / ||.');
+    if (ch === ';') { chunks.push({ operator, text: line.slice(start, i) }); operator = ';'; start = i + 1; continue; }
   }
   chunks.push({ operator, text: line.slice(start) });
   return chunks;
 }
 
-/** Extracts `> file`, `>> file`, `2> file`, `&> file` and `< file` from a command line. */
+/** Extracts `> file`, `>> file`, `1> file`, `2> file`, `&> file`, `2>&1`, `1>&2` and `< file`. */
 function parseRedirections(line) {
   const redirect = { stdout: null, stderr: null, stdin: null };
   let rest = '', quote = null;
@@ -14027,39 +14065,68 @@ function parseRedirections(line) {
     let cursor = index;
     while (cursor < line.length && /\s/.test(line[cursor])) cursor++;
     if (cursor >= line.length) throw new Error('Redirection is missing a file name.');
-    const mark = line[cursor];
-    if (mark === '"' || mark === "'") {
-      const start = ++cursor;
-      while (cursor < line.length && line[cursor] !== mark) cursor++;
-      return { target: line.slice(start, cursor), next: cursor + 1 };
+    let target = '', tSeg = '', tQuote = null, consumed = false;
+    const flushTarget = () => {
+      if (!tSeg) return;
+      target += tQuote === "'" ? tSeg : expandVariables(tSeg);
+      tSeg = '';
+    };
+    while (cursor < line.length) {
+      const ch = line[cursor];
+      if (ch === '\\' && tQuote !== "'") {
+        const next = line[cursor + 1];
+        if (next !== undefined && (tQuote !== '"' || ['"', '\\', '$', '`'].includes(next))) {
+          flushTarget();
+          target += next;
+          cursor += 2;
+          consumed = true;
+          continue;
+        }
+        tSeg += ch; cursor++; consumed = true; continue;
+      }
+      if (tQuote) {
+        if (ch === tQuote) { flushTarget(); tQuote = null; }
+        else tSeg += ch;
+        cursor++; consumed = true; continue;
+      }
+      if (ch === '"' || ch === "'") {
+        flushTarget();
+        tQuote = ch;
+        cursor++; consumed = true; continue;
+      }
+      if (/[\s>|&;<]/.test(ch)) break;
+      tSeg += ch; cursor++; consumed = true;
     }
-    const start = cursor;
-    while (cursor < line.length && !/[\s>|&;<]/.test(line[cursor])) cursor++;
-    return { target: line.slice(start, cursor), next: cursor };
+    if (tQuote) throw new Error('Unclosed quote in redirection.');
+    flushTarget();
+    if (!consumed || !target) throw new Error('Redirection is missing a file name.');
+    return { target, next: cursor };
   };
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === '\\' && quote !== "'") { rest += ch + (line[i + 1] || ''); i++; continue; }
     if (quote) { rest += ch; if (ch === quote) quote = null; continue; }
     if (ch === '"' || ch === "'") { quote = ch; rest += ch; continue; }
+    const atBoundary = i === 0 || /[\s|;&]/.test(line[i - 1]);
     if (ch === '>' && line[i + 1] === '&' && (line[i + 2] === '1' || line[i + 2] === '2')) {
       if (line[i + 2] === '2') redirect.stdoutToStderr = true;
       i += 2;
       continue;
     }
     const fdTarget = line[i + 3];
-    const fdDup = (ch === '1' || ch === '2' || ch === '&') && line[i + 1] === '>' && line[i + 2] === '&' && (fdTarget === '1' || fdTarget === '2');
+    const fdDup = atBoundary && (ch === '1' || ch === '2' || ch === '&') && line[i + 1] === '>' && line[i + 2] === '&' && (fdTarget === '1' || fdTarget === '2');
     if (fdDup) {
       if (ch === '1' || (ch === '&' && fdTarget === '2')) redirect.stdoutToStderr = true;
       else redirect.stderrToStdout = true;
       i += 3;
       continue;
     }
-    const fdPrefix = (ch === '2' || ch === '&') && line[i + 1] === '>';
+    const fdPrefix = atBoundary && (ch === '1' || ch === '2' || ch === '&') && line[i + 1] === '>';
     if (ch === '>' || ch === '<' || fdPrefix) {
       const kind = ch === '<' ? 'stdin' : ch === '2' ? 'stderr' : ch === '&' ? 'both' : 'stdout';
-      const afterFd = ch === '>' ? 1 : 2;
+      const afterFd = (ch === '>' || ch === '<') ? 1 : 2;
       const append = line[i + afterFd] === '>';
+      if (ch === '<' && append) throw new Error('Unsupported redirection: <<');
       const { target, next } = readTarget(i + afterFd + (append ? 1 : 0));
       const entry = { path: target, append };
       if (kind === 'stdin') redirect.stdin = target;
@@ -14095,65 +14162,71 @@ function expandGlob(word) {
   return bases.length ? bases.sort() : [word];
 }
 
-const isOption = word => typeof word === 'string' && word.startsWith('-') && word !== '-' && !/^-\d/.test(word);
-function parseFlags(args, { withValue = [], aliases = {} } = {}) {
-  const flags = new Set(), values = {}, positional = [];
+const isOption = (word, allowNumericFlags = false) => typeof word === 'string' && word.startsWith('-') && word !== '-' && (allowNumericFlags || !/^-\d/.test(word));
+function parseFlags(args, { withValue = [], aliases = {}, allowNumericFlags = false } = {}) {
+  const flags = new Set(), values = {}, allValues = {}, positional = [];
   const canonical = name => aliases[name] || name;
   const needsValue = new Set(withValue.map(canonical));
+  const recordValue = (name, val) => {
+    values[name] = val;
+    if (!allValues[name]) allValues[name] = [];
+    allValues[name].push(val);
+  };
   for (let index = 0; index < args.length; index++) {
     const word = args[index];
     if (word === '--') { positional.push(...args.slice(index + 1)); break; }
-    if (!isOption(word)) { positional.push(word); continue; }
+    if (!isOption(word, allowNumericFlags)) { positional.push(word); continue; }
     if (word.startsWith('--')) {
-      const [rawName, inline] = word.slice(2).split('=');
+      const eq = word.indexOf('=');
+      const rawName = eq < 0 ? word.slice(2) : word.slice(2, eq);
+      const inline = eq < 0 ? undefined : word.slice(eq + 1);
       const name = canonical(rawName);
-      if (needsValue.has(name)) { values[name] = inline !== undefined ? inline : args[++index]; continue; }
+      if (needsValue.has(name)) { recordValue(name, inline !== undefined ? inline : args[++index]); continue; }
       flags.add(name); continue;
     }
     for (let offset = 1; offset < word.length; offset++) {
       const name = canonical(word[offset]);
-      if (needsValue.has(name)) { values[name] = word.slice(offset + 1) || args[++index]; offset = word.length; continue; }
+      if (needsValue.has(name)) { recordValue(name, word.slice(offset + 1) || args[++index]); offset = word.length; continue; }
       flags.add(name);
     }
   }
-  return { flags, values, positional };
+  return { flags, values, allValues, positional };
 }
 
 // Dependency stores and build output are noise for a recursive text search.
 const GREP_SKIP = new Set(['node_modules', '.git', '.next', '.nuxt', '.output', '.cache', '.pnpm-store', '.beownir']);
 const USAGE = {
-  ls: 'ls [-la] [path…]', cat: 'cat [file…]', head: 'head [-n N] [file]', tail: 'tail [-n N] [file]',
-  wc: 'wc [-lwc] [file…]', grep: 'grep [-invcl] [-r] [--all] <pattern> [file…]', sort: 'sort [-nru] [file]',
-  uniq: 'uniq [-c] [file]', cut: 'cut -d <char> -f <list> [file]', tr: 'tr [-d] <set> [set]',
-  tee: 'tee [-a] <file…>', sed: 'sed [-n] s/pattern/replacement/[gi] [file…]', find: 'find [path] [-name pattern] [-type f|d] [-maxdepth N]',
-  stat: 'stat <path…>', du: 'du [-hs] [path…]', df: 'df', storage: 'storage [df|gc|persist]', tree: 'tree [path]',
+  ls: 'ls [-laRh1] [path…]', cat: 'cat [-n] [file…]', head: 'head [-n N|-c N] [file…]', tail: 'tail [-n N|-c N] [file…]',
+  wc: 'wc [-lwcm] [file…]', grep: 'grep [-invclFqw] [-r] [-e pattern] [--all] <pattern> [file…]', sort: 'sort [-nruf] [file…]',
+  uniq: 'uniq [-cidu] [file]', cut: 'cut [-s] [-d <char>] -f <list> [file…]', tr: 'tr [-ds] <set> [set]',
+  tee: 'tee [-a] <file…>', sed: 'sed [-n] [-i] [-e script] s/pattern/replacement/[gip] [file…]', find: 'find [path] [-name pattern] [-type f|d] [-maxdepth N]',
+  stat: 'stat <path…>', du: 'du [-hsa] [path…]', df: 'df', storage: 'storage [df|gc|persist]', tree: 'tree [path]',
   touch: 'touch <file…>', mkdir: 'mkdir [-p] <directory…>', rm: 'rm [-rf] <path…>', cp: 'cp [-r] <source…> <destination>',
-  mv: 'mv <source> <destination>', ln: 'ln [-s] <target> <link>', chmod: 'chmod <mode> <path…>',
-  echo: 'echo [-n] <text…>', printf: 'printf <format> [arguments…]', basename: 'basename <path> [suffix]',
+  mv: 'mv <source…> <destination>', ln: 'ln [-s] <target> <link>', chmod: 'chmod <mode> <path…>',
+  echo: 'echo [-ne] <text…>', printf: 'printf <format> [arguments…]', basename: 'basename <path> [suffix]',
   dirname: 'dirname <path>', realpath: 'realpath <path…>', date: 'date [+format]', sleep: 'sleep <seconds>',
   xargs: 'xargs [-n N] [command…]', env: 'env', export: 'export NAME=value…', unset: 'unset NAME…',
-  source: 'source <script>', which: 'which <command>', curl: 'curl [-I] [-o file] <https://registry.npmjs.org/…>',
-  wget: 'wget [-O file] <https://registry.npmjs.org/…>', node: 'node <file> | node -e "code" | node -p "expression"',
+  source: 'source <script>', which: 'which <command>', curl: 'curl [-I] [-s] [-f] [-i] [-X METHOD] [-H header] [-d data] [-o file] <url>',
+  wget: 'wget [-q] [-O file] <url>', node: 'node <file> | node -e "code" | node -p "expression"',
   npm: 'npm install|ci|run <script>|ls|init', pnpm: 'pnpm install|add|run <script>|dlx|exec', yarn: 'yarn [install|add|remove|run <script>|dlx|exec]', bun: 'bun [install|add|remove|run <script|file>|x <pkg>]', bunx: 'bunx <tool> [arguments…]', npx: 'npx <tool> [arguments…]', esbuild: 'esbuild <entry> --bundle --outfile=<file>',
-  ps: 'ps', kill: 'kill [-SIGNAL] <pid>', ports: 'ports', open: 'open <port>', 'close-port': 'close-port <port>',
+  ps: 'ps', kill: 'kill [-SIGNAL] <pid>', ports: 'ports', open: 'open <port|url>', 'close-port': 'close-port <port>',
   history: 'history', test: 'test <expression>', time: 'time <command…>', offline: 'offline [status|clear]',
 };
-const SHELL_HELP = `Beownir shell · a virtual POSIX-flavoured shell (not a native OS shell)
+const SHELL_HELP = `Beownir shell · POSIX-style terminal for your workspace
 
 node <file> | node -e "code" | node -p "expression"      run JavaScript here
-npm / pnpm / yarn / bun install [pkg] | run <script>     registry client
-npx / bunx serve --port 3000 | esbuild <entry> --bundle  preview / bundler
+npm / pnpm / yarn / bun install [pkg] | run <script>     package manager
+npx / bunx vite | serve --port 3000 | esbuild <entry>    dev server / bundler
 ls cd pwd cat head tail wc grep sort uniq sed find stat  files
 touch mkdir rm cp mv ln chmod du df storage tree         files, continued
 echo printf basename dirname realpath date sleep xargs   utilities
 env export unset source history time test clear          shell
-ps kill ports open close-port                            virtual processes
-curl wget                                               registry downloads only
+ps kill ports open close-port                            processes & ports
+curl wget                                                HTTP / registry fetch
 
-Redirect with > >> 2> &> < and pipe with |; chain with &&. Quote patterns to
-stop glob expansion. Run "<command> --help" for one-line usage. Type help for
-this list. "storage gc" frees rebuildable caches and checkpoints when the
-browser origin runs out of space.
+Redirect with > >> 1> 2> &> < and pipe with |; chain with ; && ||. Quote
+patterns to stop glob expansion. Run "<command> --help" for usage. Type help
+for this list. "storage gc" frees rebuildable caches and checkpoints.
 `;
 
 function humanSize(bytes) {
@@ -14166,7 +14239,7 @@ function humanSize(bytes) {
 }
 const modeString = entry => {
   const mode = typeof entry?.mode === 'number' ? entry.mode & 0o7777 : entry?.d ? 0o755 : 0o644;
-  let text = entry?.d ? 'd' : '-';
+  let text = entry?.d ? 'd' : typeof entry?.link === 'string' ? 'l' : '-';
   for (let shift = 6; shift >= 0; shift -= 3) for (let bit = 0; bit < 3; bit++) text += mode & (1 << (shift + 2 - bit)) ? 'rwx'[bit] : '-';
   return text;
 };
@@ -14203,6 +14276,7 @@ function directoryBytes(path) {
 }
 function writeRedirect(entry, data) {
   const target = resolve(expandPath(entry.path));
+  if (target === '/dev/null') return;
   if (entry.append && FS[target]) {
     const previous = FS[target].d ? '' : readFileSync(target, 'utf8');
     writeFileSync(target, previous + (typeof data === 'string' ? data : contentText(data)));
@@ -14217,6 +14291,7 @@ async function executeLine(line) {
     for (const { operator, text } of commandChunks(source)) {
       if (operator === '&&' && code !== 0) continue;
       if (operator === '||' && code === 0) continue;
+      if (!text.trim()) continue;
       code = await executeChunk(text);
       SHELL.lastCode = code;
     }
@@ -14232,48 +14307,73 @@ async function executeLine(line) {
 }
 
 async function executeChunk(rawLine) {
-  const redirect = parseRedirections(rawLine);
-  const line = redirect.line.trim();
-  let stdin = typeof SHELL.stdin === 'string' ? SHELL.stdin : '';
-  if (redirect.stdin) {
-    try { stdin = requireFile(redirect.stdin).text; }
-    catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+  if (!String(rawLine || '').trim()) return 0;
+  const rawStages = splitTopLevel(rawLine, ch => ch === '|');
+  if (rawStages.length > 1 && rawStages.some(stage => !stage.trim())) {
+    throw new Error('Unexpected empty command in pipeline.');
   }
-  if (!line) {
-    if (redirect.stdout) { try { writeRedirect(redirect.stdout, stdin); } catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; } }
-    return 0;
-  }
-  const stages = splitTopLevel(line, ch => ch === '|').map(stage => stage.trim()).filter(Boolean);
-  const stderrToStdout = Boolean(redirect.stderrToStdout), stdoutToStderr = Boolean(redirect.stdoutToStderr);
-  const captureStdout = stages.length > 1 || Boolean(redirect.stdout) || stderrToStdout || stdoutToStderr;
-  const captureStderr = stages.length > 1 || Boolean(redirect.stderr) || stderrToStdout || stdoutToStderr;
   const previous = SHELL.stdin;
-  let output = '', code = 0;
+  let prevOutput = typeof previous === 'string' ? previous : '', code = 0;
   try {
-    for (let index = 0; index < stages.length; index++) {
-      SHELL.stdin = index === 0 ? stdin : output;
-      const buffers = captureStdout || captureStderr ? { stdout: [], stderr: [], captureStdout, captureStderr } : null;
-      shellCapture = buffers;
-      try { code = await executeStage(stages[index], index === stages.length - 1 ? redirect.stderr : null); }
-      finally { shellCapture = null; }
-      if (buffers) {
-        output = buffers.stdout.join('');
-        if (buffers.stderr.length) {
-          const text = buffers.stderr.join('');
-          if (stderrToStdout) output += text;
-          else if (redirect.stderr && index === stages.length - 1) writeRedirect(redirect.stderr, text);
-          else errOut(text);
+    for (let index = 0; index < rawStages.length; index++) {
+      const redirect = parseRedirections(rawStages[index]);
+      const line = redirect.line.trim();
+      let stageStdin = prevOutput;
+      if (redirect.stdin) {
+        try {
+          const inPath = resolve(expandPath(redirect.stdin));
+          stageStdin = inPath === '/dev/null' ? '' : requireFile(redirect.stdin).text;
+        } catch (error) {
+          errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n');
+          return 1;
         }
       }
-      if (code) break;
+      const stderrToStdout = Boolean(redirect.stderrToStdout), stdoutToStderr = Boolean(redirect.stdoutToStderr);
+      if (!line) {
+        if (redirect.stdout) {
+          try { writeRedirect(redirect.stdout, stageStdin); }
+          catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+        }
+        prevOutput = '';
+        code = 0;
+        continue;
+      }
+      const hasNextStage = index < rawStages.length - 1;
+      const captureStdout = hasNextStage || Boolean(redirect.stdout) || stderrToStdout || stdoutToStderr;
+      const captureStderr = rawStages.length > 1 || Boolean(redirect.stderr) || stderrToStdout || stdoutToStderr;
+      SHELL.stdin = stageStdin;
+      const buffers = captureStdout || captureStderr ? { stdout: [], stderr: [], captureStdout, captureStderr } : null;
+      shellCapture = buffers;
+      try { code = await executeStage(line, redirect.stderr); }
+      finally { shellCapture = null; }
+      let stageOut = buffers ? buffers.stdout.join('') : '';
+      let stageErr = buffers ? buffers.stderr.join('') : '';
+      if (stderrToStdout) { stageOut += stageErr; stageErr = ''; }
+      if (stdoutToStderr) { stageErr += stageOut; stageOut = ''; }
+      if (redirect.stdout && redirect.stderr && redirect.stdout === redirect.stderr) {
+        try { writeRedirect(redirect.stdout, stageOut + stageErr); }
+        catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+        prevOutput = '';
+        continue;
+      }
+      if (stageErr) {
+        if (redirect.stderr) {
+          try { writeRedirect(redirect.stderr, stageErr); }
+          catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+        } else errOut(stageErr);
+      }
+      if (redirect.stdout) {
+        try { writeRedirect(redirect.stdout, stageOut); }
+        catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+        prevOutput = '';
+      } else if (hasNextStage) {
+        prevOutput = stageOut;
+      } else {
+        if (stageOut) out(stageOut);
+        prevOutput = '';
+      }
     }
   } finally { SHELL.stdin = previous; }
-  if (redirect.stdout) {
-    try { writeRedirect(redirect.stdout, output); }
-    catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
-  } else if (output) {
-    if (stdoutToStderr) errOut(output); else out(output);
-  }
   return code;
 }
 
@@ -14310,7 +14410,10 @@ async function executeStage(line, stderrRedirect) {
     if (error && error.__exit !== undefined) return Number(error.__exit) || 0;
     const message = '\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n';
     if (shellCapture?.captureStderr) { shellCapture.stderr.push(message); return 1; }
-    if (stderrRedirect) { writeRedirect(stderrRedirect, message); return 1; }
+    if (stderrRedirect) {
+      try { writeRedirect(stderrRedirect, message); } catch { errOut(message); }
+      return 1;
+    }
     throw error;
   }
 }
@@ -14334,7 +14437,7 @@ function resolveLocalBin(rawArg, command) {
     if (!entry || entry.d || entry.dangling) continue;
     let target = binPath;
     if (typeof entry.link === 'string') {
-      target = normalize(dirname(binPath) + '/' + entry.link);
+      target = entry.link.startsWith('/') ? normalize(entry.link) : normalize(dirname(binPath) + '/' + entry.link);
     } else if (typeof entry.c === 'string') {
       const m = /^#!\/bin\/sh\s*\nexec\s+node\s+"([^"]+)"/.exec(entry.c);
       if (m && m[1]) target = normalize(m[1]);
@@ -14344,91 +14447,223 @@ function resolveLocalBin(rawArg, command) {
   return null;
 }
 
+function parseSedCommands(script) {
+  const unescapeDelim = (str, delim) => str.replace(new RegExp('\\\\' + delim.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), delim);
+  let i = 0;
+  if (script[i] !== 's') throw new Error('This shell only supports sed s/pattern/replacement/[gip].');
+  const delim = script[++i];
+  if (!delim) throw new Error('Invalid sed substitute command: ' + script);
+  i++;
+  let rawPat = '', rawRep = '', foundMid = false, foundEnd = false;
+  for (; i < script.length; i++) {
+    if (script[i] === '\\' && i + 1 < script.length) { rawPat += script[i] + script[i + 1]; i++; continue; }
+    if (script[i] === delim) { foundMid = true; i++; break; }
+    rawPat += script[i];
+  }
+  if (!foundMid) throw new Error('Unterminated sed pattern: ' + script);
+  for (; i < script.length; i++) {
+    if (script[i] === '\\' && i + 1 < script.length) { rawRep += script[i] + script[i + 1]; i++; continue; }
+    if (script[i] === delim) { foundEnd = true; i++; break; }
+    rawRep += script[i];
+  }
+  if (!foundEnd) throw new Error('Unterminated sed replacement: ' + script);
+  const mod = script.slice(i);
+  if (!/^[gip0-9]*$/.test(mod)) throw new Error('Unsupported sed flags: ' + mod);
+  const pat = unescapeDelim(rawPat, delim);
+  let rxFlags = '';
+  if (mod.includes('g')) rxFlags += 'g';
+  if (mod.includes('i')) rxFlags += 'i';
+  let regex;
+  try { regex = new RegExp(pat, rxFlags); }
+  catch (error) { throw new Error('Invalid sed pattern: ' + error.message); }
+  let jsRep = '';
+  for (let j = 0; j < rawRep.length; j++) {
+    const ch = rawRep[j];
+    if (ch === '$') { jsRep += '$$'; continue; }
+    if (ch === '&') { jsRep += '$&'; continue; }
+    if (ch === '\\' && j + 1 < rawRep.length) {
+      const nxt = rawRep[++j];
+      if (nxt >= '1' && nxt <= '9') jsRep += '$' + nxt;
+      else if (nxt === '&') jsRep += '&';
+      else if (nxt === 'n') jsRep += '\n';
+      else if (nxt === 't') jsRep += '\t';
+      else if (nxt === 'r') jsRep += '\r';
+      else if (nxt === '\\') jsRep += '\\';
+      else jsRep += nxt;
+      continue;
+    }
+    jsRep += ch;
+  }
+  return { regex, jsRep, printMatch: mod.includes('p') };
+}
+
 async function executeCommand(input) {
   const argv = typeof input === 'string' ? splitArgs(input) : input;
   if (!argv.length || !argv[0]) return 0;
   const command = argv[0].split('/').pop();
   const quoted = argv.quoted || [];
   const args = argv.slice(1).flatMap((word, index) => (quoted[index + 1] ? [word] : expandGlob(word)));
-  if (args[0] === '--help' && USAGE[command]) { out(USAGE[command] + '\n'); return 0; }
+  if (args[0] === '--help' && USAGE[command] && !['npm', 'pnpm', 'yarn', 'bun'].includes(command)) {
+    out(USAGE[command] + '\n');
+    return 0;
+  }
 
   switch (command) {
     case 'help': out(SHELL_HELP); if (args.length) out('\n' + HELP); return 0;
     case 'pwd': out(CWD + '\n'); return 0;
     case 'cd': {
-      const target = resolve(expandPath(args[0] || '/project'));
+      const raw = args[0];
+      let target;
+      if (raw === '-') {
+        target = SHELL.prevCwd || processObj.env.OLDPWD;
+        if (!target) throw new Error('cd: OLDPWD not set');
+      } else {
+        target = resolve(expandPath(raw || '/project'));
+      }
       if (!FS[target]?.d) throw fsError('ENOTDIR', 'chdir', target);
-      CWD = target; processObj.env.PWD = target; post({ type: 'kernel-cwd', cwd: CWD }); return 0;
+      const prev = CWD;
+      SHELL.prevCwd = prev;
+      processObj.env.OLDPWD = prev;
+      CWD = target; processObj.env.PWD = target; post({ type: 'kernel-cwd', cwd: CWD });
+      if (raw === '-') out(target + '\n');
+      return 0;
     }
     case 'ls': case 'dir': {
-      const { flags, positional: paths } = parseFlags(args, { aliases: { a: 'all', l: 'long', R: 'recursive' } });
+      const { flags, positional: paths } = parseFlags(args, {
+        aliases: { a: 'all', l: 'long', R: 'recursive', h: 'human', 1: 'one' },
+        allowNumericFlags: true,
+      });
       const targets = paths.length ? paths : ['.'];
       let output = '';
+      const formatDir = (dirPath, showHeader) => {
+        if (showHeader) output += (output ? '\n' : '') + dirPath + ':\n';
+        let names = readdirSync(dirPath);
+        if (!flags.has('all') && !flags.has('A')) names = names.filter(name => !name.startsWith('.'));
+        if (flags.has('long')) {
+          for (const name of names) {
+            const item = FS[childPath(dirPath, name)] || {};
+            const sizeText = flags.has('human') ? humanSize(entryBytes(item)) : String(entryBytes(item));
+            const linkNote = typeof item.link === 'string' ? ' -> ' + item.link : '';
+            output += modeString(item) + ' ' + sizeText.padStart(9) + ' ' + new Date(item.m || Date.now()).toISOString().slice(0, 16).replace('T', ' ') + '  ' + name + (item.d ? '/' : '') + linkNote + '\n';
+          }
+        } else if (flags.has('one')) {
+          for (const name of names) output += name + (FS[childPath(dirPath, name)]?.d ? '/' : '') + '\n';
+        } else {
+          output += names.map(name => (FS[childPath(dirPath, name)]?.d ? '\x1b[34m' + name + '/\x1b[0m' : name)).join('  ') + '\n';
+        }
+        if (flags.has('recursive')) {
+          for (const name of names) {
+            if (name === '.' || name === '..') continue;
+            const child = childPath(dirPath, name);
+            if (FS[child]?.d && typeof FS[child]?.link !== 'string') formatDir(child, true);
+          }
+        }
+      };
       for (const target of targets) {
         const { path, entry } = lookupPath(target);
         if (!entry) throw fsError('ENOENT', 'scandir', path);
         if (!entry.d) {
-          output += (flags.has('long') ? modeString(entry) + ' ' + String(entryBytes(entry)).padStart(9) + ' ' + new Date(entry.m || Date.now()).toISOString().slice(0, 16).replace('T', ' ') + '  ' : '') + path + '\n';
+          const sizeText = flags.has('human') ? humanSize(entryBytes(entry)) : String(entryBytes(entry));
+          output += (flags.has('long') ? modeString(entry) + ' ' + sizeText.padStart(9) + ' ' + new Date(entry.m || Date.now()).toISOString().slice(0, 16).replace('T', ' ') + '  ' : '') + path + '\n';
           continue;
         }
-        if (targets.length > 1) output += (output ? '\n' : '') + path + ':\n';
-        let names = readdirSync(path);
-        if (!flags.has('all') && !flags.has('A')) names = names.filter(name => !name.startsWith('.'));
-        if (flags.has('long')) {
-          for (const name of names) {
-            const item = FS[childPath(path, name)] || {};
-            output += modeString(item) + ' ' + String(entryBytes(item)).padStart(9) + ' ' + new Date(item.m || Date.now()).toISOString().slice(0, 16).replace('T', ' ') + '  ' + name + (item.d ? '/' : '') + '\n';
-          }
-        } else output += names.map(name => (FS[childPath(path, name)]?.d ? '\x1b[34m' + name + '/\x1b[0m' : name)).join('  ') + '\n';
+        formatDir(path, targets.length > 1 || flags.has('recursive'));
       }
       out(output);
       return 0;
     }
     case 'cat': {
-      if (!args.length) { out(stdinText()); return 0; }
-      let output = '';
-      for (const file of args) output += requireFile(file).text;
-      out(output.endsWith('\n') || !output ? output : output + '\n');
+      const { flags, positional: files } = parseFlags(args, { aliases: { n: 'number' } });
+      const text = files.length
+        ? files.map(file => (file === '-' ? stdinText() : requireFile(file).text)).join('')
+        : stdinText();
+      if (!text) return 0;
+      if (flags.has('number')) {
+        const hasTrailing = text.endsWith('\n');
+        const lines = text.split('\n');
+        if (hasTrailing) lines.pop();
+        out(lines.map((line, idx) => String(idx + 1).padStart(6) + '\t' + line).join('\n') + (hasTrailing ? '\n' : ''));
+        return 0;
+      }
+      out(text);
       return 0;
     }
     case 'head': case 'tail': {
-      const { values, positional: rest } = parseFlags(args, { withValue: ['n'] });
+      const { values, positional: rest } = parseFlags(args, { withValue: ['n', 'c'] });
       const numeric = rest.find(word => /^-\d+$/.test(word));
-      const requested = values.n !== undefined ? values.n : numeric ? numeric.slice(1) : 10;
+      const byteMode = values.c !== undefined;
+      const requested = byteMode ? values.c : values.n !== undefined ? values.n : numeric ? numeric.slice(1) : 10;
       const parsed = Number.parseInt(String(requested), 10);
       if (!Number.isFinite(parsed) || parsed < 0) throw new Error('head/tail expects a line count of 0 or more.');
       const count = parsed;
-      const file = rest.find(word => !/^-\d+$/.test(word));
-      const text = file ? requireFile(file).text : stdinText();
-      const lines = text.split('\n');
-      if (lines.length && lines[lines.length - 1] === '') lines.pop();
-      const slice = command === 'head' ? lines.slice(0, count) : lines.slice(Math.max(0, lines.length - count));
-      if (slice.length) out(slice.join('\n') + '\n');
+      const files = rest.filter(word => !/^-\d+$/.test(word));
+      const sources = files.length ? files : ['-'];
+      for (let idx = 0; idx < sources.length; idx++) {
+        const file = sources[idx];
+        const text = file === '-' ? stdinText() : requireFile(file).text;
+        if (sources.length > 1) out((idx > 0 ? '\n' : '') + '==> ' + (file === '-' ? 'standard input' : file) + ' <==\n');
+        if (byteMode) {
+          out(command === 'head' ? text.slice(0, count) : text.slice(Math.max(0, text.length - count)));
+          continue;
+        }
+        const lines = text.split('\n');
+        if (lines.length && lines[lines.length - 1] === '') lines.pop();
+        const slice = command === 'head' ? lines.slice(0, count) : lines.slice(Math.max(0, lines.length - count));
+        if (slice.length) out(slice.join('\n') + '\n');
+      }
       return 0;
     }
     case 'wc': {
-      const { flags, positional: files } = parseFlags(args, { aliases: { l: 'lines', w: 'words', c: 'bytes' } });
-      const sources = files.length ? files.map(file => [file, requireFile(file).text]) : [['', stdinText()]];
-      const only = flags.has('lines') || flags.has('words') || flags.has('bytes');
-      let output = '';
+      const { flags, positional: files } = parseFlags(args, { aliases: { l: 'lines', w: 'words', c: 'bytes', m: 'chars' } });
+      const sources = files.length ? files.map(file => [file === '-' ? '' : file, file === '-' ? stdinText() : requireFile(file).text]) : [['', stdinText()]];
+      const only = flags.has('lines') || flags.has('words') || flags.has('bytes') || flags.has('chars');
+      let output = '', totalLines = 0, totalWords = 0, totalBytes = 0, totalChars = 0;
       for (const [name, text] of sources) {
         const lines = text === '' ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+        const words = text.split(/\s+/).filter(Boolean).length;
+        const bytes = te.encode(text).length;
+        const chars = text.length;
+        totalLines += lines; totalWords += words; totalBytes += bytes; totalChars += chars;
         const parts = [];
         if (flags.has('lines') || !only) parts.push(String(lines).padStart(6));
-        if (flags.has('words') || !only) parts.push(String(text.split(/\s+/).filter(Boolean).length).padStart(6));
-        if (flags.has('bytes') || !only) parts.push(String(te.encode(text).length).padStart(6));
+        if (flags.has('words') || !only) parts.push(String(words).padStart(6));
+        if (flags.has('chars')) parts.push(String(chars).padStart(6));
+        if (flags.has('bytes') || !only) parts.push(String(bytes).padStart(6));
         output += parts.join(' ') + (name ? ' ' + name : '') + '\n';
+      }
+      if (sources.length > 1) {
+        const parts = [];
+        if (flags.has('lines') || !only) parts.push(String(totalLines).padStart(6));
+        if (flags.has('words') || !only) parts.push(String(totalWords).padStart(6));
+        if (flags.has('chars')) parts.push(String(totalChars).padStart(6));
+        if (flags.has('bytes') || !only) parts.push(String(totalBytes).padStart(6));
+        output += parts.join(' ') + ' total\n';
       }
       out(output);
       return 0;
     }
     case 'grep': case 'egrep': {
-      const { flags, positional: rest } = parseFlags(args, { aliases: { i: 'ignorecase', n: 'line', c: 'count', v: 'invert', l: 'files', r: 'recursive' } });
-      const pattern = rest.shift();
-      if (pattern === undefined) throw new Error('Usage: ' + USAGE.grep);
-      let matcher;
-      try { matcher = new RegExp(pattern, flags.has('ignorecase') ? 'i' : ''); }
-      catch { matcher = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags.has('ignorecase') ? 'i' : ''); }
+      const { flags, allValues, positional: rest } = parseFlags(args, {
+        withValue: ['e', 'regexp'],
+        aliases: { i: 'ignorecase', n: 'line', c: 'count', v: 'invert', l: 'files', r: 'recursive', F: 'fixed', q: 'quiet', w: 'word', h: 'noFilename', e: 'regexp' },
+      });
+      const patterns = allValues.regexp?.length ? allValues.regexp : (() => {
+        const pattern = rest.shift();
+        if (pattern === undefined) throw new Error('Usage: ' + USAGE.grep);
+        return [pattern];
+      })();
+      const compile = pat => {
+        const literal = String(pat).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        let expr = flags.has('fixed') ? literal : String(pat);
+        if (flags.has('word')) expr = '\\b(?:' + expr + ')\\b';
+        try { return new RegExp(expr, flags.has('ignorecase') ? 'i' : ''); }
+        catch {
+          const fallback = flags.has('word') ? '\\b(?:' + literal + ')\\b' : literal;
+          return new RegExp(fallback, flags.has('ignorecase') ? 'i' : '');
+        }
+      };
+      const matchers = patterns.map(compile);
+      const matchesLine = line => matchers.some(m => m.test(line));
       const sources = [];
       if (flags.has('recursive')) {
         for (const root of rest.length ? rest : ['.']) {
@@ -14442,65 +14677,120 @@ async function executeCommand(input) {
             sources.push([key, contentText(FS[key].c ?? '')]);
           }
         }
-      } else if (rest.length) for (const file of rest) sources.push([file, requireFile(file).text]);
-      else sources.push(['(standard input)', stdinText()]);
+      } else if (rest.length) {
+        for (const file of rest) sources.push([file === '-' ? '(standard input)' : file, file === '-' ? stdinText() : requireFile(file).text]);
+      } else sources.push(['(standard input)', stdinText()]);
+      const showFile = sources.length > 1 && !flags.has('noFilename');
       let output = '', matched = 0;
       for (const [name, text] of sources) {
         const lines = text.split('\n');
         if (lines.length && lines[lines.length - 1] === '') lines.pop();
         let hits = 0;
         for (let index = 0; index < lines.length; index++) {
-          if (matcher.test(lines[index]) === flags.has('invert')) continue;
+          if (matchesLine(lines[index]) === flags.has('invert')) continue;
           hits++;
+          if (flags.has('quiet')) return 0;
           if (flags.has('files')) { output += name + '\n'; break; }
-          if (!flags.has('count')) output += (sources.length > 1 ? name + ':' : '') + (flags.has('line') ? (index + 1) + ':' : '') + lines[index] + '\n';
+          if (!flags.has('count')) output += (showFile ? name + ':' : '') + (flags.has('line') ? (index + 1) + ':' : '') + lines[index] + '\n';
         }
-        if (flags.has('count')) output += (sources.length > 1 ? name + ':' : '') + hits + '\n';
+        if (flags.has('count')) output += (showFile ? name + ':' : '') + hits + '\n';
         matched += hits;
       }
-      out(output);
+      if (!flags.has('quiet')) out(output);
       return matched ? 0 : 1;
     }
     case 'sort': {
-      const { flags, positional: files } = parseFlags(args, { aliases: { n: 'numeric', r: 'reverse', u: 'unique' } });
-      const text = files.length ? files.map(file => requireFile(file).text).join('') : stdinText();
+      const { flags, positional: files } = parseFlags(args, { aliases: { n: 'numeric', r: 'reverse', u: 'unique', f: 'ignoreCase' } });
+      const text = files.length
+        ? files.map(file => {
+          const chunk = file === '-' ? stdinText() : requireFile(file).text;
+          return chunk && !chunk.endsWith('\n') ? chunk + '\n' : chunk;
+        }).join('')
+        : stdinText();
       let lines = text.split('\n');
       if (lines.length && lines[lines.length - 1] === '') lines.pop();
-      lines.sort(flags.has('numeric') ? (a, b) => (parseFloat(a) - parseFloat(b)) || a.localeCompare(b) : (a, b) => a.localeCompare(b));
+      const cmpText = flags.has('ignoreCase')
+        ? (a, b) => a.toLowerCase().localeCompare(b.toLowerCase()) || a.localeCompare(b)
+        : (a, b) => a.localeCompare(b);
+      lines.sort(flags.has('numeric')
+        ? (a, b) => {
+          const na = parseFloat(a), nb = parseFloat(b);
+          return ((Number.isFinite(na) ? na : 0) - (Number.isFinite(nb) ? nb : 0)) || cmpText(a, b);
+        }
+        : cmpText);
       if (flags.has('reverse')) lines.reverse();
-      if (flags.has('unique')) lines = lines.filter((line, index) => index === 0 || line !== lines[index - 1]);
+      if (flags.has('unique')) lines = lines.filter((line, index) => index === 0 || (flags.has('ignoreCase') ? line.toLowerCase() !== lines[index - 1].toLowerCase() : line !== lines[index - 1]));
       if (lines.length) out(lines.join('\n') + '\n');
       return 0;
     }
     case 'uniq': {
-      const { flags, positional: files } = parseFlags(args, { aliases: { c: 'count' } });
-      const text = files.length ? requireFile(files[0]).text : stdinText();
+      const { flags, positional: files } = parseFlags(args, { aliases: { c: 'count', i: 'ignoreCase', d: 'repeated', u: 'unique' } });
+      const file = files[0];
+      const text = file && file !== '-' ? requireFile(file).text : stdinText();
       const lines = text.split('\n');
       if (lines.length && lines[lines.length - 1] === '') lines.pop();
+      const same = (a, b) => (flags.has('ignoreCase') ? a.toLowerCase() === b.toLowerCase() : a === b);
       const output = [];
       for (let index = 0; index < lines.length; index++) {
-        if (index && lines[index] === lines[index - 1]) continue;
+        if (index && same(lines[index], lines[index - 1])) continue;
         let repeats = 1;
-        while (index + repeats < lines.length && lines[index + repeats] === lines[index]) repeats++;
+        while (index + repeats < lines.length && same(lines[index + repeats], lines[index])) repeats++;
+        if (flags.has('repeated') && repeats < 2) continue;
+        if (flags.has('unique') && repeats > 1) continue;
         output.push(flags.has('count') ? String(repeats).padStart(7) + ' ' + lines[index] : lines[index]);
       }
       if (output.length) out(output.join('\n') + '\n');
       return 0;
     }
     case 'cut': {
-      const { values, positional: files } = parseFlags(args, { withValue: ['d', 'f'], aliases: { d: 'delimiter', f: 'fields' } });
+      const { flags, values, positional: files } = parseFlags(args, { withValue: ['d', 'f'], aliases: { d: 'delimiter', f: 'fields', s: 'onlyDelimited' } });
       if (values.fields === undefined) throw new Error('Usage: ' + USAGE.cut);
       const delimiter = values.delimiter ?? '\t';
-      const fields = String(values.fields).split(',').map(value => Number.parseInt(value, 10)).filter(Number.isFinite);
-      const text = files.length ? requireFile(files[0]).text : stdinText();
-      const output = text.split('\n').map(line => fields.map(field => line.split(delimiter)[field - 1] ?? '').join(delimiter));
-      out(output.join('\n'));
+      const ranges = [];
+      for (const part of String(values.fields).split(',')) {
+        const range = /^(\d*)-(\d*)$/.exec(part.trim());
+        if (range && (range[1] || range[2])) {
+          ranges.push({ start: range[1] ? Math.max(1, Number.parseInt(range[1], 10)) : 1, end: range[2] ? Number.parseInt(range[2], 10) : null });
+        } else {
+          const n = Number.parseInt(part, 10);
+          if (Number.isFinite(n) && n >= 1) ranges.push({ start: n, end: n });
+        }
+      }
+      const text = files.length ? files.map(f => (f === '-' ? stdinText() : requireFile(f).text)).join('') : stdinText();
+      if (!text) return 0;
+      const hasTrailing = text.endsWith('\n');
+      const lines = text.split('\n');
+      if (hasTrailing) lines.pop();
+      const output = [];
+      for (const line of lines) {
+        if (!line.includes(delimiter)) { if (!flags.has('onlyDelimited')) output.push(line); continue; }
+        const cols = line.split(delimiter);
+        const selected = new Set();
+        for (const r of ranges) {
+          const stop = r.end === null ? cols.length : Math.min(cols.length, r.end);
+          for (let col = r.start; col <= stop; col++) selected.add(col);
+        }
+        const sortedCols = [...selected].sort((a, b) => a - b);
+        output.push(sortedCols.map(col => cols[col - 1] ?? '').join(delimiter));
+      }
+      if (output.length) out(output.join('\n') + (hasTrailing ? '\n' : ''));
       return 0;
     }
     case 'tr': {
-      const { flags, positional: sets } = parseFlags(args, { aliases: { d: 'delete' } });
+      const { flags, positional: sets } = parseFlags(args, { aliases: { d: 'delete', s: 'squeeze' } });
       const text = stdinText();
-      const expandSet = spec => {
+      const unescapeTr = spec => {
+        let res = '';
+        for (let i = 0; i < spec.length; i++) {
+          if (spec[i] === '\\' && i + 1 < spec.length) {
+            const nxt = spec[++i];
+            res += ({ n: '\n', r: '\r', t: '\t', '\\': '\\', a: '\x07', b: '\b', f: '\f', v: '\v' })[nxt] ?? nxt;
+          } else res += spec[i];
+        }
+        return res;
+      };
+      const expandSet = rawSpec => {
+        const spec = unescapeTr(rawSpec);
         const chars = [];
         for (let index = 0; index < spec.length; index++) {
           if (spec[index + 1] === '-' && spec[index + 2] !== undefined && spec[index] <= spec[index + 2]) {
@@ -14511,10 +14801,28 @@ async function executeCommand(input) {
         return chars;
       };
       const source = expandSet(sets[0] ?? ''), target = expandSet(sets[1] ?? '');
-      if (flags.has('delete')) { const drop = new Set(source); out([...text].filter(ch => !drop.has(ch)).join('')); return 0; }
       if (!source.length) throw new Error('Usage: ' + USAGE.tr);
-      const map = new Map(source.map((ch, index) => [ch, target[index] ?? (target.length ? target[target.length - 1] : undefined) ?? ch]));
-      out([...text].map(ch => map.get(ch) ?? ch).join(''));
+      let result;
+      if (flags.has('delete')) {
+        const drop = new Set(source);
+        result = [...text].filter(ch => !drop.has(ch)).join('');
+      } else if (target.length) {
+        const map = new Map(source.map((ch, index) => [ch, target[index] ?? target[target.length - 1]]));
+        result = [...text].map(ch => map.get(ch) ?? ch).join('');
+      } else if (flags.has('squeeze')) {
+        result = text;
+      } else throw new Error('Usage: ' + USAGE.tr);
+      if (flags.has('squeeze')) {
+        const squeezeSet = new Set(target.length && !flags.has('delete') ? target : source);
+        let squeezed = '', prev = null;
+        for (const ch of result) {
+          if (ch === prev && squeezeSet.has(ch)) continue;
+          squeezed += ch;
+          prev = ch;
+        }
+        result = squeezed;
+      }
+      out(result);
       return 0;
     }
     case 'tee': {
@@ -14526,19 +14834,45 @@ async function executeCommand(input) {
       return 0;
     }
     case 'sed': {
-      const { flags, positional: rest } = parseFlags(args, { aliases: { n: 'quiet', i: 'inplace' } });
-      const script = rest.shift();
-      if (!script) throw new Error('Usage: ' + USAGE.sed);
-      const match = /^s(.)(.*?)\1(.*?)\1([gi]*)$/.exec(script);
-      if (!match) throw new Error('This shell only supports sed s/pattern/replacement/[gi].');
-      const [, , pattern, replacement, modifier] = match;
-      let regex;
-      try { regex = new RegExp(pattern, modifier.includes('i') ? 'gi' : 'g'); }
-      catch (error) { throw new Error('Invalid sed pattern: ' + error.message); }
-      const text = rest.length ? rest.map(file => requireFile(file).text).join('') : stdinText();
-      const expand = line => line.replace(regex, replacement.replace(/\$/g, '$$$$'));
-      if (flags.has('inplace')) { for (const file of rest) writeFileSync(file, text.split('\n').map(expand).join('\n')); return 0; }
-      if (!flags.has('quiet')) out(text.split('\n').map(expand).join('\n'));
+      const { flags, allValues, positional: rest } = parseFlags(args, { withValue: ['e'], aliases: { n: 'quiet', i: 'inplace', e: 'expression' } });
+      const scripts = allValues.expression?.length ? allValues.expression : (() => {
+        const first = rest.shift();
+        if (!first) throw new Error('Usage: ' + USAGE.sed);
+        return [first];
+      })();
+      const commands = scripts.map(parseSedCommands);
+      const transformText = inputText => {
+        if (!inputText) return '';
+        const hasTrailing = inputText.endsWith('\n');
+        const lines = inputText.split('\n');
+        if (hasTrailing) lines.pop();
+        const outLines = [];
+        for (const line of lines) {
+          let current = line, matchedAny = false;
+          for (const cmd of commands) {
+            if (cmd.regex.global) cmd.regex.lastIndex = 0;
+            if (cmd.regex.test(current)) matchedAny = true;
+            if (cmd.regex.global) cmd.regex.lastIndex = 0;
+            current = current.replace(cmd.regex, cmd.jsRep);
+          }
+          if (!flags.has('quiet')) outLines.push(current);
+          else if (matchedAny && commands.some(c => c.printMatch)) outLines.push(current);
+        }
+        return outLines.length ? outLines.join('\n') + (hasTrailing || flags.has('quiet') ? '\n' : '') : '';
+      };
+      if (flags.has('inplace')) {
+        if (!rest.length) throw new Error('sed -i requires at least one file.');
+        for (const file of rest) {
+          const { path, text } = requireFile(file);
+          writeFileSync(path, transformText(text));
+        }
+        return 0;
+      }
+      const sources = rest.length ? rest.map(f => (f === '-' ? stdinText() : requireFile(f).text)) : [stdinText()];
+      for (const src of sources) {
+        const formatted = transformText(src);
+        if (formatted) out(formatted);
+      }
       return 0;
     }
     case 'find': {
@@ -14568,7 +14902,7 @@ async function executeCommand(input) {
       for (const target of args) {
         const { path, entry } = lookupPath(target);
         if (!entry) throw fsError('ENOENT', 'stat', path);
-        out('  File: ' + path + '\n  Size: ' + entryBytes(entry) + ' bytes\n  Type: ' + (entry.d ? 'directory' : 'regular file') + '\n  Mode: ' + modeString(entry) + '\nModify: ' + new Date(entry.m || Date.now()).toISOString() + '\n');
+        out('  File: ' + path + '\n  Size: ' + entryBytes(entry) + ' bytes\n  Type: ' + (entry.d ? 'directory' : typeof entry.link === 'string' ? 'symbolic link' : 'regular file') + '\n  Mode: ' + modeString(entry) + '\nModify: ' + new Date(entry.m || Date.now()).toISOString() + '\n');
       }
       return 0;
     }
@@ -14586,6 +14920,7 @@ async function executeCommand(input) {
           for (const name of readdirSync(path)) {
             const child = childPath(path, name);
             if (FS[child]?.d) out(show(directoryBytes(child)).padStart(10) + '  ' + child + '\n');
+            else if (flags.has('all') && FS[child]) out(show(entryBytes(FS[child])).padStart(10) + '  ' + child + '\n');
           }
         }
         out(show(bytes).padStart(10) + '  ' + path + '\n');
@@ -14617,7 +14952,10 @@ async function executeCommand(input) {
     case 'mkdir': {
       const { flags, positional: dirs } = parseFlags(args, { aliases: { p: 'parents' } });
       if (!dirs.length) throw new Error('Usage: ' + USAGE.mkdir);
-      for (const dir of dirs) { if (flags.has('parents')) mkdirp(dir); else mkdirSync(dir); }
+      for (const dir of dirs) {
+        const target = resolve(expandPath(dir));
+        if (flags.has('parents')) mkdirp(target); else mkdirSync(target);
+      }
       return 0;
     }
     case 'rm': case 'rmdir': {
@@ -14628,7 +14966,7 @@ async function executeCommand(input) {
       for (const target of paths) {
         const { path, entry } = lookupPath(target);
         if (!entry) { if (force) continue; throw fsError('ENOENT', 'remove', path); }
-        if (path === '/project' || path === '/') throw new Error('Refusing to remove ' + path + '.');
+        if (path === '/project' || path === '/' || path === '/tmp') throw new Error('Refusing to remove ' + path + '.');
         if (entry.d && !recursive) throw new Error('Cannot remove directory ' + path + ' without -r.');
         if (entry.d) { if (command === 'rmdir') rmdirSync(path); else rmSync(path, { recursive: true, force }); continue; }
         rmSync(path, { force });
@@ -14639,13 +14977,16 @@ async function executeCommand(input) {
       const { flags, positional: rest } = parseFlags(args, { aliases: { r: 'recursive', R: 'recursive', a: 'archive' } });
       if (rest.length < 2) throw new Error('Usage: ' + USAGE.cp);
       const destination = rest.pop();
+      const target = resolve(expandPath(destination));
+      if (rest.length > 1 && !FS[target]?.d) throw fsError(FS[target] ? 'ENOTDIR' : 'ENOENT', 'copy', target);
       const recursive = flags.has('recursive') || flags.has('archive');
       for (const source of rest) {
         const { path, entry } = lookupPath(source);
         if (!entry) throw fsError('ENOENT', 'copy', path);
         if (entry.d && !recursive) throw new Error('Cannot copy directory ' + path + ' without -r.');
-        const target = resolve(expandPath(destination));
         const finalPath = FS[target]?.d ? childPath(target, basename(path)) : target;
+        if (path === finalPath) continue;
+        if (entry.d && finalPath.startsWith(path + '/')) throw new Error('Cannot copy directory ' + path + ' into itself.');
         if (!entry.d) { if (!FS[dirname(finalPath)]?.d) throw fsError('ENOENT', 'copy', finalPath); writeFileSync(finalPath, readFileSync(path)); continue; }
         for (const key of nestedKeys(path)) {
           const copy = finalPath + key.slice(path.length);
@@ -14657,37 +14998,65 @@ async function executeCommand(input) {
     }
     case 'mv': {
       const { positional: rest } = parseFlags(args);
-      if (rest.length !== 2) throw new Error('Usage: ' + USAGE.mv);
-      const [source, destination] = rest;
-      const { path, entry } = lookupPath(source);
-      if (!entry) throw fsError('ENOENT', 'rename', path);
+      if (rest.length < 2) throw new Error('Usage: ' + USAGE.mv);
+      const destination = rest.pop();
       const target = resolve(expandPath(destination));
-      const finalPath = FS[target]?.d ? childPath(target, basename(path)) : target;
-      if (path === finalPath) return 0;
-      if (FS[finalPath]?.d && !entry.d) throw fsError('EISDIR', 'rename', finalPath);
-      if (FS[finalPath]) rmSync(finalPath, { recursive: true, force: true });
-      FSMOD.renameSync(path, finalPath);
+      if (rest.length > 1 && !FS[target]?.d) throw fsError(FS[target] ? 'ENOTDIR' : 'ENOENT', 'rename', target);
+      for (const source of rest) {
+        const { path, entry } = lookupPath(source);
+        if (!entry) throw fsError('ENOENT', 'rename', path);
+        const finalPath = FS[target]?.d ? childPath(target, basename(path)) : target;
+        if (path === finalPath) continue;
+        if (entry.d && finalPath.startsWith(path + '/')) throw new Error('Cannot move directory ' + path + ' into itself.');
+        if (FS[finalPath]?.d && !entry.d) throw fsError('EISDIR', 'rename', finalPath);
+        if (entry.d && FS[finalPath] && !FS[finalPath].d) throw fsError('ENOTDIR', 'rename', finalPath);
+        if (FS[finalPath]) rmSync(finalPath, { recursive: true, force: true });
+        FSMOD.renameSync(path, finalPath);
+      }
       return 0;
     }
     case 'ln': {
       const { flags, positional: rest } = parseFlags(args, { aliases: { s: 'symbolic' } });
       if (rest.length !== 2) throw new Error('Usage: ' + USAGE.ln);
-      if (flags.has('symbolic')) { FSMOD.symlinkSync(rest[0], rest[1]); return 0; }
-      FSMOD.linkSync(rest[0], rest[1]);
+      const rawSrc = expandPath(rest[0]);
+      const dest = resolve(expandPath(rest[1]));
+      const finalDest = FS[dest]?.d ? childPath(dest, basename(rawSrc)) : dest;
+      if (flags.has('symbolic')) { FSMOD.symlinkSync(rawSrc, finalDest); return 0; }
+      FSMOD.linkSync(resolve(rawSrc), finalDest);
       return 0;
     }
     case 'chmod': {
-      const { positional: rest } = parseFlags(args);
+      let recursive = false;
+      const rest = [];
+      for (let idx = 0; idx < args.length; idx++) {
+        if (!rest.length && (args[idx] === '-R' || args[idx] === '--recursive')) { recursive = true; continue; }
+        if (!rest.length && args[idx] === '--') { rest.push(...args.slice(idx + 1)); break; }
+        rest.push(args[idx]);
+      }
       if (rest.length < 2) throw new Error('Usage: ' + USAGE.chmod);
       const [mode, ...targets] = rest;
-      for (const target of targets) FSMOD.chmodSync(target, mode);
+      for (const target of targets) {
+        const abs = resolve(expandPath(target));
+        if (recursive && FS[abs]?.d) {
+          for (const key of nestedKeys(abs)) FSMOD.chmodSync(key, mode);
+        } else FSMOD.chmodSync(abs, mode);
+      }
       return 0;
     }
     case 'echo': {
-      const newline = !args.includes('-n');
-      const escapes = args.includes('-e');
-      let text = args.filter(word => word !== '-n' && word !== '-e').join(' ');
-      if (escapes) text = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r').replace(/\\\\/g, '\\');
+      let newline = true, escapes = false, idx = 0;
+      while (idx < args.length && /^-[neE]+$/.test(args[idx])) {
+        for (const ch of args[idx].slice(1)) {
+          if (ch === 'n') newline = false;
+          else if (ch === 'e') escapes = true;
+          else if (ch === 'E') escapes = false;
+        }
+        idx++;
+      }
+      let text = args.slice(idx).join(' ');
+      if (escapes) {
+        text = text.replace(/\\([\\ntr0])/g, (_, ch) => ({ '\\': '\\', n: '\n', t: '\t', r: '\r', 0: '\0' })[ch] || ch);
+      }
       out(text + (newline ? '\n' : ''));
       return 0;
     }
@@ -14695,16 +15064,46 @@ async function executeCommand(input) {
       const format = args.shift();
       if (format === undefined) throw new Error('Usage: ' + USAGE.printf);
       let index = 0;
-      const text = format.replace(/\\(.)|%([%sdifx])/g, (whole, escape, spec) => {
-        if (escape) return ({ n: '\n', t: '\t', r: '\r', '\\': '\\', 0: '\0' })[escape] ?? escape;
-        if (spec === '%') return '%';
-        const value = args[index++];
-        if (spec === 's') return String(value ?? '');
-        if (spec === 'd' || spec === 'i') return String(Math.trunc(Number(value)) || 0);
-        if (spec === 'x') return (Math.trunc(Number(value)) || 0).toString(16);
-        return String(Number(value) || 0);
-      });
-      out(text);
+      let output = '';
+      do {
+        const consumed = index;
+        output += format.replace(/\\([\\ntr0])|%(-)?(0)?(\d+)?(?:\.(\d+))?([%sdifxXoc])/g, (whole, esc, left, zero, width, prec, spec) => {
+          if (esc) return ({ n: '\n', t: '\t', r: '\r', '\\': '\\', 0: '\0' })[esc] ?? esc;
+          if (spec === '%') return '%';
+          const value = args[index++];
+          let formatted;
+          if (spec === 's') {
+            formatted = String(value ?? '');
+            if (prec !== undefined) formatted = formatted.slice(0, Number(prec));
+          } else if (spec === 'c') {
+            formatted = value === undefined ? '' : String(value)[0] || '';
+          } else if (spec === 'd' || spec === 'i') {
+            formatted = String(Math.trunc(Number(value)) || 0);
+          } else if (spec === 'x' || spec === 'X') {
+            formatted = (Math.trunc(Number(value)) || 0).toString(16);
+            if (spec === 'X') formatted = formatted.toUpperCase();
+          } else if (spec === 'o') {
+            formatted = (Math.trunc(Number(value)) || 0).toString(8);
+          } else {
+            const num = Number(value) || 0;
+            formatted = prec !== undefined ? num.toFixed(Number(prec)) : String(num);
+          }
+          if (width !== undefined) {
+            const w = Number(width);
+            const padChar = !left && zero && spec !== 's' && spec !== 'c' ? '0' : ' ';
+            if (formatted.length < w) {
+              if (padChar === '0' && formatted.startsWith('-')) {
+                formatted = '-' + formatted.slice(1).padStart(w - 1, '0');
+              } else {
+                formatted = left ? formatted.padEnd(w, ' ') : formatted.padStart(w, padChar);
+              }
+            }
+          }
+          return formatted;
+        });
+        if (index === consumed) break;
+      } while (index < args.length);
+      out(output);
       return 0;
     }
     case 'basename': {
@@ -14782,7 +15181,7 @@ async function executeCommand(input) {
       if (!args.length) { out(Object.entries(processObj.env).map(([key, value]) => 'declare -x ' + key + '="' + String(value) + '"').join('\n') + '\n'); return 0; }
       for (const assignment of args) {
         const equals = assignment.indexOf('=');
-        if (equals <= 0) throw new Error('Usage: export NAME=value (this shell cannot export an existing variable by name).');
+        if (equals <= 0) throw new Error('Usage: export NAME=value (specify both variable name and value).');
         const key = assignment.slice(0, equals), value = assignment.slice(equals + 1);
         if (!/^[A-Za-z_]\w*$/.test(key)) throw new Error('Invalid environment variable name: ' + key);
         processObj.env[key] = value;
@@ -14811,27 +15210,54 @@ async function executeCommand(input) {
       return 1;
     }
     case 'curl': case 'wget': {
-      const { values, positional: rest } = parseFlags(args, { withValue: ['o', 'output', 'X', 'request', 'H', 'header', 'd', 'data'], aliases: { I: 'head', O: 'output' } });
-      const url = rest.find(word => /^https?:\/\//.test(word));
+      const { flags, values, allValues, positional: rest } = parseFlags(args, {
+        withValue: ['o', 'output', 'X', 'request', 'H', 'header', 'd', 'data'],
+        aliases: { I: 'head', O: 'output', s: 'silent', f: 'fail', i: 'include', L: 'location', q: 'silent' },
+      });
+      const url = rest.find(word => /^https?:\/\//i.test(word));
       if (!url) throw new Error('Usage: ' + USAGE[command]);
-      const method = String(values.X || values.request || (values.d || values.data ? 'POST' : 'GET')).toUpperCase();
-      const target = values.o || values.output;
-      if (method === 'GET' || method === 'HEAD') {
-        if (method === 'HEAD') {
-          const head = await fetch(url, { method: 'HEAD', credentials: 'omit' });
-          const text = 'HTTP ' + head.status + '\ncontent-length: ' + (head.headers.get('content-length') || 'unknown') + '\n';
-          if (target) writeRedirect({ path: target, append: false }, text); else out(text);
-          return head.ok ? 0 : 22;
-        }
-        const bytes = await registryBytes(url);
-        if (target) { writeRedirect({ path: target, append: false }, bytes); out('saved ' + humanSize(bytes.length) + ' to ' + resolve(target) + '\n'); }
-        else out(decodeBytes(bytes));
-        return 0;
+      const bodyData = values.data ?? values.d;
+      const method = flags.has('head') ? 'HEAD' : String(values.request || values.X || (bodyData !== undefined ? 'POST' : 'GET')).toUpperCase();
+      const target = values.output ?? values.o;
+      const headers = {};
+      for (const rawHeader of (allValues.header || allValues.H || [])) {
+        const sep = String(rawHeader).indexOf(':');
+        if (sep > 0) headers[String(rawHeader).slice(0, sep).trim()] = String(rawHeader).slice(sep + 1).trim();
       }
-      const response = await fetch(url, { method, credentials: 'omit', headers: values.d || values.data ? { 'content-type': 'application/json' } : undefined, body: values.d || values.data });
-      const text = await response.text();
-      if (target) { writeRedirect({ path: target, append: false }, text); out('saved ' + humanSize(text.length) + ' to ' + resolve(target) + '\n'); }
-      else out(text + '\n');
+      if (bodyData !== undefined && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+        headers['content-type'] = 'application/json';
+      }
+      const fetchInit = { method, credentials: 'omit' };
+      if (Object.keys(headers).length) fetchInit.headers = headers;
+      if (bodyData !== undefined && method !== 'GET' && method !== 'HEAD') fetchInit.body = String(bodyData);
+      const response = await fetch(url, fetchInit);
+      if (flags.has('fail') && !response.ok) return 22;
+      if (method === 'HEAD') {
+        const headerLines = [];
+        if (response.headers && typeof response.headers.forEach === 'function') {
+          response.headers.forEach((v, k) => headerLines.push(k + ': ' + v));
+        }
+        const text = 'HTTP ' + response.status + (response.statusText ? ' ' + response.statusText : '') + '\n' + (headerLines.length ? headerLines.join('\n') + '\n' : '');
+        if (target) writeRedirect({ path: target, append: false }, text); else out(text);
+        return response.ok ? 0 : 22;
+      }
+      let headPrefix = '';
+      if (flags.has('include')) {
+        const headerLines = [];
+        if (response.headers && typeof response.headers.forEach === 'function') {
+          response.headers.forEach((v, k) => headerLines.push(k + ': ' + v));
+        }
+        headPrefix = 'HTTP ' + response.status + (response.statusText ? ' ' + response.statusText : '') + '\n' + (headerLines.length ? headerLines.join('\n') + '\n' : '') + '\n';
+      }
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length > INSTALL_BUDGET.tarballBytes) throw new Error('Response exceeds the ' + Math.round(INSTALL_BUDGET.tarballBytes / 1024 / 1024) + ' MiB limit.');
+      if (target) {
+        writeRedirect({ path: target, append: false }, bytes);
+        if (!flags.has('silent')) out('saved ' + humanSize(bytes.length) + ' to ' + resolve(expandPath(target)) + '\n');
+      } else {
+        if (headPrefix) out(headPrefix);
+        out(decodeBytes(bytes));
+      }
       return response.ok ? 0 : 22;
     }
     case 'node': case 'nodejs': return runNode(args);
@@ -14843,7 +15269,11 @@ async function executeCommand(input) {
     case 'npx': return runNpx(args);
     case 'esbuild': return runEsbuild(args);
     case 'serve': case 'vite': return runNpx([command, ...args]);
-    case 'ports': out((await kernelCall('ps')).flatMap(entry => entry.ports.map(port => 'virtual://localhost:' + port + ' · PID ' + entry.pid)).join('\n') + '\n'); return 0;
+    case 'ports': {
+      const lines = (await kernelCall('ps')).flatMap(entry => entry.ports.map(port => 'virtual://localhost:' + port + ' · PID ' + entry.pid));
+      out(lines.length ? lines.join('\n') + '\n' : '(no listening ports)\n');
+      return 0;
+    }
     case 'ps': {
       const processes = await kernelCall('ps');
       out('  PID   PPID  STATE      COMMAND\n' + processes.map(entry => String(entry.pid).padEnd(6) + String(entry.ppid).padEnd(6) + String(entry.state).padEnd(11) + entry.command + (entry.ports.length ? ' [ports ' + entry.ports.join(',') + ']' : '')).join('\n') + '\n');
@@ -14853,8 +15283,8 @@ async function executeCommand(input) {
       let signal = 'SIGTERM', index = 0;
       if (args[0]?.startsWith('-')) {
         const raw = args[0].slice(1);
-        signal = ({ 9: 'SIGKILL', 15: 'SIGTERM', 2: 'SIGINT', 1: 'SIGHUP', KILL: 'SIGKILL', TERM: 'SIGTERM', INT: 'SIGINT', HUP: 'SIGHUP' })[raw.toUpperCase()] || ('SIG' + raw.toUpperCase());
-        if (!/^SIG[A-Z]+$/.test(signal)) throw new Error('Unsupported signal: ' + raw);
+        signal = ({ 0: '0', 9: 'SIGKILL', 15: 'SIGTERM', 2: 'SIGINT', 1: 'SIGHUP', KILL: 'SIGKILL', TERM: 'SIGTERM', INT: 'SIGINT', HUP: 'SIGHUP' })[raw.toUpperCase()] || ('SIG' + raw.toUpperCase());
+        if (signal !== '0' && !/^SIG[A-Z]+$/.test(signal)) throw new Error('Unsupported signal: ' + raw);
         index = 1;
       }
       const pid = Number(args[index]);
@@ -14870,25 +15300,59 @@ async function executeCommand(input) {
       server.close();
       return 0;
     }
-    case 'open': post({ type: 'open', port: Number(args[0]) || 3000 }); return 0;
+    case 'open': {
+      const raw = String(args[0] || '');
+      const portMatch = /:(\d{1,5})(?:\/|$)/.exec(raw);
+      const port = portMatch ? Number(portMatch[1]) : (Number(raw) || 3000);
+      post({ type: 'open', port });
+      return 0;
+    }
     case 'test': case '[': case '[[': {
-      const words = command === 'test' ? args : args.filter(word => word !== ']' && word !== ']]');
-      if (!words.length) return 1;
-      if (words.length >= 2 && ['=', '==', '!=', '-eq', '-ne', '-lt', '-le', '-gt', '-ge'].includes(words[1])) {
+      const words = [...args];
+      if (command === '[') {
+        if (words[words.length - 1] !== ']') throw new Error('[: missing closing ]');
+        words.pop();
+      } else if (command === '[[') {
+        if (words[words.length - 1] !== ']]') throw new Error('[[: missing closing ]]');
+        words.pop();
+      }
+      let negate = false;
+      if (words[0] === '!') { negate = true; words.shift(); }
+      const finish = ok => (negate ? !ok : ok) ? 0 : 1;
+      if (!words.length) return finish(false);
+      if (words.length === 1) return finish(words[0].length > 0);
+      if (words.length >= 3 && ['=', '==', '!=', '-eq', '-ne', '-lt', '-le', '-gt', '-ge'].includes(words[1])) {
+        if (words.length > 3) throw new Error(command + ': too many arguments');
         const [left, operator, right = ''] = words;
         const a = Number(left), b = Number(right);
-        const results = { '=': left === right, '==': left === right, '!=': left !== right, '-eq': a === b, '-ne': a !== b, '-lt': a < b, '-le': a <= b, '-gt': a > b, '-ge': a >= b };
-        return results[operator] ? 0 : 1;
+        const numericOk = !Number.isNaN(a) && !Number.isNaN(b);
+        const results = {
+          '=': left === right, '==': left === right, '!=': left !== right,
+          '-eq': numericOk && a === b, '-ne': numericOk && a !== b,
+          '-lt': numericOk && a < b, '-le': numericOk && a <= b,
+          '-gt': numericOk && a > b, '-ge': numericOk && a >= b,
+        };
+        return finish(Boolean(results[operator]));
       }
+      if (words.length > 2) throw new Error(command + ': too many arguments');
       const [flag, target = ''] = words;
       const entry = lookupPath(target).entry;
       const checks = {
-        '-e': () => Boolean(entry), '-f': () => Boolean(entry) && !entry.d, '-d': () => Boolean(entry?.d),
-        '-s': () => Boolean(entry) && !entry.d && entryBytes(entry) > 0, '-n': () => target.length > 0, '-z': () => target.length === 0,
-        '-r': () => Boolean(entry), '-w': () => Boolean(entry),
+        '-e': () => Boolean(entry),
+        '-f': () => Boolean(entry) && !entry.d && typeof entry.link !== 'string',
+        '-d': () => Boolean(entry?.d),
+        '-L': () => Boolean(entry && typeof entry.link === 'string'),
+        '-h': () => Boolean(entry && typeof entry.link === 'string'),
+        '-s': () => Boolean(entry) && !entry.d && entryBytes(entry) > 0,
+        '-n': () => target.length > 0,
+        '-z': () => target.length === 0,
+        '-r': () => Boolean(entry),
+        '-w': () => Boolean(entry),
+        '-x': () => Boolean(entry) && (Boolean(entry.d) || ((typeof entry.mode === 'number' ? entry.mode : 0o644) & 0o111) !== 0),
       };
-      if (checks[flag]) return checks[flag]() ? 0 : 1;
-      return target.length ? 0 : 1;
+      if (checks[flag]) return finish(checks[flag]());
+      if (flag.startsWith('-')) return finish(false);
+      return finish(target.length > 0);
     }
     case 'true': case ':': return 0;
     case 'false': return 1;
@@ -14900,7 +15364,9 @@ async function executeCommand(input) {
     }
     case 'time': {
       const start = performance.now();
-      const code = await executeCommand(args);
+      const sub = argv.slice(1);
+      sub.quoted = quoted.slice(1);
+      const code = await executeCommand(sub);
       errOut(((performance.now() - start) / 1000).toFixed(2) + 's\n');
       return code;
     }
@@ -15075,7 +15541,7 @@ async function runNode(args) {
   /* `cat script.js | node` (and `node -`) runs the source arriving on stdin,
    * which is how a lot of CI one-liners and heredoc scripts work. */
   const stdinSource = (!target || target === '-') && stdinText().trim() ? stdinText() : null;
-  if (!target && !stdinSource) { out('Use node <file> or node -e "code". Native Node.js is not embedded in this page.\n'); return 0; }
+  if (!target && !stdinSource) { out('Usage: node <file> | node -e "code" | node -p "expression"\n'); return 0; }
   const file = stdinSource ? writeStdinModule(stdinSource) : tryFiles(resolve(target));
   if (!file) {
     // Node reports a missing entry as MODULE_NOT_FOUND on stderr and exits 1; it
@@ -15192,9 +15658,9 @@ async function runNpm(args) {
     }
     return 0;
   }
-  throw new Error('Unsupported npm command: ' + sub + '. This is a constrained registry client; type npm help.');
+  throw new Error('Unsupported npm command: ' + sub + '. Run "npm help" for supported commands.');
 }
-const PNPM_HELP = `Beownir registry client — pnpm-compatible CLI surface
+const PNPM_HELP = `pnpm-compatible package manager
   pnpm install [--ignore-scripts]
   pnpm add [name@range] [-D] [--save-exact]
   pnpm run <script> | pnpm <script>
@@ -15218,9 +15684,9 @@ async function runPnpm(args) {
       if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
     } catch {}
   }
-  throw new Error('Unsupported pnpm command: ' + sub + '. This is a constrained registry client; type pnpm help.');
+  throw new Error('Unsupported pnpm command: ' + sub + '. Run "pnpm help" for supported commands.');
 }
-const YARN_HELP = `Beownir registry client — yarn-compatible CLI surface (not the yarn executable)
+const YARN_HELP = `yarn-compatible package manager · yarn [install|add|remove|run <script>|dlx|exec]
   yarn                        install dependencies from package.json
   yarn add <pkg…> [-D] [-E]   add dependencies (--dev / --exact supported)
   yarn remove <pkg…>          remove dependencies
@@ -15260,9 +15726,9 @@ async function runYarn(args) {
       if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...clean.slice(1)]);
     } catch {}
   }
-  throw new Error('Unsupported yarn command: ' + sub + '. This is a constrained registry client; type yarn help.');
+  throw new Error('Unsupported yarn command: ' + sub + '. Run "yarn help" for supported commands.');
 }
-const BUN_HELP = `Beownir virtual CLI — bun-compatible CLI surface (runs JS/TS via Beownir runtime)
+const BUN_HELP = `bun-compatible runtime & package manager · bun [install|add|remove|run <script|file>|x <pkg>]
   bun install | i             install dependencies from package.json
   bun add <pkg…> [-d] [-E]    add dependencies (-d/--dev, -E/--exact)
   bun remove <pkg…>           remove dependencies
@@ -15324,25 +15790,27 @@ async function runBun(args) {
       if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
     } catch {}
   }
-  throw new Error('Unsupported bun command: ' + sub + '. This is a virtual CLI surface; type bun help.');
+  throw new Error('Unsupported bun command: ' + sub + '. Run "bun help" for supported commands.');
 }
 async function runViteCLI(args) {
   const vite = makeRequire(CWD + '/package.json')('vite');
   if (args.includes('--version') || args.includes('-v')) { out('vite/' + vite.version + '\n'); return 0; }
-  if (args.includes('--help') || args.includes('-h')) { out('vite [root] [--port N] [--host [HOST]] | vite build [root] [--outDir DIR] [--base PATH] [--mode MODE] [--minify] [--sourcemap]\n'); return 0; }
-  const action = args[0] === 'build' ? 'build' : 'serve';
+  if (args.includes('--help') || args.includes('-h')) { out('vite [dev|serve] [root] [--port N] [--host [HOST]] | vite build [root] [--outDir DIR] [--base PATH] [--mode MODE] [--minify] [--sourcemap]\n'); return 0; }
+  let action = 'serve', startIndex = 0;
+  if (args[0] === 'build') { action = 'build'; startIndex = 1; }
+  else if (args[0] === 'dev' || args[0] === 'serve') { action = 'serve'; startIndex = 1; }
   let root = CWD, configFile, base, mode, port = 5173, host = '127.0.0.1', strictPort = false;
   const build = {};
   const valueOptions = new Map([['--config', 'config'], ['-c', 'config'], ['--base', 'base'], ['--mode', 'mode'], ['-m', 'mode'], ['--port', 'port'], ['-p', 'port'], ['--host', 'host'], ['--outDir', 'outDir']]);
-  for (let i = action === 'build' ? 1 : 0; i < args.length; i++) {
+  for (let i = startIndex; i < args.length; i++) {
     const arg = String(args[i]);
     const equals = arg.indexOf('=');
     const name = equals < 0 ? arg : arg.slice(0, equals);
     let value = equals < 0 ? null : arg.slice(equals + 1);
     if (valueOptions.has(name)) {
       if (value === null) {
-        if (i + 1 >= args.length || String(args[i + 1]).startsWith('--')) {
-          if (name === '--host' && value === null) { host = '0.0.0.0'; continue; }
+        if (i + 1 >= args.length || String(args[i + 1]).startsWith('-')) {
+          if (name === '--host') { host = '0.0.0.0'; continue; }
           throw new Error('Vite option ' + name + ' requires a value.');
         }
         value = String(args[++i]);
@@ -15363,7 +15831,8 @@ async function runViteCLI(args) {
     if (arg === '--minify') { build.minify = true; continue; }
     if (arg === '--no-minify') { build.minify = false; continue; }
     if (arg === '--sourcemap') { build.sourcemap = true; continue; }
-    if (arg === '--watch') throw new Error('Vite watch builds are not supported by this browser runtime.');
+    if (arg === '--open' || arg === '--no-open' || arg === '--clearScreen' || arg === '--force' || arg === '--cors' || arg.startsWith('--clearScreen=') || arg.startsWith('--open=')) continue;
+    if (arg === '--watch') throw new Error('Vite watch builds are not supported in the CLI; use "vite dev" for live updates.');
     if (arg.startsWith('-')) throw new Error('Unsupported Vite CLI option: ' + arg);
     if (root !== CWD) throw new Error('Vite accepts one project root argument.');
     root = resolve(arg);
@@ -15385,11 +15854,18 @@ async function runNpx(args) {
   let idx = 0;
   while (idx < args.length && ['-y', '--yes', '-q', '--quiet'].includes(args[idx])) idx++;
   let [tool, ...rest] = args.slice(idx);
+  if (!tool) throw new Error('Usage: ' + USAGE.npx);
   const requestedName = tool;
   if (tool === 'esbuild') { await runEsbuild(rest); return 0; }
   if (tool === 'vite' && packageRecord('/project/node_modules/vite')) return runViteCLI(rest);
   if (['serve', 'http-server', 'vite'].includes(tool)) {
-    if (rest.includes('build') || rest.includes('--watch')) throw new Error('The preview adapter is not Vite itself and does not implement Vite build/HMR/plugins. Install Vite to use its real CLI, or use npx esbuild for a build.');
+    if (rest.includes('--help') || rest.includes('-h')) {
+      out(tool === 'vite'
+        ? 'Usage: vite [dir] [--port N] (built-in preview; run "npm install vite" for full Vite dev/HMR/build CLI)\n'
+        : 'Usage: ' + tool + ' [dir] [--port N|-p N]\n');
+      return 0;
+    }
+    if (rest.includes('build') || rest.includes('--watch')) throw new Error('Vite is not installed in /project/node_modules. Run "npm install vite" for Vite builds and HMR, or use "npx esbuild" to bundle.');
     devServer(tool, rest); return 0;
   }
   const directBin = resolveLocalBin(tool, requestedName);
@@ -15418,19 +15894,18 @@ async function runNpx(args) {
   if (!path.startsWith('/project/node_modules/' + tool + '/')) throw new Error('Invalid package CLI path.');
   return runNode([path, ...rest]);
 }
-const NPM_HELP = `Beownir registry client — a browser-native subset, not the native npm binary
+const NPM_HELP = `npm-compatible package manager & script runner
   npm install [name@range] [-D] [--save-exact] [--no-wasm-fallback]
   npm ci [--omit=dev]         restore an integrity-checked v2/v3 lockfile
   npm run <script>           run a package.json script (auto-resolves node_modules/.bin)
   npm start | dev | build | test
   npm uninstall <name> | ls | view <name> | init
   npx esbuild <entry> --bundle --outfile=dist/app.js
-  npx vite build [options]   installed Vite 6 API + WASM Rollup/esbuild (bounded CLI subset)
-  npx serve [--port 5173]     lightweight virtual preview adapter
+  npx vite [dev|build]       Vite dev server with HMR + WASM Rollup/esbuild builds
+  npx serve [dir] [--port N] live-reloading static & ES/JSX/TS module server
   npx <bin> [args]           run any installed node_modules/.bin CLI directly
 Supports npm:, workspace:, file:, and link: protocols plus package overrides/resolutions,
 concurrent dependency resolution, hoisted node_modules, and JS/WASM native fallbacks.
-Install lifecycle scripts (postinstall), git URLs, and raw native .node binaries are unsupported.
 `;
 
 let esbuildApiPromise = null;
@@ -15517,39 +15992,48 @@ async function runEsbuild(args){
 }
 
 function devServer(kind,args){
- const index=args.findIndex(a=>a==='--port'||a==='-p'),equal=args.find(a=>a.startsWith('--port='));
- const port=Number(equal?.split('=')[1]||(index>=0?args[index+1]:null)||processObj.env.PORT||5173);
- const server=new Server(async(req,res)=>{const found=staticResponse(req.url);if(!found){res.writeHead(404,{'content-type':'text/plain'});res.end('File not found: '+req.url);return;}const file=found.file;
+ const { values, positional } = parseFlags(args, { withValue: ['p', 'port', 'l', 'listen'], aliases: { p: 'port', l: 'listen' } });
+ const rawPort = values.port ?? values.listen ?? processObj.env.PORT ?? 5173;
+ const port = Number(rawPort);
+ if(!Number.isInteger(port)||port<0||port>65535) throw new Error('Invalid port: '+rawPort);
+ let customRoots = null;
+ if(positional.length){
+  const dir = requireDir(positional[0]);
+  customRoots = [dir];
+ }
+ const server=new Server(async(req,res)=>{const found=staticResponseForRoots(req.url,customRoots);if(!found){res.writeHead(404,{'content-type':'text/plain'});res.end('File not found: '+req.url);return;}const file=found.file;
  if(/\.(?:[cm]?js|jsx|tsx?|vue)$/.test(file)){try{res.setHeader('content-type','text/javascript');res.end(await buildPreviewModule(file));}catch(e){res.writeHead(500,{'content-type':'text/plain'});res.end(String(e?.stack||e));}return;}
  res.writeHead(200,{'content-type':mime(file)});res.end(readFileSync(file));});
- server.listen(port);out('Embedded preview adapter (not the actual '+kind+' CLI). No HMR; saving a file refreshes the preview with live reload.\n');
+ server.listen(port,()=>{
+  const addr=typeof server.address==='function'?server.address():null;
+  const actualPort=addr&&typeof addr==='object'&&addr.port?addr.port:port;
+  const rootLabel=customRoots?customRoots[0]:CWD;
+  if(kind==='vite') out('Serving '+rootLabel+' on http://127.0.0.1:'+actualPort+'/ (live-reload preview; install vite for full Vite HMR)\n');
+  else out('Serving '+rootLabel+' on http://127.0.0.1:'+actualPort+'/ (live reload enabled)\n');
+ });
 }
-const HELP=`Beownir 3.0 · browser worker runtime
-This is a Node-compatible worker runtime, not native Node.js.
+const HELP=`Beownir 3.0 · Browser Node.js & Vite workspace runtime
 
 node <file> | node -e "code" | node -p "expression"
 npm / pnpm / yarn / bun install [pkg] | ci | run <script> | npm help
+npx vite [dev|build]         Vite dev server with HMR & WASM Rollup/esbuild builds
 npx / bunx esbuild <entry> --bundle --outfile=dist/app.js
-npx serve --port 5173        preview HTML / bundled browser modules
+npx serve [dir] [--port N]   preview HTML / bundled JS, JSX, TS & Vue modules
 ls cat head tail grep sort sed find du df storage tree cp mv rm chmod
 echo printf date sleep xargs env export history test curl wget clear
 ps | kill [-SIGKILL] <pid> | ports | open <port> | close-port <port>
 
-Pipes (|), redirection (> >> 2> &> <), globbing and && chains work; run help
-for the full command list, and storage df / storage gc for browser storage. Ctrl+C / Stop terminates the entire
-process tree, including timers and all servers. Files already synchronized stay.
-child_process.spawn/exec/execFile/fork use separate Workers (8 processes max).
-Async fs calls share the broker; sync fs reads use per-process snapshots.
-Use await process.virtualOS.flush()/refresh() for explicit file barriers.
-Network is limited to the npm registry; CORS and browser limits still apply.
-npm install resolves the dependency tree in parallel with hoisted node_modules,
-metadata/tarball caching and multi-worker extraction (falling back to packeted
-range streaming for large packages). node_modules stays out of source saves and
-is restored from compressed dependency checkpoints after a reload.
-The lightweight serve adapter uses live reload (no HMR) and preserves scroll,
-form values and focus. Installed Vite 6 has a bounded Node-API path for builds
-and virtual dev/HMR tests; arbitrary CLI options and plugins are not supported.
-worker_threads use sibling Web Workers with SharedArrayBuffer/Atomics when cross-origin isolated (in-process virtual fallback without COI); spawnSync/execFileSync run via SharedArrayBuffer + Atomics.wait when isolated. Virtual loopback TCP/UDP/TLS/HTTP/HTTP2/WebSockets (net, dgram, tls, https, http2, WASI sockets) run 100% inside the browser; native OS binaries, unfiltered raw external sockets, and unmapped native .node addons without JS/WASM fallbacks are not supported.
+Pipes (|), per-stage redirection (> >> 1> 2> &> <), globbing and ; / && / ||
+chains work; run help for commands and storage df / storage gc for browser storage.
+Ctrl+C / Stop cleanly terminates the entire worker tree without losing saved files.
+child_process.spawn/exec/execFile/fork run in separate Web Workers (8 processes max),
+with SharedArrayBuffer + Atomics sync when cross-origin isolated.
+npm/pnpm/yarn/bun resolve dependencies in parallel with hoisted node_modules,
+indexed caching, and compressed dependency checkpoints across reloads.
+Vite dev serves module graphs with live WebSocket HMR over service-worker preview;
+the built-in serve adapter provides instant live reload preserving scroll and inputs.
+Virtual loopback TCP/UDP/TLS/HTTP/HTTP2/WebSockets (net, dgram, tls, https, http2,
+WASI sockets) run completely inside the browser workspace.
 `;
 post({type:'boot'});
 
