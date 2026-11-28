@@ -661,6 +661,9 @@ self.onmessage = async ev => {
       syncActiveCount();
       for (const [port, ownerKey] of listeners) if (ownerKey === entry.actorKey) { listeners.delete(port); sendHost({ type: 'close', port }); }
       for (const [id, route] of httpRoutes) if (route.target === entry.actorKey) { clearTimeout(route.timer); httpRoutes.delete(id); route.reject(error('ECONNRESET', 'The virtual HTTP thread exited.')); }
+      /* WebSocket sessions owned by this thread: close them on the host so a
+       * preview HMR socket does not hang until the page reloads. */
+      for (const [id, ownerKey] of wsOwners) if (ownerKey === entry.actorKey) { wsOwners.delete(id); sendHost({ type: 'wsevent', id, event: 'close', code: 1006, reason: 'The virtual thread exited.' }); }
       for (const child of [...threads.values()]) if (child.ownerKey === entry.actorKey) finishThread(child, 1);
       threadEvent(entry, { event: 'exit', code: Number(code) || 0, error: failure ? recordError(failure) : undefined });
       publishTable();
@@ -673,6 +676,9 @@ self.onmessage = async ev => {
       syncActiveCount();
       for (const [port, ownerKey] of listeners) if (ownerKey === process.actorKey) { listeners.delete(port); sendHost({ type: 'close', port }); }
       for (const [id, route] of httpRoutes) if (route.target === process.actorKey) { clearTimeout(route.timer); httpRoutes.delete(id); route.reject(error('ECONNRESET', 'The virtual HTTP process exited.')); }
+      /* WebSocket sessions owned by this process: close them on the host so a
+       * preview HMR socket does not hang until the page reloads. */
+      for (const [id, ownerKey] of wsOwners) if (ownerKey === process.actorKey) { wsOwners.delete(id); sendHost({ type: 'wsevent', id, event: 'close', code: 1006, reason: 'The virtual process exited.' }); }
       for (const child of [...threads.values()]) if (child.ownerKey === process.actorKey) finishThread(child, 1);
       if (inputPID === process.pid) inputPID = 1;
       if (process.syncSession) {

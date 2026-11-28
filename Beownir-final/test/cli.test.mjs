@@ -171,10 +171,10 @@ test('local bin symlinks (relative and absolute), serve dir, and vite dev flags 
   ].join('\n'));
   const viteRes = await rt.run('npx vite dev --host -p 4568 --open --clearScreen=false');
   assert.equal(viteRes.code, 0);
-  assert.match(strip(viteRes.stdout), /VITE v6\.4\.6 ready at http:\/\/0\.0\.0\.0:4568\//);
+  assert.match(strip(viteRes.stdout), /VITE v6\.4\.6 ready at http:\/\/127\.0\.0\.1:4568\//);
   const calls = rt.evaluate('globalThis.__viteCalls');
   assert.equal(calls.length, 1);
   assert.equal(calls[0].root, '/project');
-  assert.equal(calls[0].server.host, '0.0.0.0');
+  assert.equal(calls[0].server.host, '127.0.0.1');
   assert.equal(calls[0].server.port, 4568);
 });

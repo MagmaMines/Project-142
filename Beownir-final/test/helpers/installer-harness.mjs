@@ -130,6 +130,7 @@ export function createInstallerSandbox(options = {}) {
     browserSubtle: crypto.subtle,
     pakoApi: () => pakoModule(),
     BeownirSemver: semver,
+    PRESENT: loadPresent(),
     dirty: vfs.dirty,
     holdSync: 0,
     out: text => output.push(text),
@@ -160,6 +161,22 @@ function loadKit() {
     cachedKit = module.exports;
   }
   return cachedKit;
+}
+
+let cachedPresent;
+function loadPresent() {
+  if (!cachedPresent) {
+    const file = new URL('../../o/runtime/present.js', import.meta.url);
+    const source = fs.readFileSync(file, 'utf8');
+    const sandbox = { Uint8Array, TextDecoder, TextEncoder, fetch, AbortController, setTimeout, clearTimeout, URL, console };
+    sandbox.module = { exports: {} };
+    sandbox.exports = sandbox.module.exports;
+    sandbox.self = sandbox;
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(source, sandbox, { filename: 'present.js' });
+    cachedPresent = sandbox.module.exports;
+  }
+  return cachedPresent;
 }
 
 let cachedSemver;

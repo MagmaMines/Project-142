@@ -33,10 +33,15 @@ const appPath = path.join(root, 'o', 'site', 'index.html');
 const KIT_START = '/* @beownir-kit-start (generated from o/runtime/stream-kit.js by tools/sync-embedded.mjs) */';
 const KIT_END = '/* @beownir-kit-end */';
 
-/** Every text source that is inlined into the single file, in embed order. */
+/** Every text source that is inlined into the single file, in embed order.
+ * Sources with `markers` are spliced into worker-runtime.js between their
+ * start/end marker comments; sources with an `id` become their own
+ * <script type="text/plain"> block. */
 export const SOURCES = [
   { name: 'kit', file: 'o/runtime/stream-kit.js', label: 'stream-kit.js', markers: true },
-  { name: 'runtimeSource', file: 'o/runtime/worker-runtime.js', label: 'worker-runtime.js', id: 'runtimeSource', type: 'text/plain', carriesKit: true },
+  { name: 'present', file: 'o/runtime/present.js', label: 'present.js', markers: 'present' },
+  { name: 'api', file: 'o/runtime/api.js', label: 'api.js', markers: 'api' },
+  { name: 'runtimeSource', file: 'o/runtime/worker-runtime.js', label: 'worker-runtime.js', id: 'runtimeSource', type: 'text/plain', carriesKit: true, carriesPresent: true, carriesApi: true },
   { name: 'runtimeFrameSource', file: 'o/runtime/frame-kernel.js', label: 'frame-kernel.js', id: 'runtimeFrameSource', type: 'text/plain' },
   { name: 'previewBridgeSource', file: 'o/runtime/preview-bridge.js', label: 'preview-bridge.js', id: 'previewBridgeSource', type: 'text/plain' },
   // The isolation/offline service worker. It cannot be *registered* from a
@@ -45,6 +50,20 @@ export const SOURCES = [
   // HTML so the artifact carries it and can hand it to the host.
   { name: 'coiServiceWorkerSource', file: 'o/site/coi-sw.js', label: 'coi-sw.js', id: 'coiServiceWorkerSource', type: 'text/plain' },
 ];
+
+const MARKER_COMMENT = source => '/* @beownir-' + source + '-start (generated from o/runtime/' + (source === 'kit' ? 'stream-kit.js' : source + '.js') + ' by tools/sync-embedded.mjs) */';
+
+/** Replaces the `@beownir-<name>-start/end` region of the runtime with `content`. */
+export function applyMarkers(runtime, source, content) {
+  const start = MARKER_COMMENT(source);
+  const end = '/* @beownir-' + source + '-end */';
+  const startAt = runtime.indexOf(start);
+  const endAt = runtime.indexOf(end);
+  if (startAt < 0 || endAt < 0 || endAt < startAt) {
+    throw new Error('the ' + source + ' markers are missing from o/runtime/worker-runtime.js');
+  }
+  return runtime.slice(0, startAt) + start + '\n' + content + '\n' + end + runtime.slice(endAt + end.length);
+}
 
 export function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
@@ -98,14 +117,18 @@ export function buildEmbedded(html, sources) {
     files.set(source.name, text);
   }
   const kit = files.get('kit').replace(/\s+$/, '');
+  const present = files.get('present').replace(/\s+$/, '');
+  const api = files.get('api').replace(/\s+$/, '');
   let output = html;
   for (const source of SOURCES) {
     if (source.markers || !source.id) continue;
     let content = files.get(source.name);
     if (source.carriesKit) content = applyKit(content, kit);
+    if (source.carriesPresent) content = applyMarkers(content, 'present', present);
+    if (source.carriesApi) content = applyMarkers(content, 'api', api);
     output = replaceBlock(output, source.id, content);
   }
-  return { output, embedded: Object.fromEntries(files), kit };
+  return { output, embedded: Object.fromEntries(files), kit, present, api };
 }
 
 export function checkEmbedded(html, sources) {
@@ -116,10 +139,13 @@ export function checkEmbedded(html, sources) {
 /** Inlined copies that are stale, with a human-readable reason. */
 export function staleSources(html, sources) {
   const problems = [];
-  const { embedded, kit } = buildEmbedded(html, sources);
+  const { embedded, kit, present, api } = buildEmbedded(html, sources);
   for (const source of SOURCES) {
     if (source.markers || !source.id) continue;
-    const expected = source.carriesKit ? applyKit(embedded[source.name], kit) : embedded[source.name];
+    let expected = embedded[source.name];
+    if (source.carriesKit) expected = applyKit(expected, kit);
+    if (source.carriesPresent) expected = applyMarkers(expected, 'present', present);
+    if (source.carriesApi) expected = applyMarkers(expected, 'api', api);
     const actual = readBlock(html, source.id);
     if (actual !== expected) problems.push(source.label + ' <script id="' + source.id + '"> is stale');
   }
@@ -133,11 +159,17 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
   if (extract) {
     // HTML -> files: the reverse direction, used once when a blob moves into
     // the source tree (and to prove the two directions agree).
-    const kit = readBlock(html, 'runtimeSource');
-    const start = kit.indexOf(KIT_START);
-    const end = kit.indexOf(KIT_END);
+    const runtime = readBlock(html, 'runtimeSource');
+    const start = runtime.indexOf(KIT_START);
+    const end = runtime.indexOf(KIT_END);
     if (start < 0 || end < 0) throw new Error('the runtimeSource block has no kit markers');
-    fs.writeFileSync(path.join(root, 'o/runtime/stream-kit.js'), kit.slice(start + KIT_START.length, end).replace(/^\n/, '').replace(/\n$/, '') + '\n');
+    fs.writeFileSync(path.join(root, 'o/runtime/stream-kit.js'), runtime.slice(start + KIT_START.length, end).replace(/^\n/, '').replace(/\n$/, '') + '\n');
+    for (const marker of ['present', 'api']) {
+      const mStart = runtime.indexOf(MARKER_COMMENT(marker));
+      const mEnd = runtime.indexOf('/* @beownir-' + marker + '-end */');
+      if (mStart < 0 || mEnd < 0) throw new Error('the runtimeSource block has no ' + marker + ' markers');
+      fs.writeFileSync(path.join(root, 'o/runtime/' + marker + '.js'), runtime.slice(mStart + MARKER_COMMENT(marker).length, mEnd).replace(/^\n/, '').replace(/\n$/, '') + '\n');
+    }
     for (const source of SOURCES) {
       if (source.markers || !source.id) continue;
       fs.writeFileSync(path.join(root, source.file), readBlock(html, source.id));

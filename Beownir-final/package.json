@@ -19,6 +19,8 @@
     "matrix": "node tools/framework-matrix.mjs",
     "matrix:write": "node tools/framework-matrix.mjs --write",
     "matrix:check": "node tools/framework-matrix.mjs --check",
+    "build": "node tools/framework-matrix.mjs",
+    "build:check": "node tools/framework-matrix.mjs --check",
     "build:standalone": "node tools/build-standalone.mjs",
     "standalone:check": "node tools/build-standalone.mjs --check",
     "standalone:smoke": "node tools/standalone-smoke.mjs beownir-standalone.html",

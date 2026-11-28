@@ -81,7 +81,7 @@ export function loadRuntime(options = {}) {
     encodeInto(input, destination) { const bytes = this.encode(input); destination.set(bytes.subarray(0, destination.length)); return { read: input.length, written: Math.min(bytes.length, destination.length) }; }
   };`, sandbox);
   vm.runInContext(
-    source + '\n;globalThis.__internal={CORE,UTIL,OS,PATH,URLMOD,CRYPTO,ZLIB,STREAM,processObj,FS,getFS:()=>FS,splitArgs,executeLine,executeCommand,runCommand,SHELL,shellQuote,LIMITS,WORKSPACE_QUOTA,workspaceBudgetFromQuota,applyWorkspaceBudget,applyWorkspaceLimits,refreshWorkspaceBudget,quotaMessage};',
+    source + '\n;globalThis.__internal={CORE,UTIL,OS,PATH,URLMOD,CRYPTO,ZLIB,STREAM,processObj,FS,getFS:()=>FS,splitArgs,executeLine,executeCommand,runCommand,runNode,SHELL,shellQuote,LIMITS,WORKSPACE_QUOTA,workspaceBudgetFromQuota,applyWorkspaceBudget,applyWorkspaceLimits,refreshWorkspaceBudget,quotaMessage};',
     sandbox,
     { filename: 'runtime-source.js' },
   );
@@ -110,6 +110,7 @@ export function loadRuntime(options = {}) {
   // kernelCall, so answering it here exercises the same production code path a
   // browser would, instead of a test-only shortcut.
   const kernelPorts = new Map();
+  let kernelPidCounter = 1000;
   const reply = (id, result, error) => {
     try { sandbox.self.onmessage({ data: { type: 'kernel-reply', id, result, error } }); } catch (failure) { console.error('kernel reply failed', failure); }
   };
@@ -157,6 +158,63 @@ export function loadRuntime(options = {}) {
       }
       if (op === 'ps') { reply(id, [{ pid: 1, ppid: 0, state: 'running', command: 'beownir', ports: [...kernelPorts.keys()] }]); return true; }
       if (op === 'kill') { reply(id, {}); return true; }
+      if (op === 'spawn') {
+        // Emulate a virtual child process in-process: hand back a pid, run the
+        // command through the real shell, and stream stdout/stderr/exit back as
+        // kernel-child messages. This lets the API's exec/spawn/shell methods run
+        // against the same code path a browser worker uses.
+        const pid = ++kernelPidCounter;
+        reply(id, { pid });
+        let childError = null;
+        const emit = (event, data) => {
+          const message = { type: 'kernel-child', pid, event, data };
+          if (event === 'exit') { message.code = code; message.signal = null; if (childError) message.error = childError; }
+          try { sandbox.self.onmessage({ data: message }); } catch { /* closed */ }
+        };
+        let code = 0;
+        (async () => {
+          const from = posts.length;
+          try {
+            if (data && data.command === 'sh' && Array.isArray(data.args) && data.args[0] === '-c') {
+              code = await internal.executeLine(data.args[1] || '');
+            } else if (data && ['node', 'nodejs'].includes(data.command) && ['-e', '--eval', '-p'].includes(data.args && data.args[0])) {
+              /* Evaluate node -e code directly. Going through runNode would call
+               * settleEntryWork(), which waits for entry work to settle — but this
+               * spawned child is itself referenced, so it would deadlock. */
+              internal.evaluate('processObj.exitCode = undefined; processObj.argv = [processObj.execPath || "node", "-e"];');
+              try {
+                internal.evaluate(String(data.args[1]));
+              } catch (exitFailure) {
+                // process.exit(n) unwinds by throwing a sentinel; honor its code.
+                if (exitFailure && exitFailure.__exit !== undefined) code = Number(exitFailure.__exit) || 0;
+                else throw exitFailure;
+              }
+            } else {
+              const line = [String(data && data.command)].concat(((data && data.args) || []).map(a => internal.shellQuote(String(a)))).join(' ');
+              code = await internal.executeLine(line);
+            }
+          } catch (failure) {
+            emit('stderr', String(failure && failure.message || failure) + '\n');
+            code = 1;
+            /* A command that cannot spawn rejects (like Node's ENOENT), rather
+             * than resolving with a non-zero code — mirror spawn semantics. */
+            childError = { code: 'ENOENT', message: String(failure && failure.message || failure) };
+          }
+          // Let the WorkerChildProcess finish registering in kernelChildrenByPID
+          // (it registers on the microtask after the kernelCall reply resolves)
+          // before streaming child output, or the kernel-child messages are dropped.
+          await new Promise(resolve => setTimeout(resolve, 0));
+          for (const message of posts.slice(from)) {
+            if (message.type === 'stdout') emit('stdout', message.data);
+            else if (message.type === 'stderr') emit('stderr', message.data);
+          }
+          // Stream.push() delivers 'data' events asynchronously; wait a tick so
+          // captureWorker's listeners receive the output before 'close' fires.
+          await new Promise(resolve => setTimeout(resolve, 0));
+          emit('exit', null, code);
+        })();
+        return true;
+      }
       reply(id, null, { code: 'ENOSYS', message: 'Unsupported virtual syscall in tests: ' + op });
       return true;
     } catch (failure) { reply(id, null, { code: 'ERR_KERNEL', message: String(failure?.message || failure) }); return true; }

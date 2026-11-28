@@ -1589,7 +1589,7 @@ class Server extends EventEmitter {
     SERVERS.set(this.port, this);
     post({type:'listen', port:this.port});
     const scheme = (this._isHttps || this._isHttp2Secure) ? 'https' : 'http';
-    out('\x1b[32m✔\x1b[0m server listening on \x1b[36m'+scheme+'://localhost:'+this.port+'\x1b[0m\n');
+    out(PRESENT.success('server listening on ' + PRESENT.paint(scheme+'://localhost:'+this.port, 'cyan')));
     if (cb) setTimeout(cb,0);
     this.emit('listening');
     return this;
@@ -11346,8 +11346,112 @@ function loadFile(file, parent){
 }
 function tryReact(file){ try { const r = resolveModule('react', file); return r.file? loadFile(r.file) : null; } catch(e){ return null; } }
 
+/* @beownir-present-start (generated from o/runtime/present.js by tools/sync-embedded.mjs) */
+/* @beownir-present-end */
+
+/* @beownir-api-start (generated from o/runtime/api.js by tools/sync-embedded.mjs) */
+/* @beownir-api-end */
+
+/* ---------- presentation & public API ----------
+ * The present kit is the single source of every ANSI string this runtime
+ * emits, so the shell, the package-manager helpers and any other web page that
+ * renders this text through its own text API share one colour policy: auto by
+ * default (follows the stream's isTTY), with 'always'/'never' overrides and a
+ * strip() for plain contexts. The public API system wraps the runtime's real
+ * process, filesystem, npm and HTTP machinery behind a stable contract, so an
+ * editor built in plain HTML/CSS/JS can drive the whole IDE from its own page. */
+const PRESENT = self.BeownirPresent;
+if (PRESENT) { PRESENT.setColorMode('auto'); PRESENT.setTty(processObj.stdout); }
+const COLOR_NAME = { log: null, info: 'cyan', warn: 'yellow', error: 'red', debug: 'gray' };
+
+/* The production API instance. Created lazily on first use so every internal
+ * it wraps (spawn, capture, npm, fs, http) is already defined when it runs. */
+let runtimeAPI = null;
+/** Builds a URL string from an http.request options object (url, or host/port/path parts). */
+function buildHttpUrl(opts) {
+  if (opts.url) return String(opts.url);
+  if (opts.href) return String(opts.href);
+  const host = opts.host || opts.hostname || 'localhost';
+  const port = opts.port ? ':' + opts.port : '';
+  const path = opts.path || '/';
+  const protocol = opts.protocol || 'http:';
+  return protocol + '//' + host + port + path;
+}
+function getRuntimeAPI() {
+  if (runtimeAPI) return runtimeAPI;
+  const capture = (argv, options) => new Promise((resolve, reject) => {
+    captureWorker(argv[0], argv.slice(1), options, (error, stdout, stderr) => {
+      /* A non-zero exit is a result, not a failure: only spawn-level errors
+       * (string codes like ENOENT) reject, so exec() mirrors bash semantics. */
+      if (error && typeof error.code === 'string') reject(error);
+      else resolve({ code: Number(error?.code) || 0, stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+  runtimeAPI = BeownirAPI.create({
+    spawn: (argv, options) => spawnWorker(argv[0], argv.slice(1), options),
+    capture,
+    shell: line => executeLine(line),
+    npm: {
+      install: opts => npmInstall(opts?.args || []),
+      run: argv => runNpm(['run', ...argv]).then(code => ({ code })),
+      view: name => fetchMeta(name).then(meta => ({ name: meta.name, latest: meta['dist-tags']?.latest, description: meta.description })),
+      ls: () => Promise.resolve(collectDependencyList()).then(list => ({ declared: Object.keys(list.declared), rows: list.rows })),
+      uninstall: names => runNpm(['uninstall', ...names]).then(code => ({ code })),
+      exec: argv => runCommandInline(argv.map(shellQuote).join(' ')).then(code => ({ code })),
+    },
+    fs: {
+      readFile: (path, opts) => CORE['fs/promises'].readFile(path, opts),
+      writeFile: (path, data, opts) => CORE['fs/promises'].writeFile(path, data, opts),
+      readdir: (path, opts) => CORE['fs/promises'].readdir(path, opts),
+      stat: (path, opts) => CORE['fs/promises'].stat(path, opts),
+      exists: async path => { try { await CORE['fs/promises'].stat(path); return true; } catch { return false; } },
+      remove: (path, opts) => CORE['fs/promises'].rm(path, opts),
+      mkdir: (path, opts) => CORE['fs/promises'].mkdir(path, opts),
+      watch: (path, handler) => CORE.fs.watch(path, handler),
+    },
+    http: {
+      request: async opts => {
+        const url = typeof opts === 'string' ? opts : buildHttpUrl(opts);
+        const init = { method: opts.method || 'GET', headers: opts.headers || {} };
+        if (opts.body !== undefined && opts.body !== null) init.body = opts.body;
+        const response = await self.fetch(url, init);
+        const body = await response.arrayBuffer();
+        return { status: response.status, headers: Object.fromEntries(response.headers), body: Buffer.from(body) };
+      },
+      serve: (handler, opts = {}) => new Promise((resolve, reject) => {
+        const server = CORE.http.createServer(handler);
+        server.once('error', reject);
+        server.listen(opts.port || 0, () => {
+          const port = server.port;
+          resolve({ port, url: 'http://localhost:' + port, close: () => new Promise(r => server.close(() => r())) });
+        });
+      }),
+    },
+    present: PRESENT,
+    runtimeVersion: processObj.versions.node,
+  });
+  return runtimeAPI;
+}
+/** Answers a host-page API call: { type:'api', id, method, args } -> { type:'api-reply', id, result|error }. */
+function handleApiMessage(m) {
+  const id = m.id, method = m.method, args = m.args || [];
+  Promise.resolve().then(() => {
+    const api = getRuntimeAPI();
+    const fn = api[method];
+    if (typeof fn !== 'function') throw BeownirAPI.BeownirAPIError('Unknown API method: ' + method, { code: 'ERR_API_UNSUPPORTED' });
+    return fn.apply(api, args);
+  }).then(result => {
+    let payload;
+    try { payload = JSON.parse(JSON.stringify(result === undefined ? null : result)); }
+    catch { payload = { note: 'The result is not JSON-serializable; use exec/shell for captured output.' }; }
+    post({ type: 'api-reply', id, result: payload });
+  }, error => {
+    post({ type: 'api-reply', id, error: { name: error?.name || 'Error', code: error?.code || 'ERR_API_ERROR', message: String(error?.message || error) } });
+  });
+}
+self.beownirAPI = getRuntimeAPI;
+
 /* ---------- console ---------- */
-const COLOR = {log:'', info:'\x1b[36m', warn:'\x1b[33m', error:'\x1b[31m', debug:'\x1b[90m'};
   /* ----- console, sys, dgram, repl, trace_events, wasi -----
    * These six are real Node builtins that were missing from CORE entirely: a
    * `require('dgram')` failed with MODULE_NOT_FOUND even though the module was
@@ -11788,18 +11892,15 @@ const COLOR = {log:'', info:'\x1b[36m', warn:'\x1b[33m', error:'\x1b[31m', debug
 function mkConsole(){
   const mk = (lvl) => (...a)=>{ const s = a.map(x=>typeof x==='string'?x:fmt(x)).join(' ');
     const isErr = lvl==='error'||lvl==='warn';
-    const ansi = COLOR[lvl] && (isErr ? processObj.stderr?.isTTY !== false : processObj.stdout?.isTTY !== false) ? COLOR[lvl] : '';
-    (isErr ? errOut : out)(ansi+s+(ansi?'\x1b[0m':'')+'\n'); };
+    const painted = COLOR_NAME[lvl] ? PRESENT.paint(s, COLOR_NAME[lvl]) : s;
+    (isErr ? errOut : out)(painted+'\n'); };
   const counts={}, timers={};
   const instance = new Console({ stdout: { write: text => out(String(text)) }, stderr: { write: text => errOut(String(text)) } });
   Object.assign(instance, { log:mk('log'), info:mk('info'), warn:mk('warn'), error:mk('error'), debug:mk('debug'), trace:mk('debug'),
     dir:mk('log'), table:(d)=>{ try{ const rows=Array.isArray(d)?d:Object.entries(d).map(([k,v])=>({key:k,value:v}));
         const cols=[...new Set(rows.flatMap(r=>typeof r==='object'&&r?Object.keys(r):['value']))];
         const w=cols.map(c=>Math.max(c.length,...rows.map(r=>String((r&&r[c])??'').length))+2);
-        out('\x1b[90m┌'+w.map(x=>'─'.repeat(x)).join('┬')+'┐\x1b[0m\n');
-        out('\x1b[90m│\x1b[0m'+cols.map((c,i)=>' '+c.padEnd(w[i]-1)).join('\x1b[90m│\x1b[0m')+'\x1b[90m│\x1b[0m\n');
-        rows.forEach(r=>out('\x1b[90m│\x1b[0m'+cols.map((c,i)=>' '+String((r&&r[c])??'').padEnd(w[i]-1)).join('\x1b[90m│\x1b[0m')+'\x1b[90m│\x1b[0m\n'));
-        out('\x1b[90m└'+w.map(x=>'─'.repeat(x)).join('┴')+'┘\x1b[0m\n'); }catch(e){ mk('log')(d); } },
+        out(PRESENT.table(rows.map(r=>Object.fromEntries(cols.map(c=>[c, (r&&r[c])??'']))), { header: cols })); }catch(e){ mk('log')(d); } },
     group:mk('log'), groupCollapsed:mk('log'), groupEnd:()=>{}, assert:(c,...a)=>{ if(!c) mk('error')('Assertion failed:',...a); },
     count:(l='default')=>{ counts[l]=(counts[l]||0)+1; mk('log')(l+': '+counts[l]); },
     countReset:(l='default')=>{ delete counts[l]; },
@@ -11818,8 +11919,8 @@ self.setImmediate = (f,...a)=>setTimeout(f,0,...a);
 self.clearImmediate = clearTimeout;
 self.require = makeRequire('/project/__repl__.js');
 self.__dirname = '/project'; self.__filename = '/project/__repl__.js';
-self.onerror = (m,s,l,c,e)=>{ errOut('\x1b[31mUncaught '+(e&&e.stack||m)+'\x1b[0m\n'); };
-self.onunhandledrejection = (ev)=>{ errOut('\x1b[31mUnhandledPromiseRejection: '+(ev.reason&&ev.reason.stack||ev.reason)+'\x1b[0m\n'); ev.preventDefault&&ev.preventDefault(); };
+self.onerror = (m,s,l,c,e)=>{ errOut(PRESENT.error('Uncaught '+(e&&e.stack||m))); };
+self.onunhandledrejection = (ev)=>{ errOut(PRESENT.error('UnhandledPromiseRejection: '+(ev.reason&&ev.reason.stack||ev.reason))); ev.preventDefault&&ev.preventDefault(); };
 
 /* @beownir-kit-start (generated from o/runtime/stream-kit.js by tools/sync-embedded.mjs) */
 /*
@@ -13462,7 +13563,7 @@ async function executeParallelPackageInstalls(jobs, { verifyVersion = true } = {
     const integrity = computeIntegrity(job.dist);
     const cacheKey = integrity + '\0' + job.dist.tarball;
     if (writeFromExtractCache(job.base, cacheKey) !== null) {
-      out('  \x1b[90m⚡\x1b[0m ' + job.name + '@' + job.version + ' (cached)\n');
+      out(PRESENT.hint(PRESENT.paint('⚡ ' + job.name + '@' + job.version + ' (cached)', 'gray')));
       finalizeNode(job, integrity);
     } else {
       needDownload.push(job);
@@ -13485,7 +13586,7 @@ async function executeParallelPackageInstalls(jobs, { verifyVersion = true } = {
   if (batchEligible.length >= 2) {
     for (let startIdx = 0; startIdx < batchEligible.length; startIdx += INSTALL_BUDGET.sabBatchSize) {
       const chunk = batchEligible.slice(startIdx, startIdx + INSTALL_BUDGET.sabBatchSize);
-      for (const job of chunk) out('  \x1b[90m↓\x1b[0m ' + job.name + '@' + job.version + '\n');
+      for (const job of chunk) out(PRESENT.hint(PRESENT.paint('↓ ' + job.name + '@' + job.version, 'gray')));
       let batchResult;
       try {
         batchResult = await kernelCall('npm-extract-batch', {
@@ -13530,7 +13631,7 @@ async function executeParallelPackageInstalls(jobs, { verifyVersion = true } = {
     const worker = async () => {
       while (cursor < streamEligible.length) {
         const job = streamEligible[cursor++];
-        out('  \x1b[90m↓\x1b[0m ' + job.name + '@' + job.version + '\n');
+        out(PRESENT.hint(PRESENT.paint('↓ ' + job.name + '@' + job.version, 'gray')));
         if (typeof rmrf === 'function') rmrf(job.base);
         let lastPost = 0;
         const integrity = await extractPackage(job.base, job.dist, {
@@ -13570,7 +13671,7 @@ async function installPkg(name, range, root, dev = false, depth = 0) {
   const base = (canHoist ? '/project' : root) + '/node_modules/' + name;
   if (packageRecord(base)?.version === version) return version;
   installCount++;
-  out('  \x1b[90m↓\x1b[0m ' + name + '@' + version + '\n');
+  out(PRESENT.hint(PRESENT.paint('↓ ' + name + '@' + version, 'gray')));
   if (typeof rmrf === 'function') rmrf(base);
   let lastPost = 0;
   const integrity = await extractPackage(base, rec.dist, {
@@ -13647,7 +13748,7 @@ async function npmInstall(args = []) {
       reservedRoots = new Set(roots.map(r => r.name));
       installCount = 0; installBytes = 0; installReused = 0; installRangeFallbacks = 0;
       const start = performance.now();
-      out('\x1b[36mRegistry install\x1b[0m · parallel BFS & workers · SHA-512 verified · install hooks disabled\n');
+      out(PRESENT.info('Registry install · parallel BFS & workers · SHA-512 verified · install hooks disabled'));
       const plan = await resolveInstallPlan(roots, pkg, { noWasmFallback });
       await executeParallelPackageInstalls(plan.nodes, { verifyVersion: true });
       for (const loc of plan.localNodes) {
@@ -13659,13 +13760,13 @@ async function npmInstall(args = []) {
       }
       for (const sub of plan.substitutions) {
         writeSubstitutionBridge(sub.orig, sub.alt, sub.version);
-        out('  \x1b[36m↳\x1b[0m Substituted browser-compatible ' + sub.alt + '@' + sub.version + ' for native package ' + sub.orig + '\n');
+        out(PRESENT.hint(PRESENT.paint('↳ Substituted browser-compatible ' + sub.alt + '@' + sub.version + ' for native package ' + sub.orig, 'cyan')));
       }
       writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
       writeFileSync('/project/package-lock.json', JSON.stringify(collectLock(pkg), null, 2) + '\n');
       const reuseMsg = installReused ? ' (' + installReused + ' reused unchanged)' : '';
       const modeMsg = installRangeFallbacks ? ' ' + installRangeFallbacks + ' tarball(s) fell back to a single stream because the registry ignored byte ranges.' : ' Parallel verified downloads complete.';
-      out('\x1b[32m✓\x1b[0m ' + installCount + ' package(s)' + reuseMsg + ', ' + (installBytes / 1024 / 1024).toFixed(1) + ' MiB unpacked, in ' + ((performance.now() - start) / 1000).toFixed(1) + 's.' + modeMsg + '\n');
+      out(PRESENT.success(installCount + ' package(s)' + reuseMsg + ', ' + (installBytes / 1024 / 1024).toFixed(1) + ' MiB unpacked, in ' + ((performance.now() - start) / 1000).toFixed(1) + 's.' + modeMsg));
       post({ type: 'pkgprogress', done: true, packages: installCount, bytes: installBytes });
     }).then(() => { scheduleDependencyCheckpoint(); });
   } finally {
@@ -13719,7 +13820,7 @@ async function npmCi(args = []) {
         writeSubstitutionBridge(orig, rule.alt, altRec?.version);
       }
     }
-    out('\x1b[32m✓\x1b[0m Restored ' + entries.length + ' locked packages (' + (installBytes / 1024 / 1024).toFixed(1) + ' MiB). Lifecycle scripts disabled.\n');
+    out(PRESENT.success('Restored ' + entries.length + ' locked packages (' + (installBytes / 1024 / 1024).toFixed(1) + ' MiB). Lifecycle scripts disabled.'));
   }).then(() => { scheduleDependencyCheckpoint(); });
 }
 /* ---------- dependency checkpoint ----------
@@ -13917,11 +14018,17 @@ self.onmessage=async ev=>{
     }
     if(m.type==='setfiles'){for(const [path,value]of Object.entries(m.files||{})){if(!path.startsWith('/project/')&&path!=='/project'&&!path.startsWith('/tmp/')&&path!=='/tmp')continue;if(value===null)delete FS[path];else FS[path]=value.d?{d:true,m:Date.now()}:{c:unpackFileData(value.c),m:Date.now()};baseRevisions[path]=m.versions?.[path]||0;delete cache[path];}return;}
     if(m.type==='cmd'){commandQueue=commandQueue.then(()=>runCommand(m.line,m.id));return;}
+    if(m.type==='api'){handleApiMessage(m);return;}
     if(m.type==='ws'){handleWsMessage(m);return;}
     if(m.type==='http'){
+      /* Routing order matters: a real server that owns the port always wins.
+       * The static/compiled preview path is only a fallback for ports with no
+       * listener, so an asset-module request can never hijack a response from a
+       * running dev server (Vite, express, …) on the same port. */
+      if(SERVERS.has(m.port)){handleHttp(m);return;}
       const staticFile=staticResponse(m.url);
       if(m.asset==='module'&&staticFile&&/\.(?:[cm]?js|jsx|tsx?|vue)$/.test(staticFile.file)){const code=await buildPreviewModule(staticFile.file);post({type:'httpres',id:m.id,status:200,headers:{'content-type':'text/javascript'},body:te.encode(code)});return;}
-      if(!SERVERS.has(m.port)&&staticFile){
+      if(staticFile){
         // No dev server on the port: TypeScript/JSX served raw would not parse,
         // so compile those through esbuild instead. Plain JavaScript is served
         // as-is so nested imports can be handled by the preview's module loader.
@@ -13932,7 +14039,7 @@ self.onmessage=async ev=>{
     }
     if(m.type==='stdin'){if(pendingQuestion){const callback=pendingQuestion;pendingQuestion=null;callback(m.data);post({type:'questionend'});}else processObj.stdin.push(Buffer.from(String(m.data)+'\n'));return;}
     if(m.type==='ping'){post({type:'pong'});return;}
-  }catch(e){const text=e?.stack||String(e);if(m.type==='http')post({type:'httpres',id:m.id,status:500,headers:{'content-type':'text/plain'},body:te.encode(text)});else{errOut('\x1b[31m'+text+'\x1b[0m\n');post({type:'fatal',message:text,id:m.id});}}
+  }catch(e){const text=e?.stack||String(e);if(m.type==='http')post({type:'httpres',id:m.id,status:500,headers:{'content-type':'text/plain'},body:te.encode(text)});else{errOut(PRESENT.error(text));post({type:'fatal',message:text,id:m.id});}}
 };
 /* ---------- Node globals ----------
  * Node exposes process/global/Buffer/setImmediate to code that never imports
@@ -14212,22 +14319,54 @@ const USAGE = {
   ps: 'ps', kill: 'kill [-SIGNAL] <pid>', ports: 'ports', open: 'open <port|url>', 'close-port': 'close-port <port>',
   history: 'history', test: 'test <expression>', time: 'time <command…>', offline: 'offline [status|clear]',
 };
-const SHELL_HELP = `Beownir shell · POSIX-style terminal for your workspace
-
-node <file> | node -e "code" | node -p "expression"      run JavaScript here
-npm / pnpm / yarn / bun install [pkg] | run <script>     package manager
-npx / bunx vite | serve --port 3000 | esbuild <entry>    dev server / bundler
-ls cd pwd cat head tail wc grep sort uniq sed find stat  files
-touch mkdir rm cp mv ln chmod du df storage tree         files, continued
-echo printf basename dirname realpath date sleep xargs   utilities
-env export unset source history time test clear          shell
-ps kill ports open close-port                            processes & ports
-curl wget                                                HTTP / registry fetch
-
-Redirect with > >> 1> 2> &> < and pipe with |; chain with ; && ||. Quote
-patterns to stop glob expansion. Run "<command> --help" for usage. Type help
-for this list. "storage gc" frees rebuildable caches and checkpoints.
-`;
+function shellHelpText() {
+  const P = PRESENT;
+  const groups = [
+    ['Run code', ['node <file> | node -e "code" | node -p "expression"', 'npm / pnpm / yarn / bun install [pkg] | run <script>', 'npx / bunx vite | serve --port 3000 | esbuild <entry>']],
+    ['Files', ['ls cd pwd cat head tail wc grep sort uniq sed find stat', 'touch mkdir rm cp mv ln chmod du df storage tree']],
+    ['Utilities', ['echo printf basename dirname realpath date sleep xargs', 'env export unset source history time test clear']],
+    ['Processes & ports', ['ps kill ports open close-port', 'curl wget']],
+  ];
+  const lines = [P.style('Beownir shell · POSIX-style terminal for your workspace', 'bold', 'cyan'), ''];
+  for (const [heading, items] of groups) {
+    lines.push(P.style(heading, 'bold'));
+    for (const item of items) lines.push(P.bullet(item));
+    lines.push('');
+  }
+  lines.push(P.style('Syntax', 'bold'));
+  lines.push(P.bullet('Redirect with > >> 1> 2> &> <, pipe with |, and chain with ; && ||'));
+  lines.push(P.bullet('Quote patterns to stop glob expansion, and run "<command> --help" for usage'));
+  lines.push(P.bullet('Type help for this list; "storage gc" frees rebuildable caches and checkpoints'));
+  return lines.join('');
+}
+function shellFullHelpText() {
+  const P = PRESENT;
+  const lines = [
+    P.style('Beownir 3.0 · Browser Node.js & Vite workspace runtime', 'bold', 'cyan'),
+    '',
+    P.style('Run code', 'bold'),
+    P.bullet('node <file> | node -e "code" | node -p "expression"'),
+    P.bullet('npm / pnpm / yarn / bun install [pkg] | ci | run <script> | npm help'),
+    P.bullet('npx vite [dev|build] — Vite dev server with HMR & WASM Rollup/esbuild builds'),
+    P.bullet('npx / bunx esbuild <entry> --bundle --outfile=dist/app.js'),
+    P.bullet('npx serve [dir] [--port N] — preview HTML / bundled JS, JSX, TS & Vue modules'),
+    P.style('Files & utilities', 'bold'),
+    P.bullet('ls cat head tail grep sort sed find du df storage tree cp mv rm chmod'),
+    P.bullet('echo printf date sleep xargs env export history test curl wget clear'),
+    P.style('Processes & ports', 'bold'),
+    P.bullet('ps | kill [-SIGKILL] <pid> | ports | open <port> | close-port <port>'),
+    '',
+    P.style('Syntax & runtime notes', 'bold'),
+    P.bullet('Pipes (|), per-stage redirection (> >> 1> 2> &> <), globbing and ; / && / || chains work'),
+    P.bullet('Run help for commands, and storage df / storage gc for browser storage'),
+    P.bullet('Ctrl+C / Stop cleanly terminates the entire worker tree without losing saved files'),
+    P.bullet('child_process.spawn/exec/execFile/fork run in separate Web Workers (8 processes max), with SharedArrayBuffer + Atomics sync when cross-origin isolated'),
+    P.bullet('npm/pnpm/yarn/bun resolve dependencies in parallel with hoisted node_modules, indexed caching, and compressed dependency checkpoints across reloads'),
+    P.bullet('Vite dev serves module graphs with live WebSocket HMR over service-worker preview; the built-in serve adapter provides instant live reload preserving scroll and inputs'),
+    P.bullet('Virtual loopback TCP/UDP/TLS/HTTP/HTTP2/WebSockets (net, dgram, tls, https, http2, WASI sockets) run completely inside the browser workspace'),
+  ];
+  return lines.join('');
+}
 
 function humanSize(bytes) {
   const value = Number(bytes) || 0;
@@ -14324,7 +14463,7 @@ async function executeChunk(rawLine) {
           const inPath = resolve(expandPath(redirect.stdin));
           stageStdin = inPath === '/dev/null' ? '' : requireFile(redirect.stdin).text;
         } catch (error) {
-          errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n');
+          errOut(PRESENT.error((error?.message || String(error))));
           return 1;
         }
       }
@@ -14332,7 +14471,7 @@ async function executeChunk(rawLine) {
       if (!line) {
         if (redirect.stdout) {
           try { writeRedirect(redirect.stdout, stageStdin); }
-          catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+          catch (error) { errOut(PRESENT.error((error?.message || String(error)))); return 1; }
         }
         prevOutput = '';
         code = 0;
@@ -14352,19 +14491,19 @@ async function executeChunk(rawLine) {
       if (stdoutToStderr) { stageErr += stageOut; stageOut = ''; }
       if (redirect.stdout && redirect.stderr && redirect.stdout === redirect.stderr) {
         try { writeRedirect(redirect.stdout, stageOut + stageErr); }
-        catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+        catch (error) { errOut(PRESENT.error((error?.message || String(error)))); return 1; }
         prevOutput = '';
         continue;
       }
       if (stageErr) {
         if (redirect.stderr) {
           try { writeRedirect(redirect.stderr, stageErr); }
-          catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+          catch (error) { errOut(PRESENT.error((error?.message || String(error)))); return 1; }
         } else errOut(stageErr);
       }
       if (redirect.stdout) {
         try { writeRedirect(redirect.stdout, stageOut); }
-        catch (error) { errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); return 1; }
+        catch (error) { errOut(PRESENT.error((error?.message || String(error)))); return 1; }
         prevOutput = '';
       } else if (hasNextStage) {
         prevOutput = stageOut;
@@ -14408,7 +14547,7 @@ async function executeStage(line, stderrRedirect) {
   } catch (error) {
     if (error && error.__shellExit !== undefined) throw error;
     if (error && error.__exit !== undefined) return Number(error.__exit) || 0;
-    const message = '\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n';
+    const message = PRESENT.error(error?.message || String(error));
     if (shellCapture?.captureStderr) { shellCapture.stderr.push(message); return 1; }
     if (stderrRedirect) {
       try { writeRedirect(stderrRedirect, message); } catch { errOut(message); }
@@ -14509,7 +14648,7 @@ async function executeCommand(input) {
   }
 
   switch (command) {
-    case 'help': out(SHELL_HELP); if (args.length) out('\n' + HELP); return 0;
+    case 'help': out(shellHelpText()); if (args.length) out('\n' + shellFullHelpText()); return 0;
     case 'pwd': out(CWD + '\n'); return 0;
     case 'cd': {
       const raw = args[0];
@@ -14549,7 +14688,7 @@ async function executeCommand(input) {
         } else if (flags.has('one')) {
           for (const name of names) output += name + (FS[childPath(dirPath, name)]?.d ? '/' : '') + '\n';
         } else {
-          output += names.map(name => (FS[childPath(dirPath, name)]?.d ? '\x1b[34m' + name + '/\x1b[0m' : name)).join('  ') + '\n';
+          output += names.map(name => (FS[childPath(dirPath, name)]?.d ? PRESENT.paint(name + '/', 'blue') : name)).join('  ') + '\n';
         }
         if (flags.has('recursive')) {
           for (const name of names) {
@@ -15423,7 +15562,7 @@ async function storageReport(args, sub) {
     out('Origin      ' + humanSize(before.usage).padStart(10) + '   of ' + humanSize(before.quota) + ' used (' + percent + '%), ' + humanSize(Math.max(0, before.quota - before.usage)) + ' free\n');
     out('Policy      ' + (before.persisted ? 'persistent · storage will not be evicted silently' : 'best effort · run "storage persist" to request persistence') + '\n');
   } else out('Origin      storage usage is not exposed by this browser\n');
-  if (before.supported && before.quota && before.usage / before.quota > 0.9) out('\x1b[33mLow space: run "storage gc" (or Help → Storage → Free space) before installing or building.\x1b[0m\n');
+  if (before.supported && before.quota && before.usage / before.quota > 0.9) out(PRESENT.warn('Low space: run "storage gc" (or Help → Storage → Free space) before installing or building.'));
   return 0;
 }
 /** Entry point used by the host for every terminal command. */
@@ -15433,7 +15572,7 @@ async function runCommand(line, id) {
   try { code = await executeLine(String(line).slice(0, 16384)); }
   catch (error) {
     if (error && error.__exit !== undefined) code = Number(error.__exit) || 0;
-    else { code = 1; errOut('\x1b[31m' + (error?.message || String(error)) + '\x1b[0m\n'); }
+    else { code = 1; errOut(PRESENT.error((error?.message || String(error)))); }
   } finally {
     profilerEnd(__prof, { code });
     if (PROFILER.enabled && PROFILER.spans.length) post({ type: 'profiler-spans', spans: profilerTakeSpans() });
@@ -15597,7 +15736,7 @@ async function runNode(args) {
   // terminal and is invisible to pipes, redirections and captured stdout, so
   // `node app.js > out.txt` and `node app.js | grep x` stay byte-identical to
   // what Node would produce.
-  emitOutput('notice', '\x1b[90mEvaluated ' + basename(file) + ' · ' + (performance.now() - start).toFixed(0) + ' ms. Timers and virtual servers may remain active.\x1b[0m\n');
+  emitOutput('notice', PRESENT.hint('Evaluated ' + basename(file) + ' · ' + (performance.now() - start).toFixed(0) + ' ms. Timers and virtual servers may remain active.'));
   const exitCode = processObj.exitCode;
   processObj.exitCode = undefined;
   return exitCode === undefined ? 0 : exitCode;
@@ -15618,21 +15757,185 @@ function reportUncaught(error, file) {
       errOut(file + ':' + frame[1] + '\n' + source + '\n' + ' '.repeat(column) + '^\n\n');
     }
   }
-  errOut('\x1b[31m' + lines.join('\n') + '\x1b[0m\n\nNode.js v' + String(processObj.versions.node) + '\n');
+  errOut(PRESENT.error(lines.join('\n')) + '\nNode.js v' + String(processObj.versions.node) + '\n');
+}
+/* Reads /project/package.json with a production-grade error: every npm command
+ * that needs the manifest must fail with an actionable message instead of a raw
+ * ENOENT stack from readFileSync. */
+function readProjectPackage() {
+  const path = '/project/package.json';
+  if (!FS[path]) throw new Error('No package.json in /project. Run "npm init" to create one first.');
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(path, 'utf8')); }
+  catch (error) { throw new Error('package.json is not valid JSON: ' + (error && error.message || error)); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('package.json must contain a JSON object.');
+  return parsed;
+}
+/* ---------- help texts ----------
+ * Every package manager and the shell print structured, punctuated help:
+ * a titled banner, a comma-separated usage block, per-command descriptions
+ * and concrete examples. Colours come from the present kit, so the same text
+ * renders correctly in the terminal and, stripped, in any web page. */
+function helpBlock(title, sections) {
+  const P = PRESENT;
+  const lines = [];
+  lines.push(P.style(title, 'bold', 'cyan') + '\n');
+  for (const section of sections) {
+    lines.push(P.style(section.heading, 'bold') + '\n');
+    for (const item of section.items) {
+      if (item.example) lines.push(P.hint('  ' + item.example));
+      else lines.push(P.bullet(item.text));
+    }
+    lines.push('');
+  }
+  return lines.join('');
+}
+function npmHelpText() {
+  return helpBlock('npm — npm-compatible package manager & script runner', [
+    {
+      heading: 'Usage',
+      items: [
+        { text: 'npm install [name@range] [-D] [--save-exact] [--no-wasm-fallback], or npm i / npm add, to install packages' },
+        { text: 'npm ci [--omit=dev], to restore an integrity-checked v2/v3 lockfile' },
+        { text: 'npm run <script> [args…], to run a package.json script with node_modules/.bin on PATH' },
+        { text: 'npm start | dev | build | test, shorthands for the matching script' },
+        { text: 'npm uninstall <name>, npm ls, npm view <name>, npm init, and npm exec <cmd…>' },
+      ],
+    },
+    {
+      heading: 'npx',
+      items: [
+        { text: 'npx esbuild <entry> --bundle --outfile=dist/app.js, to bundle with the embedded esbuild' },
+        { text: 'npx vite [dev|build], the Vite dev server with HMR and WASM Rollup/esbuild builds' },
+        { text: 'npx serve [dir] [--port N], a live-reloading static and ES/JSX/TS module server' },
+        { text: 'npx <bin> [args], to run any installed node_modules/.bin CLI directly' },
+      ],
+    },
+    {
+      heading: 'Examples',
+      items: [
+        { example: 'npm install express lodash --save-exact' },
+        { example: 'npm run build -- --minify' },
+        { example: 'npm view react description' },
+        { example: 'npx esbuild src/app.js --bundle --outfile=dist/app.js' },
+      ],
+    },
+    {
+      heading: 'Notes',
+      items: [
+        { text: 'Supports npm:, workspace:, file:, and link: protocols, plus package overrides and resolutions' },
+        { text: 'Concurrent dependency resolution, hoisted node_modules, and JS/WASM native fallbacks' },
+        { text: 'Run "npm help" again, or "npm <command> --help", for this list' },
+      ],
+    },
+  ]);
+}
+function npmVersionText() { return NPM_COMPAT_VERSION + '\n'; }
+function npmIdentityText() {
+  return PRESENT.style('Beownir registry client 2.0', 'cyan') + ' · npm-' + NPM_COMPAT_VERSION + PRESENT.style(' compatible CLI surface (not the npm executable)', 'dim') + '\n';
+}
+function pnpmHelpText() {
+  return helpBlock('pnpm — pnpm-compatible package manager', [
+    {
+      heading: 'Usage',
+      items: [
+        { text: 'pnpm install [--ignore-scripts], or pnpm, to install from package.json' },
+        { text: 'pnpm add [name@range] [-D] [--save-exact], to add dependencies' },
+        { text: 'pnpm run <script> | pnpm <script>, to run a package.json script' },
+        { text: 'pnpm exec <cmd…> | pnpm dlx <tool…>, to run installed or one-off CLIs' },
+        { text: 'pnpm remove <name>, pnpm ls, pnpm view <name>, and pnpm init' },
+      ],
+    },
+    { heading: 'Examples', items: [ { example: 'pnpm add react react-dom' }, { example: 'pnpm run build' } ] },
+  ]);
+}
+function yarnHelpText() {
+  return helpBlock('yarn — yarn-compatible package manager', [
+    {
+      heading: 'Usage',
+      items: [
+        { text: 'yarn [install|add|remove|run <script>|exec|dlx|list|info|init]' },
+        { text: 'yarn, to install dependencies from package.json' },
+        { text: 'yarn add <pkg…> [-D] [-E], to add dependencies (--dev / --exact supported)' },
+        { text: 'yarn remove <pkg…>, to remove dependencies' },
+        { text: 'yarn run <script> | yarn <script>, to run a package.json script' },
+        { text: 'yarn exec <cmd…> | dlx <tool…>, to run installed or one-off CLIs' },
+        { text: 'yarn list, yarn info <name>, and yarn init [-y]' },
+      ],
+    },
+    { heading: 'Examples', items: [ { example: 'yarn add express --dev' }, { example: 'yarn run build' } ] },
+  ]);
+}
+function bunHelpText() {
+  return helpBlock('bun — bun-compatible runtime & package manager', [
+    {
+      heading: 'Usage',
+      items: [
+        { text: 'bun [install|add|remove|run <script|file>|x <pkg>|pm|init]' },
+        { text: 'bun install | bun i, to install dependencies from package.json' },
+        { text: 'bun add <pkg…> [-d] [-E], to add dependencies (-d/--dev, -E/--exact)' },
+        { text: 'bun remove <pkg…>, to remove dependencies' },
+        { text: 'bun run <script|file>, to run a package.json script or a JS/TS/ESM file' },
+        { text: 'bun <file.ts|file.js>, to execute a JS/TS/ESM file directly' },
+        { text: 'bun x <tool…> | bunx <tool>, to run an installed package binary' },
+        { text: 'bun pm ls | init, to list packages or initialize package.json' },
+      ],
+    },
+    { heading: 'Examples', items: [ { example: 'bun add react --dev' }, { example: 'bun run build' }, { example: 'bun server.ts' } ] },
+  ]);
+}
+
+/** Structured dependency listing shared by `npm ls` and the public API. */
+function collectDependencyList() {
+  const declared = readProjectPackage();
+  const manifest = { ...(declared.dependencies || {}), ...(declared.devDependencies || {}) };
+  const nm = '/project/node_modules';
+  const rows = [];
+  if (FS[nm]) {
+    for (const name of Object.keys(manifest)) {
+      const rec = packageRecord(nm + '/' + name);
+      rows.push({ name, version: rec && rec.version ? rec.version : 'missing', extraneous: false });
+    }
+    /* Top-level trees that no manifest declares are reported as extraneous
+     * rather than silently ignored, the same way npm ls surfaces them. */
+    for (const entry of readdirSync(nm)) {
+      if (entry.startsWith('.')) continue;
+      if (Object.prototype.hasOwnProperty.call(manifest, entry)) continue;
+      const names = entry.startsWith('@') && FS[nm + '/' + entry]?.d ? readdirSync(nm + '/' + entry).map(inner => entry + '/' + inner) : [entry];
+      for (const name of names) if (!Object.prototype.hasOwnProperty.call(manifest, name)) rows.push({ name, version: 'extraneous', extraneous: true });
+    }
+  }
+  return { declared: manifest, rows };
 }
 async function runNpm(args) {
   const sub = args[0];
-  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(NPM_HELP); return 0; }
-  if (['-v', '--version'].includes(sub)) { out(NPM_COMPAT_VERSION + '\n'); return 0; }
-  if (sub === '--beownir') { out('Beownir registry client 2.0 · npm-' + NPM_COMPAT_VERSION + ' compatible CLI surface (not the npm executable)\n'); return 0; }
-  if (['install', 'i', 'add', 'update'].includes(sub)) { await npmInstall(sub === 'update' ? [] : args.slice(1)); return 0; }
+  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(npmHelpText()); return 0; }
+  if (['-v', '--version'].includes(sub)) { out(npmVersionText()); return 0; }
+  if (sub === '--beownir') { out(npmIdentityText()); return 0; }
+  if (['install', 'i', 'add', 'update'].includes(sub)) { await npmInstall(args.slice(1)); return 0; }
   if (sub === 'ci') { await npmCi(args.slice(1)); return 0; }
-  if (['ls', 'list'].includes(sub)) { const path = '/project/node_modules'; out(FS[path] ? readdirSync(path).join('\n') + '\n' : '(no installed dependencies)\n'); return 0; }
+  if (['ls', 'list'].includes(sub)) {
+    const list = collectDependencyList();
+    if (!FS['/project/node_modules']) {
+      out((Object.keys(list.declared).length ? 'Dependencies declared but not installed — run "npm install".' : '(no installed dependencies)') + '\n');
+      return 0;
+    }
+    const lines = list.rows.map(row => row.extraneous ? '  ' + row.name + ' (extraneous)' : '  ' + row.name + '@' + row.version);
+    out((lines.length ? lines.join('\n') + '\n' : '(no installed dependencies)\n'));
+    return 0;
+  }
   if (sub === 'init') { if (FS['/project/package.json']) throw new Error('package.json already exists.'); writeFileSync('/project/package.json', JSON.stringify({ name: 'beownir-app', version: '1.0.0', scripts: { start: 'node index.js' }, dependencies: {} }, null, 2)); return 0; }
-  if (['view', 'info'].includes(sub)) { if (!args[1]) throw new Error('Usage: npm ' + sub + ' <package>'); const meta = await fetchMeta(args[1]); out(fmt({ name: meta.name, latest: meta['dist-tags']?.latest, description: meta.description }) + '\n'); return 0; }
+  if (['view', 'info'].includes(sub)) {
+    if (!args[1]) throw new Error('Usage: npm ' + sub + ' <package>');
+    let meta;
+    try { meta = await fetchMeta(args[1]); }
+    catch (error) { if (/HTTP 4\d\d/.test(String(error && error.message || ''))) throw new Error('npm ' + sub + ' ' + args[1] + ': no such package on the registry (' + String(error.message).split('\n')[0] + ')'); throw error; }
+    out(fmt({ name: meta.name, latest: meta['dist-tags']?.latest, description: meta.description }) + '\n');
+    return 0;
+  }
   if (['uninstall', 'remove', 'rm'].includes(sub)) {
     await installTransaction(async()=>{
-      const pkg=JSON.parse(readFileSync('/project/package.json','utf8'));
+      const pkg=readProjectPackage();
       const names = args.slice(1).filter(x => x && !String(x).startsWith('-'));
       if (!names.length) throw new Error('Usage: npm ' + sub + ' <package>');
       for(const name of names){if(!validPackageName(name))throw new Error('Invalid package name.');for(const field of ['dependencies','devDependencies','optionalDependencies'])if(pkg[field])delete pkg[field][name];}
@@ -15640,19 +15943,26 @@ async function runNpm(args) {
       await npmInstall([]);
     });return 0;
   }
-  if (['exec', 'x'].includes(sub)) return runCommandInline(args.slice(1).filter(x => x !== '--').map(shellQuote).join(' '));
+  if (['exec', 'x'].includes(sub)) {
+    /* Only the first "--" separates npm flags from the command; later "--"
+     * tokens are arguments of the command itself and must survive quoting. */
+    const rest = args.slice(1);
+    const sep = rest.indexOf('--');
+    return runCommandInline((sep >= 0 ? rest.slice(sep + 1) : rest).map(shellQuote).join(' '));
+  }
   if (['run', 'run-script', 'start', 'dev', 'build', 'test'].includes(sub)) {
     const isExplicit = sub === 'run' || sub === 'run-script';
-    const pkg = JSON.parse(readFileSync('/project/package.json', 'utf8')), script = isExplicit ? args[1] : sub;
+    const pkg = readProjectPackage(), script = isExplicit ? args[1] : sub;
     if (!script) { out('Scripts:\n' + Object.entries(pkg.scripts || {}).map(([n, s]) => '  ' + n + ' → ' + s).join('\n') + '\n'); return 0; }
     if (typeof pkg.scripts?.[script] !== 'string') throw new Error('No package script named ' + script);
     const rawExtra = args.slice(isExplicit ? 2 : 1);
-    const sep = rawExtra.indexOf('--');
-    const extraArgs = (sep >= 0 ? rawExtra.slice(sep + 1) : rawExtra).map(shellQuote).join(' ');
+    /* A leading "--" is the npm separator; every other token — including a
+     * "--" that appears later — is an argument of the script itself. */
+    const extraArgs = (rawExtra[0] === '--' ? rawExtra.slice(1) : rawExtra).map(shellQuote).join(' ');
     if (Object.keys({ ...pkg.dependencies, ...pkg.devDependencies }).some(n => !packageRecord('/project/node_modules/' + n))) { out('Installing missing declared dependencies…\n'); await npmInstall([]); }
     for (const name of ['pre' + script, script, 'post' + script]) if (pkg.scripts?.[name]) {
       const cmd = name === script && extraArgs ? pkg.scripts[name] + ' ' + extraArgs : pkg.scripts[name];
-      out('\x1b[90m> ' + cmd + '\x1b[0m\n');
+      out(PRESENT.cmd(cmd) + '\n');
       const code = await runCommandInline(cmd);
       if (code) return code;
     }
@@ -15660,18 +15970,11 @@ async function runNpm(args) {
   }
   throw new Error('Unsupported npm command: ' + sub + '. Run "npm help" for supported commands.');
 }
-const PNPM_HELP = `pnpm-compatible package manager
-  pnpm install [--ignore-scripts]
-  pnpm add [name@range] [-D] [--save-exact]
-  pnpm run <script> | pnpm <script>
-  pnpm exec <cmd…> | pnpm dlx <tool…>
-  pnpm remove <name> | ls | view <name> | init
-`;
 async function runPnpm(args) {
   const sub = args[0];
-  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(PNPM_HELP); return 0; }
+  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(pnpmHelpText()); return 0; }
   if (['-v', '--version'].includes(sub)) { out('9.0.0\n'); return 0; }
-  if (sub === '--beownir') { out('Beownir registry client 3.0 · pnpm-compatible CLI surface (not the pnpm executable)\n'); return 0; }
+  if (sub === '--beownir') { out(PRESENT.style('Beownir registry client 3.0', 'cyan') + ' · pnpm-compatible CLI surface' + PRESENT.style(' (not the pnpm executable)', 'dim') + '\n'); return 0; }
   if (sub === 'dlx') return runNpx(args.slice(1));
   if (['exec', 'x'].includes(sub)) return runNpm(['exec', ...args.slice(1)]);
   const mapped = sub === 'up' ? 'update' : sub;
@@ -15679,21 +15982,13 @@ async function runPnpm(args) {
     return runNpm([mapped, ...args.slice(1)]);
   }
   if (!String(sub).startsWith('-')) {
-    try {
-      const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
-      if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
-    } catch {}
+    /* A missing or corrupt package.json must surface its actionable error
+     * instead of being swallowed and reported as an unsupported command. */
+    const pkg = readProjectPackage();
+    if (typeof pkg.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
   }
   throw new Error('Unsupported pnpm command: ' + sub + '. Run "pnpm help" for supported commands.');
 }
-const YARN_HELP = `yarn-compatible package manager · yarn [install|add|remove|run <script>|dlx|exec]
-  yarn                        install dependencies from package.json
-  yarn add <pkg…> [-D] [-E]   add dependencies (--dev / --exact supported)
-  yarn remove <pkg…>          remove dependencies
-  yarn run <script> | yarn <script>
-  yarn exec <cmd…> | dlx <tool…>
-  yarn list | info <name> | init [-y]
-`;
 async function runYarn(args) {
   const clean = [];
   for (let i = 0; i < args.length; i++) {
@@ -15703,9 +15998,9 @@ async function runYarn(args) {
   }
   const sub = clean[0];
   if (!sub) { await npmInstall([]); return 0; }
-  if (['help', '--help', '-h'].includes(sub)) { out(YARN_HELP); return 0; }
+  if (['help', '--help', '-h'].includes(sub)) { out(yarnHelpText()); return 0; }
   if (['-v', '--version'].includes(sub)) { out('1.22.22\n'); return 0; }
-  if (sub === '--beownir') { out('Beownir registry client 3.0 · yarn-compatible CLI surface (not the yarn executable)\n'); return 0; }
+  if (sub === '--beownir') { out(PRESENT.style('Beownir registry client 3.0', 'cyan') + ' · yarn-compatible CLI surface' + PRESENT.style(' (not the yarn executable)', 'dim') + '\n'); return 0; }
   if (sub === 'dlx') return runNpx(clean.slice(1));
   if (sub === 'exec') return runNpm(['exec', ...clean.slice(1)]);
   if (sub === 'create') {
@@ -15721,27 +16016,16 @@ async function runYarn(args) {
   if (['info', 'view'].includes(sub)) return runNpm(['view', ...clean.slice(1)]);
   if (['run', 'start', 'dev', 'build', 'test'].includes(sub)) return runNpm([sub, ...clean.slice(1)]);
   if (!String(sub).startsWith('-')) {
-    try {
-      const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
-      if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...clean.slice(1)]);
-    } catch {}
+    const pkg = readProjectPackage();
+    if (typeof pkg.scripts?.[sub] === 'string') return runNpm(['run', sub, ...clean.slice(1)]);
   }
   throw new Error('Unsupported yarn command: ' + sub + '. Run "yarn help" for supported commands.');
 }
-const BUN_HELP = `bun-compatible runtime & package manager · bun [install|add|remove|run <script|file>|x <pkg>]
-  bun install | i             install dependencies from package.json
-  bun add <pkg…> [-d] [-E]    add dependencies (-d/--dev, -E/--exact)
-  bun remove <pkg…>           remove dependencies
-  bun run <script|file>       run a package.json script or JS/TS/ESM file
-  bun <file.ts|file.js>       execute a JS/TS/ESM file
-  bun x <tool…> | bunx <tool> run an installed package binary
-  bun pm ls | init            list packages or initialize package.json
-`;
 async function runBun(args) {
   const sub = args[0];
-  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(BUN_HELP); return 0; }
+  if (!sub || ['help', '--help', '-h'].includes(sub)) { out(bunHelpText()); return 0; }
   if (['-v', '--version'].includes(sub)) { out('1.2.0\n'); return 0; }
-  if (sub === '--beownir') { out('Beownir virtual CLI 3.0 · bun-compatible CLI surface (not the native bun executable)\n'); return 0; }
+  if (sub === '--beownir') { out(PRESENT.style('Beownir virtual CLI 3.0', 'cyan') + ' · bun-compatible CLI surface' + PRESENT.style(' (not the native bun executable)', 'dim') + '\n'); return 0; }
   if (['-e', '--eval', '-p'].includes(sub)) return runNode(args);
   if (sub === 'x') return runNpx(args.slice(1));
   if (sub === 'create') {
@@ -15769,8 +16053,8 @@ async function runBun(args) {
     return runNpm(['run', target, ...args.slice(2)]);
   }
   if (sub === 'test' || sub === 't') {
-    const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
-    if (typeof pkg?.scripts?.test === 'string') return runNpm(['run', 'test', ...args.slice(1)]);
+    const pkg = FS['/project/package.json'] ? readProjectPackage() : null;
+    if (pkg && typeof pkg.scripts?.test === 'string') return runNpm(['run', 'test', ...args.slice(1)]);
     const fileArgs = args.slice(1).filter(a => !String(a).startsWith('-'));
     if (fileArgs.length) {
       for (const fileArg of fileArgs) {
@@ -15785,10 +16069,8 @@ async function runBun(args) {
   if (!String(sub).startsWith('-')) {
     const looksLikeFile = /\.(?:[cm]?js|jsx|[cm]?ts|tsx)$/.test(sub) || sub.startsWith('/') || sub.startsWith('./') || sub.startsWith('../');
     if (looksLikeFile || tryFiles(resolve(sub))) return runNode(args);
-    try {
-      const pkg = FS['/project/package.json'] ? JSON.parse(readFileSync('/project/package.json', 'utf8')) : null;
-      if (typeof pkg?.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
-    } catch {}
+    const pkg = readProjectPackage();
+    if (typeof pkg.scripts?.[sub] === 'string') return runNpm(['run', sub, ...args.slice(1)]);
   }
   throw new Error('Unsupported bun command: ' + sub + '. Run "bun help" for supported commands.');
 }
@@ -15836,6 +16118,14 @@ async function runViteCLI(args) {
     if (arg.startsWith('-')) throw new Error('Unsupported Vite CLI option: ' + arg);
     if (root !== CWD) throw new Error('Vite accepts one project root argument.');
     root = resolve(arg);
+  }
+  /* The runtime's network is virtual loopback only: a non-loopback --host can
+   * never be reached, so bind 127.0.0.1 and say so instead of advertising a
+   * wildcard bind that the virtual stack would silently ignore. */
+  if (host === '0.0.0.0') host = '127.0.0.1';
+  else if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1' && host !== '[::1]') {
+    errOut('vite: host "' + host + '" is outside the virtual loopback; serving on 127.0.0.1 instead.\n');
+    host = '127.0.0.1';
   }
   if (action === 'build') {
     const result = await vite.build({ root, configFile, base, mode, logLevel: 'silent', build });
@@ -15894,19 +16184,6 @@ async function runNpx(args) {
   if (!path.startsWith('/project/node_modules/' + tool + '/')) throw new Error('Invalid package CLI path.');
   return runNode([path, ...rest]);
 }
-const NPM_HELP = `npm-compatible package manager & script runner
-  npm install [name@range] [-D] [--save-exact] [--no-wasm-fallback]
-  npm ci [--omit=dev]         restore an integrity-checked v2/v3 lockfile
-  npm run <script>           run a package.json script (auto-resolves node_modules/.bin)
-  npm start | dev | build | test
-  npm uninstall <name> | ls | view <name> | init
-  npx esbuild <entry> --bundle --outfile=dist/app.js
-  npx vite [dev|build]       Vite dev server with HMR + WASM Rollup/esbuild builds
-  npx serve [dir] [--port N] live-reloading static & ES/JSX/TS module server
-  npx <bin> [args]           run any installed node_modules/.bin CLI directly
-Supports npm:, workspace:, file:, and link: protocols plus package overrides/resolutions,
-concurrent dependency resolution, hoisted node_modules, and JS/WASM native fallbacks.
-`;
 
 let esbuildApiPromise = null;
 async function getEsbuildApi(){
@@ -15979,7 +16256,7 @@ async function runEsbuild(args){
   const esbuild=await getEsbuildApi();
   options.entryPoints=absEntries;
   options.plugins.push(makeVfsEsbuildPlugin(loaders));
-  out('\x1b[36mesbuild-wasm\x1b[0m bundling '+entries.join(', ')+'…\n');
+  out(PRESENT.info('esbuild-wasm bundling ' + entries.join(', ') + '…'));
   const result=await esbuild.build(options);
   for(const w of (result.warnings||[])) errOut('esbuild warning: '+(w.text||fmt(w))+'\n');
   for(const file of result.outputFiles||[]){
@@ -15988,7 +16265,7 @@ async function runEsbuild(args){
     out('  '+p.replace('/project/','')+'\n');
   }
   syncBack();
-  out('\x1b[32m✔\x1b[0m esbuild finished\n');
+  out(PRESENT.success('esbuild finished'));
 }
 
 function devServer(kind,args){
@@ -16001,9 +16278,20 @@ function devServer(kind,args){
   const dir = requireDir(positional[0]);
   customRoots = [dir];
  }
- const server=new Server(async(req,res)=>{const found=staticResponseForRoots(req.url,customRoots);if(!found){res.writeHead(404,{'content-type':'text/plain'});res.end('File not found: '+req.url);return;}const file=found.file;
- if(/\.(?:[cm]?js|jsx|tsx?|vue)$/.test(file)){try{res.setHeader('content-type','text/javascript');res.end(await buildPreviewModule(file));}catch(e){res.writeHead(500,{'content-type':'text/plain'});res.end(String(e?.stack||e));}return;}
- res.writeHead(200,{'content-type':mime(file)});res.end(readFileSync(file));});
+  const server=new Server(async(req,res)=>{
+    /* A static preview server speaks GET and HEAD only; everything else is
+     * refused with 405 rather than answered with a file body. */
+    const method = String(req.method || 'GET').toUpperCase();
+    if(method!=='GET'&&method!=='HEAD'){res.writeHead(405,{'content-type':'text/plain','allow':'GET, HEAD'});res.end('Method Not Allowed: '+method);return;}
+    const found=staticResponseForRoots(req.url,customRoots);
+    if(!found){res.writeHead(404,{'content-type':'text/plain'});res.end(method==='HEAD'?'':'File not found: '+req.url);return;}
+    const file=found.file;
+    const headOnly=method==='HEAD';
+    if(/\.(?:[cm]?js|jsx|tsx?|vue)$/.test(file)){try{res.setHeader('content-type','text/javascript');const code=await buildPreviewModule(file);if(headOnly)res.end();else res.end(code);}catch(e){res.writeHead(500,{'content-type':'text/plain'});res.end(headOnly?'':String(e?.stack||e));}return;}
+    const data=readFileSync(file);
+    res.writeHead(200,{'content-type':mime(file),'content-length':String(data.length)});
+    res.end(headOnly?null:data);
+  });
  server.listen(port,()=>{
   const addr=typeof server.address==='function'?server.address():null;
   const actualPort=addr&&typeof addr==='object'&&addr.port?addr.port:port;
@@ -16012,29 +16300,6 @@ function devServer(kind,args){
   else out('Serving '+rootLabel+' on http://127.0.0.1:'+actualPort+'/ (live reload enabled)\n');
  });
 }
-const HELP=`Beownir 3.0 · Browser Node.js & Vite workspace runtime
-
-node <file> | node -e "code" | node -p "expression"
-npm / pnpm / yarn / bun install [pkg] | ci | run <script> | npm help
-npx vite [dev|build]         Vite dev server with HMR & WASM Rollup/esbuild builds
-npx / bunx esbuild <entry> --bundle --outfile=dist/app.js
-npx serve [dir] [--port N]   preview HTML / bundled JS, JSX, TS & Vue modules
-ls cat head tail grep sort sed find du df storage tree cp mv rm chmod
-echo printf date sleep xargs env export history test curl wget clear
-ps | kill [-SIGKILL] <pid> | ports | open <port> | close-port <port>
-
-Pipes (|), per-stage redirection (> >> 1> 2> &> <), globbing and ; / && / ||
-chains work; run help for commands and storage df / storage gc for browser storage.
-Ctrl+C / Stop cleanly terminates the entire worker tree without losing saved files.
-child_process.spawn/exec/execFile/fork run in separate Web Workers (8 processes max),
-with SharedArrayBuffer + Atomics sync when cross-origin isolated.
-npm/pnpm/yarn/bun resolve dependencies in parallel with hoisted node_modules,
-indexed caching, and compressed dependency checkpoints across reloads.
-Vite dev serves module graphs with live WebSocket HMR over service-worker preview;
-the built-in serve adapter provides instant live reload preserving scroll and inputs.
-Virtual loopback TCP/UDP/TLS/HTTP/HTTP2/WebSockets (net, dgram, tls, https, http2,
-WASI sockets) run completely inside the browser workspace.
-`;
 post({type:'boot'});
 
 function NodeStringDecoder(encoding='utf8'){this.encoding=String(encoding).toLowerCase();this._textDecoder=/^utf-?8$/.test(this.encoding)?new TextDecoder():/^(?:utf-?16le|ucs-?2)$/.test(this.encoding)?new TextDecoder('utf-16le'):null;this.lastNeed=0;this.lastTotal=0;this.lastChar=Buffer.alloc(4);}
@@ -16126,7 +16391,7 @@ function kernelUnhandled(e) {
   // top-level throw, not as a bare stack.
   const frame = /(?:^|[\s(])(\/[^\s():]+?\.(?:[cm]?js|jsx|tsx?)):(\d+):(\d+)/.exec(String(e?.stack || ''));
   if (frame) reportUncaught(e, frame[1]);
-  else errOut('\x1b[31m' + String(e?.stack || e) + '\x1b[0m\n');
+  else errOut(PRESENT.error(String(e?.stack || e)));
   if (kernelInfo.pid !== 1) kernelExit(1);
   else {
     if (typeof SHELL === 'object' && SHELL) SHELL.lastCode = 1;
@@ -16245,7 +16510,7 @@ Server.prototype.listen = function(port, ...args) {
     // Node prints nothing on listen; keep the hint out of stdout so a piped or
     // redirected `node server.js` is byte-identical.
     const scheme = (this._isHttps || this._isHttp2Secure) ? 'https' : 'http';
-    emitOutput('notice', '\x1b[32m✔\x1b[0m PID ' + kernelInfo.pid + ' listening on \x1b[36m' + scheme + '://localhost:' + port + '\x1b[0m\n');
+    emitOutput('notice', PRESENT.success('PID ' + kernelInfo.pid + ' listening on ' + PRESENT.paint(scheme + '://localhost:' + port, 'cyan')));
     this.emit('listening'); callback?.();
   }).catch(e => { this._kernelBinding = false; try { this.emit('error', e); } catch (failure) { kernelUnhandled(failure); } }).finally(kernelMaybeIdle);
   return this;
